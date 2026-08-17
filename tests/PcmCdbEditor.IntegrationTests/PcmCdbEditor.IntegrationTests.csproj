@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\PcmCdbEditor.Domain\PcmCdbEditor.Domain.csproj" />
+    <ProjectReference Include="..\..\src\PcmCdbEditor.Application\PcmCdbEditor.Application.csproj" />
+    <ProjectReference Include="..\..\src\PcmCdbEditor.Infrastructure\PcmCdbEditor.Infrastructure.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="MSTest.TestFramework" />
+    <PackageReference Include="MSTest.TestAdapter" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="Fixtures\FakeConverterProgram.cs" />
+    <None Include="Fixtures\FakeConverterProgram.cs" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

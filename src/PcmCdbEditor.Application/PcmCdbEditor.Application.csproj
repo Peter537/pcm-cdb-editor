@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Application-owned use cases and ports for the PCM CDB Editor.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PcmCdbEditor.Domain\PcmCdbEditor.Domain.csproj" />
+  </ItemGroup>
+</Project>

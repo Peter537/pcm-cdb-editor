@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\PcmCdbEditor.Domain\PcmCdbEditor.Domain.csproj" />
+    <ProjectReference Include="..\..\src\PcmCdbEditor.Application\PcmCdbEditor.Application.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\..\src\PcmCdbEditor.App\TabCloseSelectionReconciler.cs"
+             Link="App\TabCloseSelectionReconciler.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="MSTest.TestFramework" />
+    <PackageReference Include="MSTest.TestAdapter" PrivateAssets="all" />
+  </ItemGroup>
+</Project>

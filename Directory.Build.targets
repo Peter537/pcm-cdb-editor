@@ -1,0 +1,11 @@
+<Project>
+  <Target Name="ValidateReleaseShape" BeforeTargets="Publish" Condition="'$(Configuration)' == 'Release' and '$(MSBuildProjectName)' == 'PcmCdbEditor.App'">
+    <Error Condition="'$(RuntimeIdentifier)' != 'win-x64'" Text="Release publishing is restricted to win-x64." />
+    <Error Condition="'$(SelfContained)' != 'true'" Text="Release publishing must be self-contained." />
+    <Error Condition="'$(WindowsAppSDKSelfContained)' != 'true'" Text="Windows App SDK must be self-contained." />
+    <Error Condition="'$(PublishSingleFile)' == 'true'" Text="Single-file publishing is prohibited." />
+    <Error Condition="'$(PublishTrimmed)' == 'true'" Text="Trimming is prohibited." />
+    <Error Condition="'$(PublishReadyToRun)' == 'true'" Text="ReadyToRun is prohibited." />
+    <Error Condition="'$(PublishAot)' == 'true'" Text="NativeAOT is prohibited." />
+  </Target>
+</Project>

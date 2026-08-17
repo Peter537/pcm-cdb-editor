@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">PCM CDB Editor</title>
+  <desc id="description">A cobalt data grid with a teal edit mark.</desc>
+  <rect width="512" height="512" rx="104" fill="#315FCC"/>
+  <rect x="88" y="112" width="336" height="288" rx="24" fill="none" stroke="#FFFFFF" stroke-width="28"/>
+  <path fill="none" stroke="#FFFFFF" stroke-width="24" stroke-linecap="round" d="M104 208h304M104 288h304M232 128v256"/>
+  <path fill="#1A8F85" stroke="#FFFFFF" stroke-width="14" stroke-linejoin="round" d="m244 367 12-66 102-102 54 54-102 102-66 12Zm114-114 26 26"/>
+</svg>

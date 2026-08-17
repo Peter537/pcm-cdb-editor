@@ -1,0 +1,25 @@
+<UserControl
+    x:Class="PcmCdbEditor.App.Controls.TableGridAdapterControl"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:tv="using:WinUI.TableView">
+  <Grid Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+    <tv:TableView
+        x:Name="GridControl"
+        AutomationProperties.Name="Current table rows"
+        AutomationProperties.HelpText="Use arrow keys to move between cells. Press Enter or F2 to edit an editable cell."
+        AutoGenerateColumns="False"
+        BeginningEdit="GridControl_BeginningEdit"
+        CanFilterColumns="False"
+        CanSortColumns="False"
+        CellEditEnding="GridControl_CellEditEnding"
+        SelectionMode="Multiple"
+        SelectionChanged="GridControl_SelectionChanged">
+      <tv:TableView.ItemsPanel>
+        <ItemsPanelTemplate>
+          <ItemsStackPanel Orientation="Vertical" CacheLength="0" />
+        </ItemsPanelTemplate>
+      </tv:TableView.ItemsPanel>
+    </tv:TableView>
+  </Grid>
+</UserControl>

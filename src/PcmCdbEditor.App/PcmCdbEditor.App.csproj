@@ -1,0 +1,76 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>PcmCdbEditor.App</RootNamespace>
+    <AssemblyName>PcmCdbEditor</AssemblyName>
+    <Description>Unpackaged WinUI 3 desktop application for safely editing PCM CDB files.</Description>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <TargetLatestRuntimePatch>true</TargetLatestRuntimePatch>
+    <PublishSingleFile>false</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <PublishAot>false</PublishAot>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\App.ico</ApplicationIcon>
+  </PropertyGroup>
+  <!--
+    RuntimeFrameworkVersion cannot be used on a Windows TFM because dotnet/sdk#37044
+    applies it to Microsoft.Windows.SDK.NET.Ref as well. Override only the .NET 10
+    runtime and apphost pack metadata so the selected compiler publishes the
+    security-serviced 10.0.11 runtime without changing the Windows SDK reference.
+  -->
+  <ItemGroup>
+    <KnownFrameworkReference Update="Microsoft.NETCore.App">
+      <LatestRuntimeFrameworkVersion>10.0.11</LatestRuntimeFrameworkVersion>
+    </KnownFrameworkReference>
+    <KnownAppHostPack Update="Microsoft.NETCore.App">
+      <AppHostPackVersion>10.0.11</AppHostPackVersion>
+    </KnownAppHostPack>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PcmCdbEditor.Application\PcmCdbEditor.Application.csproj" />
+    <ProjectReference Include="..\PcmCdbEditor.Infrastructure\PcmCdbEditor.Infrastructure.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" PrivateAssets="all" IncludeAssets="runtime; build; native; contentfiles; analyzers; buildtransitive" />
+    <PackageReference Include="WinUI.TableView" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="..\..\third_party\SQLiteExporter\SQLiteExporter.exe"
+             Link="third_party\SQLiteExporter\SQLiteExporter.exe"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <!--
+    The Windows App SDK build emits the unpackaged app's compiled XAML and PRI
+    beside the apphost but does not add them to the .NET publish item graph.
+    Keep the multi-file publish runnable by copying those generated resources
+    after Publish; the release verifier independently requires all four files.
+  -->
+  <Target Name="CopyWinUiApplicationResourcesToPublish" AfterTargets="Publish">
+    <Error Condition="!Exists('$(TargetDir)App.xbf')"
+           Text="The compiled WinUI application resource is missing: $(TargetDir)App.xbf" />
+    <Error Condition="!Exists('$(TargetDir)MainWindow.xbf')"
+           Text="The compiled WinUI window resource is missing: $(TargetDir)MainWindow.xbf" />
+    <Error Condition="!Exists('$(TargetDir)Controls\TableGridAdapterControl.xbf')"
+           Text="The compiled TableView adapter resource is missing." />
+    <Error Condition="!Exists('$(TargetDir)CountryQuotaPreviewDialog.xbf')"
+           Text="The compiled country quota preview resource is missing." />
+    <Error Condition="!Exists('$(TargetDir)PcmCdbEditor.pri')"
+           Text="The compiled WinUI resource index is missing: $(TargetDir)PcmCdbEditor.pri" />
+    <MakeDir Directories="$(PublishDir)Controls" />
+    <Copy SourceFiles="$(TargetDir)App.xbf;$(TargetDir)MainWindow.xbf;$(TargetDir)CountryQuotaPreviewDialog.xbf;$(TargetDir)PcmCdbEditor.pri"
+          DestinationFolder="$(PublishDir)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(TargetDir)Controls\TableGridAdapterControl.xbf"
+          DestinationFolder="$(PublishDir)Controls"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>

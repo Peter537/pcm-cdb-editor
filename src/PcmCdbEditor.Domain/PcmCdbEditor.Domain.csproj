@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Immutable domain models for the PCM CDB Editor.</Description>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,15 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Folder Name="/src/">
+    <Project Path="src/PcmCdbEditor.Domain/PcmCdbEditor.Domain.csproj" />
+    <Project Path="src/PcmCdbEditor.Application/PcmCdbEditor.Application.csproj" />
+    <Project Path="src/PcmCdbEditor.Infrastructure/PcmCdbEditor.Infrastructure.csproj" />
+    <Project Path="src/PcmCdbEditor.App/PcmCdbEditor.App.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/PcmCdbEditor.UnitTests/PcmCdbEditor.UnitTests.csproj" />
+    <Project Path="tests/PcmCdbEditor.IntegrationTests/PcmCdbEditor.IntegrationTests.csproj" />
+  </Folder>
+</Solution>

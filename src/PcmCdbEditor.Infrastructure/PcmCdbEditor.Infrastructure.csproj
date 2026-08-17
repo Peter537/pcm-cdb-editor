@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>SQLite, process, file-system, settings, and recovery implementations.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PcmCdbEditor.Application\PcmCdbEditor.Application.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="SQLitePCLRaw.core" />
+  </ItemGroup>
+</Project>
