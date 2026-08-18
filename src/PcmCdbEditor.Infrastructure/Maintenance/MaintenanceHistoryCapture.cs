@@ -98,7 +98,7 @@ internal static class MaintenanceHistoryCapture
         return rows.AsReadOnly();
     }
 
-    private static SqliteValue ReadValue(SqliteDataReader reader, int ordinal)
+    internal static SqliteValue ReadValue(SqliteDataReader reader, int ordinal)
     {
         if (reader.IsDBNull(ordinal))
         {

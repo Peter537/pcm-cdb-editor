@@ -10,6 +10,10 @@ namespace PcmCdbEditor.Infrastructure.Maintenance;
 public sealed class RiderRecoveryService : IRiderRecoveryService
 {
     private const string Table = "DYN_cyclist_fitness";
+    private const string CyclistTable = "DYN_cyclist";
+    private const string TeamTable = "DYN_team";
+    private static readonly string[] TeamDisplayColumns =
+        ["gene_sz_name", "gene_sz_shortname", "gene_sz_abbreviation", "CONSTANT", "name"];
 
     private static readonly IReadOnlyDictionary<string, IReadOnlyCollection<string>> Requirements =
         new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
@@ -33,37 +37,106 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
             sqlitePath,
             MaintenanceToolKind.RiderRecovery,
             Requirements,
+            [Table],
+            cancellationToken);
+
+    public Task<IReadOnlyList<RiderTeamOption>> ListTeamsAsync(
+        string sqlitePath,
+        CancellationToken cancellationToken) =>
+        SqliteOperationRunner.RunAsync(
+            () => ListTeamsCoreAsync(sqlitePath, cancellationToken),
+            cancellationToken);
+
+    private static async Task<IReadOnlyList<RiderTeamOption>> ListTeamsCoreAsync(
+        string sqlitePath,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = SqliteSupport.CreateConnection(sqlitePath, SqliteOpenMode.ReadOnly);
+        using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
+                connection,
+                cancellationToken)
+            .ConfigureAwait(false);
+        await RequireTeamSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+        HashSet<string> teamColumns = await SqliteSupport.ReadColumnNamesAsync(
+                connection,
+                TeamTable,
+                cancellationToken)
+            .ConfigureAwait(false);
+        string? displayColumn = TeamDisplayColumns.FirstOrDefault(teamColumns.Contains);
+        string displayExpression = displayColumn is null
+            ? "''"
+            : $"COALESCE(CAST(team.{SqliteSupport.QuoteIdentifier(displayColumn)} AS TEXT), '')";
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT team.IDteam,
+                   {displayExpression},
+                   COUNT(cyclist.IDcyclist)
+            FROM {SqliteSupport.QuoteIdentifier(TeamTable)} team
+            LEFT JOIN {SqliteSupport.QuoteIdentifier(CyclistTable)} cyclist
+              ON cyclist.fkIDteam = team.IDteam
+            WHERE team.IDteam > 0
+            GROUP BY team.IDteam, {displayExpression}
+            ORDER BY {displayExpression} COLLATE NOCASE, team.IDteam
+            """;
+        var options = new List<RiderTeamOption>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            long teamId = reader.GetInt64(0);
+            string name = reader.GetString(1).Trim();
+            options.Add(new RiderTeamOption(
+                teamId,
+                string.IsNullOrWhiteSpace(name) ? $"Team {teamId}" : name,
+                reader.GetInt64(2)));
+        }
+
+        return options.AsReadOnly();
+    }
+
+    public Task<RiderRecoveryPreview> PreviewAsync(
+        string sqlitePath,
+        RiderRecoveryTarget target,
+        CancellationToken cancellationToken) =>
+        SqliteOperationRunner.RunAsync(
+            () => PreviewCoreAsync(sqlitePath, target, cancellationToken),
             cancellationToken);
 
     public Task<RiderRecoveryPreview> PreviewAsync(
         string sqlitePath,
         IReadOnlyCollection<long> cyclistIds,
         CancellationToken cancellationToken) =>
-        SqliteOperationRunner.RunAsync(
-            () => PreviewCoreAsync(sqlitePath, cyclistIds, cancellationToken),
+        PreviewAsync(
+            sqlitePath,
+            RiderRecoveryTarget.ForRiderIds(cyclistIds),
             cancellationToken);
 
     private async Task<RiderRecoveryPreview> PreviewCoreAsync(
         string sqlitePath,
-        IReadOnlyCollection<long> cyclistIds,
+        RiderRecoveryTarget target,
         CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(cyclistIds);
+        ArgumentNullException.ThrowIfNull(target);
         var capability = await CheckCapabilityAsync(sqlitePath, cancellationToken).ConfigureAwait(false);
         MaintenanceSupport.RequireEnabled(capability);
-        var ids = cyclistIds.Distinct().Order().ToArray();
-        if (ids.Length == 0)
-        {
-            return new RiderRecoveryPreview(MaintenanceSupport.ComputeToken([]), ids, []);
-        }
-
         await using var connection = SqliteSupport.CreateConnection(sqlitePath, SqliteOpenMode.ReadOnly);
         using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
                 connection,
                 cancellationToken)
             .ConfigureAwait(false);
+        long[] ids = await ResolveTargetIdsAsync(
+                connection,
+                transaction: null,
+                target,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (ids.Length == 0)
+        {
+            return new RiderRecoveryPreview(ComputeToken(target, ids, []), target, ids, []);
+        }
+
         var changes = await ReadChangesAsync(connection, transaction: null, ids, cancellationToken).ConfigureAwait(false);
-        return new RiderRecoveryPreview(ComputeToken(ids, changes), ids, changes);
+        return new RiderRecoveryPreview(ComputeToken(target, ids, changes), target, ids, changes);
     }
 
     public Task<MaintenanceApplyResult> ApplyAsync(
@@ -100,13 +173,25 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
         var sqliteTransaction = (SqliteTransaction)transaction;
         try
         {
+            long[] resolvedIds = await ResolveTargetIdsAsync(
+                    connection,
+                    sqliteTransaction,
+                    preview.Target,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (!resolvedIds.SequenceEqual(preview.CyclistIds))
+            {
+                throw new DBConcurrencyException("The selected team roster changed after the preview was generated.");
+            }
+
             var current = await ReadChangesAsync(
                     connection,
                     sqliteTransaction,
                     preview.CyclistIds,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (!ComputeToken(preview.CyclistIds, current).Equals(preview.SnapshotToken, StringComparison.Ordinal))
+            if (!ComputeToken(preview.Target, preview.CyclistIds, current)
+                .Equals(preview.SnapshotToken, StringComparison.Ordinal))
             {
                 throw new DBConcurrencyException("Rider fitness changed after the preview was generated.");
             }
@@ -219,10 +304,16 @@ ORDER BY IDcyclist";
     }
 
     private static string ComputeToken(
+        RiderRecoveryTarget target,
         IEnumerable<long> requestedIds,
         IEnumerable<RiderRecoveryChange> changes)
     {
-        var values = requestedIds.Select(id => $"requested:{MaintenanceSupport.CanonicalNumber(id)}")
+        var values = new[]
+            {
+                $"target:{target.Kind}",
+                $"team:{(target.TeamId.HasValue ? MaintenanceSupport.CanonicalNumber(target.TeamId.Value) : "none")}"
+            }
+            .Concat(requestedIds.Select(id => $"requested:{MaintenanceSupport.CanonicalNumber(id)}"))
             .Concat(changes.Select(change => string.Join(':',
                 MaintenanceSupport.CanonicalNumber(change.CyclistId),
                 MaintenanceSupport.CanonicalNumber(change.OldValues.Fit),
@@ -232,6 +323,69 @@ ORDER BY IDcyclist";
                 MaintenanceSupport.CanonicalNumber(change.OldValues.Freshness),
                 MaintenanceSupport.CanonicalNumber(change.OldValues.Preparation))));
         return MaintenanceSupport.ComputeToken(values);
+    }
+
+    private static async Task<long[]> ResolveTargetIdsAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        RiderRecoveryTarget target,
+        CancellationToken cancellationToken)
+    {
+        if (target.Kind == RiderRecoveryTargetKind.RiderIds)
+        {
+            return target.RiderIds.ToArray();
+        }
+
+        await RequireTeamSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"""
+            SELECT IDcyclist
+            FROM {SqliteSupport.QuoteIdentifier(CyclistTable)}
+            WHERE fkIDteam = $teamId
+              AND IDcyclist > 0
+            ORDER BY IDcyclist
+            """;
+        command.Parameters.AddWithValue("$teamId", target.TeamId!.Value);
+        var ids = new List<long>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            ids.Add(reader.GetInt64(0));
+        }
+
+        return ids.Distinct().Order().ToArray();
+    }
+
+    private static async Task RequireTeamSchemaAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        HashSet<string> tables = await SqliteSupport.ReadTableNamesAsync(connection, cancellationToken)
+            .ConfigureAwait(false);
+        if (!tables.Contains(CyclistTable) || !tables.Contains(TeamTable))
+        {
+            throw new InvalidOperationException(
+                "Team selection is unavailable because DYN_cyclist or DYN_team is missing. Rider IDs can still be used.");
+        }
+
+        HashSet<string> cyclistColumns = await SqliteSupport.ReadColumnNamesAsync(
+                connection,
+                CyclistTable,
+                cancellationToken)
+            .ConfigureAwait(false);
+        HashSet<string> teamColumns = await SqliteSupport.ReadColumnNamesAsync(
+                connection,
+                TeamTable,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!cyclistColumns.Contains("IDcyclist") ||
+            !cyclistColumns.Contains("fkIDteam") ||
+            !teamColumns.Contains("IDteam"))
+        {
+            throw new InvalidOperationException(
+                "Team selection is unavailable because the rider/team lookup columns are missing. Rider IDs can still be used.");
+        }
     }
 
     private static void AddPresetParameters(SqliteCommand command, long cyclistId)

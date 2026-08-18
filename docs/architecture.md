@@ -29,7 +29,8 @@ Solid arrows between projects show compile-time dependencies. `PcmCdbEditor.App`
 - identifier validation against the current schema catalog;
 - the numbered `AND`/`OR` advanced-filter parser;
 - stable query models;
-- operation gates that prevent conflicting work and suppress stale asynchronous completions; and
+- operation gates that prevent conflicting work and suppress stale asynchronous completions;
+- an inline-edit commit stager that separates pre-commit parsing from post-lifecycle mutation, plus the shared rider-ID parser; and
 - bounded virtual-query coordination with independently cancellable row and count work.
 
 No package-specific UI event or SQLite connection type crosses these contracts.
@@ -47,7 +48,7 @@ No package-specific UI event or SQLite connection type crosses these contracts.
 - batched foreign-key display resolution and stable database-side sorting;
 - atomic settings and schema-signature-keyed view state;
 - disk-backed session history and guarded replay for updates, inserts, deletes, and maintenance commands; and
-- per-user Windows file association plus the three schema-gated maintenance services.
+- per-user Windows file association plus the schema-gated maintenance workflows and the clean, atomic rider/contract creation service.
 
 History snapshots live inside the active session because undoing deletes and maintenance requires complete typed rows. Settings and view state do not contain database row values, but recent-file settings can contain local filesystem paths.
 
@@ -62,10 +63,14 @@ History snapshots live inside the active session because undoing deletes and mai
 - raw, resolved-name, and `raw | name` FK display modes;
 - typed inline edits that preserve the existing SQLite storage class;
 - a full-row editor with explicit Integer, Real, Text, and NULL choices while treating BLOBs as read-only metadata;
+- rider recovery by explicit ID list or lazily loaded team roster, with selected rows available through an explicit copy action;
+- a dedicated six-step Create Rider destination with live game-name generation, bounded name/ID lookups, ordered favorite races, the complete ability matrix and potential, typed Advanced controls, and complete insert review;
 - disk-backed undo/redo with saved-baseline tracking; and
 - theme, density, page size, recent files, view state, and file-association controls.
 
-Inline commits use the row identity and revision captured with the visible page, then pass through the same transactional edit, dirty-state, history, refresh, and error path as row-inspector edits. The TableView adapter prepares a completed page before replacing its source and reuses compatible columns, selection, and viewport state.
+Inline commits use the row identity and revision captured with the visible page, then pass through the same transactional edit, dirty-state, history, refresh, and error path as row-inspector edits. `CellEditEnding` only validates and stages an immutable update. `CellEditEnded` publishes it exactly once after a successful commit; cancellation, validation failure, rebinding, or a changed bind generation clears the pending update. The TableView adapter prepares a completed page before replacing its source and reuses compatible columns, current column, multi-selection, and viewport state.
+
+Create Rider keeps wizard state and typed controls in the App, immutable draft/input/preview models in Domain, its port in Application, and schema discovery, clean-default resolution, lookup search, preview, and insertion in Infrastructure. The draft is scoped to one database session. `gene_sz_firstlastname`, `value_f_potentiel`, and `gene_ilist_fkIDfavorite_races` are controlled workflow fields rather than generic Advanced overrides. Preview allocates checked `MAX + 1` identities, builds every insert value without a source rider, and fingerprints schema, save date, lookup rows and selected favorite-race revisions, maxima, target absence, defaults, overrides, role, abilities, potential, the ordered favorite list and serialized text, missing Limits, and complete inserts. Apply repeats those checks inside one deferred-foreign-key transaction, reads both rows back, and records contract then rider so Undo removes rider before contract and Redo restores both atomically. The Create command is recalculated after the preview operation releases its exclusive lease, so a current valid preview becomes actionable once the app returns to Ready.
 
 ## Runtime data boundaries
 

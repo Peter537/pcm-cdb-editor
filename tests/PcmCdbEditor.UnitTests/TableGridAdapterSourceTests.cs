@@ -46,6 +46,40 @@ public sealed class TableGridAdapterSourceTests
             "Cell elements must remain direct children for bounded TableView measurement.");
     }
 
+    [TestMethod]
+    public void InlineEditMutationIsPublishedOnlyAfterTableViewFinishesTheCommit()
+    {
+        string source = File.ReadAllText(GetAdapterSourcePath());
+        string xaml = File.ReadAllText(GetAdapterXamlPath());
+
+        StringAssert.Contains(
+            xaml,
+            "CellEditEnding=\"GridControl_CellEditEnding\"",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            xaml,
+            "CellEditEnded=\"GridControl_CellEditEnded\"",
+            StringComparison.Ordinal);
+
+        int endingStart = source.IndexOf(
+            "private void GridControl_CellEditEnding(",
+            StringComparison.Ordinal);
+        int endedStart = source.IndexOf(
+            "private void GridControl_CellEditEnded(",
+            StringComparison.Ordinal);
+        Assert.IsTrue(endingStart >= 0, "The cancelable validation event must remain wired.");
+        Assert.IsTrue(endedStart > endingStart, "The post-commit event must publish staged edits.");
+
+        string endingBody = source[endingStart..endedStart];
+        Assert.IsFalse(
+            endingBody.Contains("AnnounceEdit(", StringComparison.Ordinal),
+            "CellEditEnding runs before TableView commits and must not start a mutation or rebind.");
+        StringAssert.Contains(
+            source[endedStart..],
+            "AnnounceEdit(",
+            StringComparison.Ordinal);
+    }
+
     private static string GetAdapterSourcePath()
     {
         DirectoryInfo? directory = new(AppContext.BaseDirectory);
@@ -65,5 +99,11 @@ public sealed class TableGridAdapterSourceTests
 
         throw new DirectoryNotFoundException(
             "TableGridAdapterControl.xaml.cs could not be resolved from the test output directory.");
+    }
+
+    private static string GetAdapterXamlPath()
+    {
+        string sourcePath = GetAdapterSourcePath();
+        return sourcePath[..^".cs".Length];
     }
 }

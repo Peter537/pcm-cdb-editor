@@ -192,9 +192,44 @@ public interface IRiderRecoveryService
 {
     Task<MaintenanceCapability> CheckCapabilityAsync(string sqlitePath, CancellationToken cancellationToken);
 
+    Task<IReadOnlyList<RiderTeamOption>> ListTeamsAsync(
+        string sqlitePath,
+        CancellationToken cancellationToken);
+
+    Task<RiderRecoveryPreview> PreviewAsync(
+        string sqlitePath,
+        RiderRecoveryTarget target,
+        CancellationToken cancellationToken);
+
     Task<RiderRecoveryPreview> PreviewAsync(string sqlitePath, IReadOnlyCollection<long> cyclistIds, CancellationToken cancellationToken);
 
     Task<MaintenanceApplyResult> ApplyAsync(string sqlitePath, RiderRecoveryPreview preview, CancellationToken cancellationToken);
+}
+
+public interface IRiderCreationService
+{
+    Task<MaintenanceCapability> CheckCapabilityAsync(string sqlitePath, CancellationToken cancellationToken);
+
+    Task<RiderCreationDraft> PrepareAsync(
+        string sqlitePath,
+        CancellationToken cancellationToken);
+
+    Task<IReadOnlyList<RiderLookupOption>> SearchLookupAsync(
+        string sqlitePath,
+        RiderLookupTarget target,
+        string query,
+        int maxResults,
+        CancellationToken cancellationToken);
+
+    Task<RiderCreationPreview> PreviewAsync(
+        string sqlitePath,
+        RiderCreationInput input,
+        CancellationToken cancellationToken);
+
+    Task<MaintenanceApplyResult> ApplyAsync(
+        string sqlitePath,
+        RiderCreationPreview preview,
+        CancellationToken cancellationToken);
 }
 
 public interface IJanuaryFirstRepairService

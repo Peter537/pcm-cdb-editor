@@ -13,6 +13,7 @@ namespace PcmCdbEditor.App.Controls;
 public sealed partial class TableGridAdapterControl : UserControl, ITableGridAdapter
 {
     private readonly BulkRowSource<GridRowPresentation> _rowSource = new();
+    private readonly InlineEditCommitStager _editStager = new();
     private ColumnFingerprintHeader? _columnFingerprintHeader;
     private GridColumnFingerprint[] _columnFingerprint = [];
     private long _bindGeneration;
@@ -39,6 +40,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(rows);
+        _editStager.Clear();
 
         ColumnSchema[] visibleColumns = schema.Columns
             .Where(static column => !column.IsHidden)
@@ -91,6 +93,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
 
     public void Clear()
     {
+        _editStager.Clear();
         _isBinding = true;
         try
         {
@@ -349,6 +352,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         object sender,
         WinUI.TableView.TableViewBeginningEditEventArgs args)
     {
+        _editStager.Clear();
         if (args.DataItem is not GridRowPresentation row ||
             args.Column.Tag is not string columnName ||
             row.Identity is null ||
@@ -384,6 +388,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         object sender,
         WinUI.TableView.TableViewCellEditEndingEventArgs args)
     {
+        _editStager.Clear();
         if (args.EditAction != WinUI.TableView.TableViewEditAction.Commit ||
             args.DataItem is not GridRowPresentation row ||
             row.Identity is null ||
@@ -411,14 +416,32 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
             return;
         }
 
-        AnnounceEdit(new RowUpdateOperation(
+        _editStager.Stage(new RowUpdateOperation(
             Guid.NewGuid(),
             row.TableName,
             DateTimeOffset.UtcNow,
             row.Identity,
             [KeyValuePair.Create(columnName, cell.Value)],
             [KeyValuePair.Create(columnName, value)],
-            row.Revision));
+            row.Revision),
+            _bindGeneration,
+            row,
+            columnName);
+    }
+
+    private void GridControl_CellEditEnded(
+        object sender,
+        WinUI.TableView.TableViewCellEditEndedEventArgs args)
+    {
+        EditOperation? operation = _editStager.Complete(
+            args.EditAction == WinUI.TableView.TableViewEditAction.Commit,
+            _bindGeneration,
+            args.DataItem,
+            args.Column.Tag as string);
+        if (operation is not null)
+        {
+            AnnounceEdit(operation);
+        }
     }
 
     private static bool TryParseInlineValue(

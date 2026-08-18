@@ -45,6 +45,7 @@ public sealed class CountryQuotaMaintenanceService : ICountryQuotaMaintenanceSer
             sqlitePath,
             MaintenanceToolKind.CountryChampionshipQuota,
             Requirements,
+            ["STA_country"],
             cancellationToken);
 
     public Task<CountryQuotaPreview> PreviewAsync(

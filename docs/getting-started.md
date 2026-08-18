@@ -67,6 +67,7 @@ A failure before destination replacement preserves the session's prior dirty sta
 ## Edit safely
 
 - Inline editing preserves the cell's current Integer, Real, or Text SQLite storage class.
+- Inline values are validated before TableView commits, but the database mutation and grid refresh begin only after the control reports that editing has ended. Double-click, Enter, F2, click-away, and Escape therefore stay within the native cell-edit lifecycle.
 - **Edit row** can explicitly write Integer, Real, Text, or NULL values.
 - All mutations use transactions. Updates, deletes, Undo, and Redo use typed row-revision or row-presence guards; maintenance uses snapshot fingerprints; inserts validate their assigned or returned identity. Stale state is rejected instead of overwriting newer data.
 - BLOB values show their type and size but cannot be edited. Session history may still contain complete typed row snapshots, including BLOB data required for Undo.
@@ -93,7 +94,11 @@ Normal close and discard paths clean the active session, but there is no age- or
 
 ## Maintenance tools
 
-The app includes **Rider recovery preset**, **January 1 season-stage repair**, and **World and European country quotas**. Each tool checks the current database, shows what it will change, requires confirmation, and rejects a stale snapshot before applying a transaction. See [Maintenance tools](specialized-tools.md) for the exact schema and calculation rules.
+The primary navigation includes a dedicated **Create Rider** wizard. **Maintenance** contains **Rider recovery preset**, **January 1 season-stage repair**, and **World and European country quotas**. Each workflow checks the current database, shows what it will change, requires confirmation, and rejects a stale snapshot before applying a transaction.
+
+For rider recovery, choose **Entire team** to resolve the current `DYN_cyclist.fkIDteam` roster, or **Rider IDs** to enter positive IDs separated by commas, semicolons, or whitespace. **Use selected rows** copies suitable IDs from the table grid when convenient; ordinary row selection does not overwrite manual input. Team lookup is optional for recovery, so manual IDs remain usable when `DYN_team` is absent.
+
+Create Rider has six steps: Identity, Profile, Abilities, Contract, Advanced, and Review. Name/ID pickers resolve teams, regions with country context, rider types, favorite races, and other unambiguous relationships. The game display name updates as `Last name F.` until you edit it manually; **Reset to generated** resumes that rule. Favorite races are optional and retain their selected order. Enter all 14 Current abilities from 50 through 85; Limits use the same range but may be blank. Potential accepts half-point values from 0.5 through 6.0. A blank Limit becomes SQLite `NULL` and requires an explicit acknowledgement because in-game generation is unverified. Review shows generated IDs, warnings, the game display name, potential, favorite races, and both complete typed insert maps before the final confirmation. The wizard creates only the core `DYN_cyclist` and `DYN_contract_cyclist` rows; it does not synthesize fitness, season, result, ranking, transfer, or related records. See [Maintenance tools](specialized-tools.md) for the exact schema, defaults, role codes, and transaction rules.
 
 ## Troubleshooting
 
@@ -115,7 +120,7 @@ Views, virtual tables, and tables without a safe identity are browse-only. BLOB 
 
 ### A maintenance tool is unavailable
 
-Open **Maintenance** and review the reported missing table, column, or date gate. Generic browsing remains available even when the exact maintenance schema is absent.
+Open the destination for the affected workflow and review its reported missing table, column, identity, trigger-safety, lookup, or date gate. Create Rider reports its capability state in its own navigation destination. Rider recovery can still use manually entered IDs when only its optional team lookup is unavailable. Generic browsing remains available even when the exact workflow schema is absent.
 
 ### Saving fails
 

@@ -5,7 +5,10 @@ using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Automation.Peers;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.Data.Sqlite;
+using System.Collections.ObjectModel;
 using System.Data;
+using System.Globalization;
+using System.Text;
 using PcmCdbEditor.Application;
 using PcmCdbEditor.App.ViewModels;
 using PcmCdbEditor.Domain;
@@ -28,6 +31,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly ITableCatalog _tableCatalog;
     private readonly ITableDataStore _tableDataStore;
     private readonly IRiderRecoveryService _riderRecoveryService;
+    private readonly IRiderCreationService _riderCreationService;
     private readonly IJanuaryFirstRepairService _januaryFirstRepairService;
     private readonly ICountryQuotaMaintenanceService _countryQuotaMaintenanceService;
     private readonly ISettingsStore _settingsStore;
@@ -63,6 +67,31 @@ public sealed partial class MainWindow : Window, IDisposable
     private bool _suppressCurrentTableSearch;
     private bool _suppressPageSizeSelection;
     private NavigationViewItem? _lastContentNavigationItem;
+    private Guid? _maintenanceTargetsSessionId;
+    private Guid? _maintenanceTeamsSessionId;
+    private long[] _selectedRecoveryRiderIds = [];
+    private Guid? _riderCreationSessionId;
+    private RiderCreationDraft? _riderCreationDraft;
+    private RiderCreationPreview? _riderCreationPreview;
+    private RiderLookupOption? _riderCreationTeam;
+    private RiderLookupOption? _riderCreationRegion;
+    private RiderLookupOption? _riderCreationType;
+    private RiderLookupOption? _riderFavoriteRaceCandidate;
+    private RiderLookupTarget? _riderTeamLookup;
+    private RiderLookupTarget? _riderRegionLookup;
+    private RiderLookupTarget? _riderTypeLookup;
+    private RiderLookupTarget? _riderFavoriteRaceLookup;
+    private readonly ObservableCollection<RiderLookupOption> _riderFavoriteRaces = [];
+    private readonly RiderGameDisplayNameState _riderGameDisplayNameState = new();
+    private readonly Dictionary<AutoSuggestBox, CancellationTokenSource> _riderLookupCancellations = [];
+    private readonly List<RiderAbilityEditor> _riderAbilityEditors = [];
+    private readonly List<RiderAdvancedFieldEditor> _riderAdvancedEditors = [];
+    private readonly List<RiderAdvancedFieldEditor> _contractAdvancedEditors = [];
+    private int _riderCreationStep;
+    private int _riderCreationMaxVisitedStep;
+    private bool _suppressRiderLookupText;
+    private bool _suppressFavoriteRaceText;
+    private bool _suppressRiderGameDisplayNameEvents;
 
     public MainWindow(
         string? launchPath,
@@ -70,6 +99,7 @@ public sealed partial class MainWindow : Window, IDisposable
         ITableCatalog tableCatalog,
         ITableDataStore tableDataStore,
         IRiderRecoveryService riderRecoveryService,
+        IRiderCreationService riderCreationService,
         IJanuaryFirstRepairService januaryFirstRepairService,
         ICountryQuotaMaintenanceService countryQuotaMaintenanceService,
         ISettingsStore settingsStore,
@@ -80,6 +110,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _tableCatalog = tableCatalog ?? throw new ArgumentNullException(nameof(tableCatalog));
         _tableDataStore = tableDataStore ?? throw new ArgumentNullException(nameof(tableDataStore));
         _riderRecoveryService = riderRecoveryService ?? throw new ArgumentNullException(nameof(riderRecoveryService));
+        _riderCreationService = riderCreationService ?? throw new ArgumentNullException(nameof(riderCreationService));
         _januaryFirstRepairService = januaryFirstRepairService ?? throw new ArgumentNullException(nameof(januaryFirstRepairService));
         _countryQuotaMaintenanceService = countryQuotaMaintenanceService ??
             throw new ArgumentNullException(nameof(countryQuotaMaintenanceService));
@@ -89,6 +120,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _mutationWriteAhead = new MutationWriteAhead(_workspaceService);
 
         InitializeComponent();
+        RiderFavoriteRacesList.ItemsSource = _riderFavoriteRaces;
         _lastContentNavigationItem = TablesNavigationItem;
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
@@ -408,6 +440,7 @@ public sealed partial class MainWindow : Window, IDisposable
         DisposeTableCoordinators();
         _session = session;
         _catalog = catalog;
+        ResetMaintenanceTargetsForSession(session.SessionId);
         _tableTabs.Clear();
         TableTabs.TabItems.Clear();
         ViewModel.Tabs.Clear();
@@ -454,6 +487,10 @@ public sealed partial class MainWindow : Window, IDisposable
 
         await RememberRecentFileAsync(session.SourceCdbPath, cancellationToken);
         SetReadyState();
+        if (ReferenceEquals(Navigation.SelectedItem, CreateRiderNavigationItem))
+        {
+            await InitializeRiderCreationAsync(session, cancellationToken);
+        }
     }
 
     private async void TablesList_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -907,7 +944,8 @@ public sealed partial class MainWindow : Window, IDisposable
         InspectorValues.ItemsSource = null;
         _selectedRow = null;
         SetSelectedRowActionsEnabled(isEnabled: false);
-        RiderIdsTextBox.Text = string.Empty;
+        _selectedRecoveryRiderIds = [];
+        UseSelectedRiderRowsButton.IsEnabled = false;
         if (selection.CurrentRow is null ||
             TableTabs.SelectedItem is not TabViewItem tab ||
             tab.Tag is not TableTabContext context)
@@ -929,7 +967,9 @@ public sealed partial class MainWindow : Window, IDisposable
             .Distinct()
             .Order()
             .ToArray();
-        RiderIdsTextBox.Text = string.Join(", ", selectedCyclistIds);
+        _selectedRecoveryRiderIds = selectedCyclistIds;
+        UseSelectedRiderRowsButton.IsEnabled = RecoveryIdsModeRadioButton.IsChecked == true
+            && selectedCyclistIds.Length != 0;
         if (row is null)
         {
             InspectorHeading.Text = "No row selected";
@@ -1566,6 +1606,44 @@ public sealed partial class MainWindow : Window, IDisposable
         ComboBox StorageClassPicker,
         CheckBox NullBox,
         CheckBox UseDefaultBox);
+
+    private sealed record RiderAbilityEditor(
+        RiderAbilityDefinition Definition,
+        NumberBox Current,
+        NumberBox Limit,
+        TextBlock Warning);
+
+    private sealed class RiderAdvancedFieldEditor
+    {
+        public RiderAdvancedFieldEditor(
+            RiderCreationField field,
+            FrameworkElement valueEditor,
+            CheckBox? nullBox,
+            CheckBox? useDefaultBox)
+        {
+            Field = field;
+            ValueEditor = valueEditor;
+            NullBox = nullBox;
+            UseDefaultBox = useDefaultBox;
+        }
+
+        public RiderCreationField Field { get; }
+
+        public FrameworkElement ValueEditor { get; }
+
+        public CheckBox? NullBox { get; }
+
+        public CheckBox? UseDefaultBox { get; }
+
+        public RiderLookupOption? SelectedLookup { get; set; }
+
+        public CancellationTokenSource? SearchCancellation { get; set; }
+    }
+
+    private sealed record RiderRoleOption(RiderContractRole Role, string Label)
+    {
+        public override string ToString() => $"{Label} · {(int)Role}";
+    }
 
     private async void Undo_Click(object sender, RoutedEventArgs e)
     {
@@ -3314,12 +3392,27 @@ public sealed partial class MainWindow : Window, IDisposable
         string? tag = (args.SelectedItem as NavigationViewItem)?.Tag as string;
         TablesView.Visibility = tag is null or "tables" ? Visibility.Visible : Visibility.Collapsed;
         MaintenanceView.Visibility = tag == "maintenance" ? Visibility.Visible : Visibility.Collapsed;
+        RiderCreationView.Visibility = tag == "create-rider" ? Visibility.Visible : Visibility.Collapsed;
         RecoveryView.Visibility = tag == "recovery" ? Visibility.Visible : Visibility.Collapsed;
         if (tag == "maintenance")
         {
             ViewModel.Status = _session is null
                 ? "Open a CDB file to use maintenance tools."
                 : "Choose a maintenance tool to check and preview.";
+            if (_session is not null)
+            {
+                await LoadMaintenanceTeamsAsync(_session, _lifetimeCancellation.Token);
+            }
+        }
+        else if (tag == "create-rider")
+        {
+            ViewModel.Status = _session is null
+                ? "Open a CDB file to create a rider."
+                : "Preparing the Create Rider workflow…";
+            if (_session is not null)
+            {
+                await InitializeRiderCreationAsync(_session, _lifetimeCancellation.Token);
+            }
         }
         else if (tag == "recovery")
         {
@@ -3627,6 +3720,1691 @@ public sealed partial class MainWindow : Window, IDisposable
         }
     }
 
+    private void RecoveryTargetMode_Changed(object sender, RoutedEventArgs e)
+    {
+        if (RiderIdsTextBox is null || RiderRecoveryTeamComboBox is null)
+        {
+            return;
+        }
+
+        bool useTeam = RecoveryTeamModeRadioButton.IsChecked == true;
+        RiderIdsTextBox.IsEnabled = !useTeam;
+        UseSelectedRiderRowsButton.IsEnabled = !useTeam && _selectedRecoveryRiderIds.Length != 0;
+        RiderRecoveryTeamComboBox.IsEnabled = useTeam
+            && _maintenanceTeamsSessionId == _session?.SessionId
+            && RiderRecoveryTeamComboBox.Items.Count != 0;
+    }
+
+    private void UseSelectedRiderRows_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selectedRecoveryRiderIds.Length == 0)
+        {
+            PresentWarning(
+                "No rider IDs in the selection",
+                "Select rows containing an integer IDcyclist or fkIDcyclist value, then try again.");
+            return;
+        }
+
+        RecoveryIdsModeRadioButton.IsChecked = true;
+        RiderIdsTextBox.Text = string.Join(", ", _selectedRecoveryRiderIds);
+        RiderIdsTextBox.Focus(FocusState.Programmatic);
+        RiderIdsTextBox.SelectAll();
+    }
+
+    private void ResetMaintenanceTargetsForSession(Guid? sessionId)
+    {
+        if (_maintenanceTargetsSessionId == sessionId)
+        {
+            return;
+        }
+
+        _maintenanceTargetsSessionId = sessionId;
+        _maintenanceTeamsSessionId = null;
+        _selectedRecoveryRiderIds = [];
+        RiderIdsTextBox.Text = string.Empty;
+        UseSelectedRiderRowsButton.IsEnabled = false;
+        RiderRecoveryTeamComboBox.ItemsSource = null;
+        RiderRecoveryTeamComboBox.SelectedItem = null;
+        RiderRecoveryTeamComboBox.IsEnabled = false;
+        RiderRecoveryTeamComboBox.PlaceholderText = "Loading teams…";
+        RiderRecoveryTeamStatusText.Text = sessionId is null
+            ? "Open a database to load teams. Rider IDs remain available without team tables."
+            : "Team choices have not been loaded for this session yet.";
+        ResetRiderCreationForSession(sessionId);
+    }
+
+    private async Task LoadMaintenanceTeamsAsync(
+        EditorSessionState session,
+        CancellationToken cancellationToken)
+    {
+        if (_maintenanceTeamsSessionId == session.SessionId)
+        {
+            RecoveryTargetMode_Changed(this, new RoutedEventArgs());
+            return;
+        }
+
+        RiderRecoveryTeamStatusText.Text = "Loading teams…";
+        RiderRecoveryTeamComboBox.IsEnabled = false;
+        try
+        {
+            IReadOnlyList<RiderTeamOption> teams = await _riderRecoveryService.ListTeamsAsync(
+                session.WorkingSqlitePath,
+                cancellationToken);
+            if (_session?.SessionId != session.SessionId)
+            {
+                return;
+            }
+
+            _maintenanceTeamsSessionId = session.SessionId;
+            RiderRecoveryTeamComboBox.ItemsSource = teams;
+            RiderRecoveryTeamStatusText.Text = teams.Count == 0
+                ? "No teams were found. Rider IDs can still be entered directly."
+                : $"{teams.Count:N0} teams loaded for this session.";
+            RecoveryTargetMode_Changed(this, new RoutedEventArgs());
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Navigation or shutdown owns cancellation.
+        }
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+        {
+            if (_session?.SessionId != session.SessionId)
+            {
+                return;
+            }
+
+            _maintenanceTeamsSessionId = session.SessionId;
+            RiderRecoveryTeamStatusText.Text =
+                "Team lookup is unavailable for this database. Enter rider IDs directly instead.";
+            RiderRecoveryTeamComboBox.PlaceholderText = "Team lookup unavailable";
+            RecoveryIdsModeRadioButton.IsChecked = true;
+        }
+    }
+
+    private void ResetRiderCreationForSession(Guid? sessionId)
+    {
+        foreach (CancellationTokenSource cancellation in _riderLookupCancellations.Values)
+        {
+            cancellation.Cancel();
+            cancellation.Dispose();
+        }
+
+        _riderLookupCancellations.Clear();
+        foreach (RiderAdvancedFieldEditor editor in _riderAdvancedEditors.Concat(_contractAdvancedEditors))
+        {
+            editor.SearchCancellation?.Cancel();
+            editor.SearchCancellation?.Dispose();
+        }
+
+        _riderCreationSessionId = null;
+        _riderCreationDraft = null;
+        _riderCreationPreview = null;
+        _riderCreationTeam = null;
+        _riderCreationRegion = null;
+        _riderCreationType = null;
+        _riderFavoriteRaceCandidate = null;
+        _riderTeamLookup = null;
+        _riderRegionLookup = null;
+        _riderTypeLookup = null;
+        _riderFavoriteRaceLookup = null;
+        _riderFavoriteRaces.Clear();
+        _riderGameDisplayNameState.Reset(string.Empty, string.Empty);
+        _riderAbilityEditors.Clear();
+        _riderAdvancedEditors.Clear();
+        _contractAdvancedEditors.Clear();
+        RiderAbilityRowsPanel.Children.Clear();
+        RiderAdvancedFieldsPanel.Children.Clear();
+        ContractAdvancedFieldsPanel.Children.Clear();
+        _suppressRiderGameDisplayNameEvents = true;
+        RiderFirstNameTextBox.Text = string.Empty;
+        RiderLastNameTextBox.Text = string.Empty;
+        RiderGameDisplayNameTextBox.Text = string.Empty;
+        _suppressRiderGameDisplayNameEvents = false;
+        RiderPhotoTextBox.Text = string.Empty;
+        RiderSoundNameTextBox.Text = string.Empty;
+        RiderBirthDatePicker.Date = null;
+        RiderHeightNumberBox.Value = double.NaN;
+        RiderWeightNumberBox.Value = double.NaN;
+        RiderBulkCurrentNumberBox.Value = double.NaN;
+        RiderBulkLimitNumberBox.Value = double.NaN;
+        RiderPotentialNumberBox.Value = 3.0;
+        RiderWageNumberBox.Value = double.NaN;
+        RiderContractEndYearNumberBox.Value = double.NaN;
+        RiderRoleComboBox.ItemsSource = null;
+        RiderRoleComboBox.SelectedItem = null;
+        RiderMissingLimitsAcknowledgement.IsChecked = false;
+        RiderMissingLimitsAcknowledgement.Visibility = Visibility.Collapsed;
+        RiderReviewSummaryText.Text = string.Empty;
+        RiderReviewFavoriteRacesText.Text = string.Empty;
+        RiderReviewAbilitiesText.Text = string.Empty;
+        RiderReviewTechnicalValuesTextBox.Text = string.Empty;
+        RiderReviewWarningInfo.IsOpen = false;
+        RiderAbilityWarningInfo.IsOpen = false;
+        _suppressRiderLookupText = true;
+        RiderTeamSuggestBox.Text = string.Empty;
+        RiderRegionSuggestBox.Text = string.Empty;
+        RiderTypeSuggestBox.Text = string.Empty;
+        RiderTeamSuggestBox.ItemsSource = null;
+        RiderRegionSuggestBox.ItemsSource = null;
+        RiderTypeSuggestBox.ItemsSource = null;
+        _suppressRiderLookupText = false;
+        _suppressFavoriteRaceText = true;
+        RiderFavoriteRaceSuggestBox.Text = string.Empty;
+        RiderFavoriteRaceSuggestBox.ItemsSource = null;
+        _suppressFavoriteRaceText = false;
+        AddFavoriteRaceButton.IsEnabled = false;
+        RiderFavoriteRaceStatusText.Text = "No favorite races selected.";
+        RiderCreationStepContentControl.IsEnabled = false;
+        RiderCreationNextButton.IsEnabled = false;
+        CreateRiderButton.IsEnabled = false;
+        RiderCreationCapabilityInfo.IsOpen = true;
+        RiderCreationCapabilityInfo.Severity = InfoBarSeverity.Informational;
+        RiderCreationCapabilityInfo.Title = sessionId is null
+            ? "Open a CDB to create a rider"
+            : "Checking Create Rider requirements";
+        RiderCreationCapabilityInfo.Message = sessionId is null
+            ? "The wizard checks the open database schema before enabling creation."
+            : "The open database is being checked without changing it.";
+        _riderCreationStep = 0;
+        _riderCreationMaxVisitedStep = 0;
+        ShowRiderCreationStep(0);
+    }
+
+    private async Task InitializeRiderCreationAsync(
+        EditorSessionState session,
+        CancellationToken cancellationToken)
+    {
+        if (_riderCreationSessionId == session.SessionId && _riderCreationDraft is not null)
+        {
+            ViewModel.Status = $"Create Rider draft retained · Step {_riderCreationStep + 1} of 6.";
+            return;
+        }
+
+        ResetRiderCreationForSession(session.SessionId);
+        try
+        {
+            MaintenanceCapability capability = await _riderCreationService.CheckCapabilityAsync(
+                session.WorkingSqlitePath,
+                cancellationToken);
+            if (_session?.SessionId != session.SessionId)
+            {
+                return;
+            }
+
+            if (!capability.IsEnabled)
+            {
+                RiderCreationCapabilityInfo.Severity = InfoBarSeverity.Warning;
+                RiderCreationCapabilityInfo.Title = "Create Rider is unavailable for this database";
+                RiderCreationCapabilityInfo.Message = FormatCapabilityDetails(capability);
+                ViewModel.Status = "The open database does not support Create Rider.";
+                return;
+            }
+
+            RiderCreationDraft draft = await _riderCreationService.PrepareAsync(
+                session.WorkingSqlitePath,
+                cancellationToken);
+            if (_session?.SessionId != session.SessionId)
+            {
+                return;
+            }
+
+            _riderCreationSessionId = session.SessionId;
+            _riderCreationDraft = draft;
+            _riderTeamLookup = RequireRiderLookup(draft, "DYN_cyclist", "fkIDteam");
+            _riderRegionLookup = RequireRiderLookup(draft, "DYN_cyclist", "fkIDregion");
+            _riderTypeLookup = RequireRiderLookup(draft, "DYN_cyclist", "fkIDtype_rider");
+            _riderFavoriteRaceLookup = draft.FavoriteRaceLookupTarget;
+            RiderBirthDatePicker.MaxDate = new DateTimeOffset(
+                draft.SaveDate.Year,
+                draft.SaveDate.Month,
+                draft.SaveDate.Day,
+                0,
+                0,
+                0,
+                TimeSpan.Zero);
+            RiderContractEndYearNumberBox.Minimum = draft.SaveYear;
+            string profileGuidance = CreateObservedProfileGuidance(draft);
+            RiderProfileGuidanceText.Text = profileGuidance;
+            AutomationProperties.SetHelpText(RiderHeightNumberBox, profileGuidance);
+            AutomationProperties.SetHelpText(RiderWeightNumberBox, profileGuidance);
+            RiderRoleComboBox.ItemsSource = CreateRiderRoleOptions();
+            BuildRiderAbilityEditors(draft);
+            BuildRiderAdvancedEditors(draft);
+            RiderCreationStepContentControl.IsEnabled = true;
+            RiderCreationNextButton.IsEnabled = true;
+            RiderCreationCapabilityInfo.IsOpen = false;
+            ViewModel.Status = "Create Rider is ready. Complete Identity to continue.";
+            await LoadInitialRiderLookupsAsync(session, cancellationToken);
+            RiderFirstNameTextBox.Focus(FocusState.Programmatic);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Navigation, session replacement, or shutdown owns cancellation.
+        }
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+        {
+            if (_session?.SessionId != session.SessionId)
+            {
+                return;
+            }
+
+            RiderCreationCapabilityInfo.IsOpen = true;
+            RiderCreationCapabilityInfo.Severity = InfoBarSeverity.Error;
+            RiderCreationCapabilityInfo.Title = "Create Rider could not be prepared";
+            RiderCreationCapabilityInfo.Message = SafeFailureMessage(
+                exception,
+                "The database was not changed. Reopen the CDB and try again.");
+            ViewModel.Status = "Create Rider could not be prepared.";
+        }
+    }
+
+    private static string FormatCapabilityDetails(MaintenanceCapability capability)
+    {
+        var details = new List<string>(capability.Reasons);
+        if (capability.MissingTables.Count != 0)
+        {
+            details.Add($"Missing tables: {string.Join(", ", capability.MissingTables)}.");
+        }
+
+        if (capability.MissingColumns.Count != 0)
+        {
+            details.Add($"Missing columns: {string.Join(", ", capability.MissingColumns)}.");
+        }
+
+        return details.Count == 0
+            ? "The required rider-creation schema is unavailable."
+            : string.Join(' ', details);
+    }
+
+    private static RiderLookupTarget RequireRiderLookup(
+        RiderCreationDraft draft,
+        string tableName,
+        string columnName) =>
+        draft.Fields.FirstOrDefault(field =>
+                field.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase)
+                && field.Column.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase))?.LookupTarget
+            ?? throw new InvalidDataException($"The required lookup for {tableName}.{columnName} is unavailable.");
+
+    private static RiderRoleOption[] CreateRiderRoleOptions() =>
+    [
+        new(RiderContractRole.AbsoluteLeader, "Absolute leader"),
+        new(RiderContractRole.AbsoluteSprinter, "Absolute sprinter"),
+        new(RiderContractRole.Leader, "Leader"),
+        new(RiderContractRole.Sprinter, "Sprinter"),
+        new(RiderContractRole.ImportantRider, "Important rider"),
+        new(RiderContractRole.LuxuryTeammate, "Luxury teammate"),
+        new(RiderContractRole.Teammate, "Teammate")
+    ];
+
+    private static string CreateObservedProfileGuidance(RiderCreationDraft draft)
+    {
+        string height = draft.ObservedMinimumHeight is int minimumHeight
+            && draft.ObservedMaximumHeight is int maximumHeight
+            ? $"Observed height range in this save: {minimumHeight}–{maximumHeight} cm."
+            : "This save has no positive rider heights to use as guidance.";
+        string weight = draft.ObservedMinimumWeight is int minimumWeight
+            && draft.ObservedMaximumWeight is int maximumWeight
+            ? $"Observed weight range: {minimumWeight}–{maximumWeight} kg."
+            : "This save has no positive rider weights to use as guidance.";
+        return $"Birth date, height, and weight are required. {height} {weight} These ranges are guidance only.";
+    }
+
+    private void BuildRiderAbilityEditors(RiderCreationDraft draft)
+    {
+        RiderAbilityRowsPanel.Children.Clear();
+        _riderAbilityEditors.Clear();
+        foreach (RiderAbilityDefinition definition in draft.Abilities)
+        {
+            var current = new NumberBox
+            {
+                Minimum = 50,
+                Maximum = 85,
+                SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact,
+            };
+            var limit = new NumberBox
+            {
+                Minimum = 50,
+                Maximum = 85,
+                SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact,
+            };
+            AutomationProperties.SetAutomationId(current, $"RiderAbilityCurrent_{definition.Key}");
+            AutomationProperties.SetName(current, $"{definition.Label} Current ability");
+            AutomationProperties.SetAutomationId(limit, $"RiderAbilityLimit_{definition.Key}");
+            AutomationProperties.SetName(limit, $"{definition.Label} ability Limit, optional");
+            var warning = new TextBlock
+            {
+                Foreground = (Microsoft.UI.Xaml.Media.Brush)Microsoft.UI.Xaml.Application.Current.Resources["SystemFillColorCautionBrush"],
+                TextWrapping = TextWrapping.Wrap,
+                Visibility = Visibility.Collapsed,
+            };
+            var grid = new Grid { ColumnSpacing = 12 };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(220) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(160) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(160) });
+            var label = new TextBlock
+            {
+                Text = definition.Label,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            Grid.SetColumn(current, 1);
+            Grid.SetColumn(limit, 2);
+            grid.Children.Add(label);
+            grid.Children.Add(current);
+            grid.Children.Add(limit);
+            var row = new StackPanel { Spacing = 4 };
+            row.Children.Add(grid);
+            row.Children.Add(warning);
+            RiderAbilityRowsPanel.Children.Add(row);
+            var editor = new RiderAbilityEditor(definition, current, limit, warning);
+            current.Tag = editor;
+            limit.Tag = editor;
+            current.ValueChanged += RiderAbilityValue_Changed;
+            limit.ValueChanged += RiderAbilityValue_Changed;
+            _riderAbilityEditors.Add(editor);
+        }
+    }
+
+    private void BuildRiderAdvancedEditors(RiderCreationDraft draft)
+    {
+        RiderAdvancedFieldsPanel.Children.Clear();
+        ContractAdvancedFieldsPanel.Children.Clear();
+        _riderAdvancedEditors.Clear();
+        _contractAdvancedEditors.Clear();
+        foreach (RiderCreationField field in draft.Fields.Where(static field => field.IsEditable && !field.IsLocked))
+        {
+            (StackPanel panel, RiderAdvancedFieldEditor editor) = CreateRiderAdvancedFieldEditor(field);
+            if (field.TableName.Equals("DYN_cyclist", StringComparison.OrdinalIgnoreCase))
+            {
+                RiderAdvancedFieldsPanel.Children.Add(panel);
+                _riderAdvancedEditors.Add(editor);
+            }
+            else
+            {
+                ContractAdvancedFieldsPanel.Children.Add(panel);
+                _contractAdvancedEditors.Add(editor);
+            }
+        }
+
+        RiderAdvancedExpander.Header = $"Rider game data ({_riderAdvancedEditors.Count + 1:N0})";
+        ContractAdvancedExpander.Header = $"Contract game data ({_contractAdvancedEditors.Count:N0})";
+        if (_riderAdvancedEditors.Count == 0)
+        {
+            RiderAdvancedFieldsPanel.Children.Add(new TextBlock { Text = "No additional rider fields are writable." });
+        }
+
+        if (_contractAdvancedEditors.Count == 0)
+        {
+            ContractAdvancedFieldsPanel.Children.Add(new TextBlock { Text = "No additional contract fields are writable." });
+        }
+    }
+
+    private (StackPanel Panel, RiderAdvancedFieldEditor Editor) CreateRiderAdvancedFieldEditor(
+        RiderCreationField field)
+    {
+        FrameworkElement valueEditor;
+        if (field.LookupTarget is not null)
+        {
+            valueEditor = new AutoSuggestBox
+            {
+                PlaceholderText = "Search by name or ID",
+                Text = FormatAdvancedLookupDefault(field),
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+            };
+        }
+        else if (field.Column.Affinity is SqliteAffinity.Integer or SqliteAffinity.Real or SqliteAffinity.Numeric)
+        {
+            valueEditor = new NumberBox
+            {
+                Value = field.Value.Kind switch
+                {
+                    SqliteValueKind.Integer => field.Value.IntegerValue,
+                    SqliteValueKind.Real => field.Value.RealValue,
+                    _ => double.NaN,
+                },
+                SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact,
+            };
+        }
+        else
+        {
+            valueEditor = new TextBox
+            {
+                Text = field.Value.Kind == SqliteValueKind.Text ? field.Value.TextValue ?? string.Empty : string.Empty,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+            };
+        }
+
+        AutomationProperties.SetAutomationId(
+            valueEditor,
+            $"RiderAdvanced_{field.TableName}_{field.Column.Name}");
+        AutomationProperties.SetName(valueEditor, field.Label);
+        string? helpText = CreateAdvancedFieldHelpText(field);
+        if (helpText is not null)
+        {
+            AutomationProperties.SetHelpText(valueEditor, helpText);
+        }
+        CheckBox? nullBox = field.Column.IsNullable && !field.UsesDatabaseDefault
+            ? new CheckBox
+            {
+                Content = "Store NULL",
+                IsChecked = field.Value.Kind == SqliteValueKind.Null,
+            }
+            : null;
+        CheckBox? useDefaultBox = field.UsesDatabaseDefault
+            ? new CheckBox
+            {
+                Content = "Use database default",
+                IsChecked = true,
+            }
+            : null;
+        var editor = new RiderAdvancedFieldEditor(field, valueEditor, nullBox, useDefaultBox);
+        valueEditor.Tag = editor;
+        if (valueEditor is AutoSuggestBox suggestBox)
+        {
+            suggestBox.TextChanged += RiderAdvancedLookup_TextChanged;
+            suggestBox.SuggestionChosen += RiderAdvancedLookup_SuggestionChosen;
+        }
+
+        if (nullBox is not null)
+        {
+            nullBox.Tag = editor;
+            nullBox.Checked += RiderAdvancedMode_Changed;
+            nullBox.Unchecked += RiderAdvancedMode_Changed;
+        }
+
+        if (useDefaultBox is not null)
+        {
+            useDefaultBox.Tag = editor;
+            useDefaultBox.Checked += RiderAdvancedMode_Changed;
+            useDefaultBox.Unchecked += RiderAdvancedMode_Changed;
+        }
+
+        UpdateAdvancedEditorEnabled(editor);
+        var panel = new StackPanel { Spacing = 5 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = field.Label,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap,
+        });
+        panel.Children.Add(new TextBlock
+        {
+            Text = $"{field.TableName}.{field.Column.Name} · {field.Column.Affinity}",
+            FontSize = 12,
+            Foreground = (Microsoft.UI.Xaml.Media.Brush)Microsoft.UI.Xaml.Application.Current.Resources["TextFillColorSecondaryBrush"],
+            TextWrapping = TextWrapping.Wrap,
+        });
+        if (helpText is not null)
+        {
+            panel.Children.Add(new TextBlock
+            {
+                Text = helpText,
+                FontSize = 12,
+                Foreground = (Microsoft.UI.Xaml.Media.Brush)Microsoft.UI.Xaml.Application.Current.Resources["TextFillColorSecondaryBrush"],
+                TextWrapping = TextWrapping.Wrap,
+            });
+        }
+        panel.Children.Add(valueEditor);
+        if (nullBox is not null)
+        {
+            panel.Children.Add(nullBox);
+        }
+
+        if (useDefaultBox is not null)
+        {
+            panel.Children.Add(useDefaultBox);
+        }
+
+        return (panel, editor);
+    }
+
+    private static string? CreateAdvancedFieldHelpText(RiderCreationField field)
+    {
+        if (field.LookupTarget is not null)
+        {
+            return $"Searches {field.LookupTarget.TargetTable} and shows its readable label with the stored ID.";
+        }
+
+        if (field.Column.Name.StartsWith("fkID", StringComparison.OrdinalIgnoreCase))
+        {
+            return "No unambiguous lookup relationship was found. Enter the stored numeric ID directly.";
+        }
+
+        if (field.Column.Name.Equals("value_f_current_ability", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Defaults to the arithmetic mean of the 14 Current abilities. This is not claimed to reproduce the game's internal formula.";
+        }
+
+        return null;
+    }
+
+    private static string FormatAdvancedLookupDefault(RiderCreationField field) =>
+        field.Value.Kind == SqliteValueKind.Integer
+            ? $"ID {field.Value.IntegerValue} (clean default)"
+            : string.Empty;
+
+    private void RiderAdvancedMode_Changed(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is RiderAdvancedFieldEditor editor)
+        {
+            UpdateAdvancedEditorEnabled(editor);
+        }
+    }
+
+    private static void UpdateAdvancedEditorEnabled(RiderAdvancedFieldEditor editor)
+    {
+        bool isEnabled = editor.NullBox?.IsChecked != true
+            && editor.UseDefaultBox?.IsChecked != true;
+        if (editor.ValueEditor is Control control)
+        {
+            control.IsEnabled = isEnabled;
+        }
+
+        editor.ValueEditor.Opacity = isEnabled ? 1 : 0.55;
+    }
+
+    private void RiderIdentityName_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_suppressRiderGameDisplayNameEvents)
+        {
+            return;
+        }
+
+        if (_riderGameDisplayNameState.UpdateNames(
+                RiderFirstNameTextBox.Text,
+                RiderLastNameTextBox.Text))
+        {
+            SetRiderGameDisplayNameText(_riderGameDisplayNameState.Value);
+        }
+
+        InvalidateRiderCreationPreview();
+    }
+
+    private void RiderGameDisplayName_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_suppressRiderGameDisplayNameEvents)
+        {
+            return;
+        }
+
+        _riderGameDisplayNameState.Override(RiderGameDisplayNameTextBox.Text);
+        InvalidateRiderCreationPreview();
+    }
+
+    private void ResetRiderGameDisplayName_Click(object sender, RoutedEventArgs e)
+    {
+        _riderGameDisplayNameState.Reset(RiderFirstNameTextBox.Text, RiderLastNameTextBox.Text);
+        SetRiderGameDisplayNameText(_riderGameDisplayNameState.Value);
+        InvalidateRiderCreationPreview();
+        RiderGameDisplayNameTextBox.Focus(FocusState.Programmatic);
+    }
+
+    private void SetRiderGameDisplayNameText(string value)
+    {
+        _suppressRiderGameDisplayNameEvents = true;
+        RiderGameDisplayNameTextBox.Text = value;
+        _suppressRiderGameDisplayNameEvents = false;
+    }
+
+    private async void RiderFavoriteRace_TextChanged(
+        AutoSuggestBox sender,
+        AutoSuggestBoxTextChangedEventArgs args)
+    {
+        if (_suppressFavoriteRaceText || args.Reason != AutoSuggestionBoxTextChangeReason.UserInput)
+        {
+            return;
+        }
+
+        _riderFavoriteRaceCandidate = null;
+        AddFavoriteRaceButton.IsEnabled = false;
+        if (_riderFavoriteRaceLookup is null
+            || _session is null
+            || _riderCreationSessionId != _session.SessionId)
+        {
+            return;
+        }
+
+        if (_riderLookupCancellations.Remove(sender, out CancellationTokenSource? oldCancellation))
+        {
+            oldCancellation.Cancel();
+            oldCancellation.Dispose();
+        }
+
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        _riderLookupCancellations[sender] = cancellation;
+        UpdateFavoriteRaceStatus("Searching races…");
+        try
+        {
+            await Task.Delay(SearchDelayMilliseconds, cancellation.Token);
+            IReadOnlyList<RiderLookupOption> options = await _riderCreationService.SearchLookupAsync(
+                _session.WorkingSqlitePath,
+                _riderFavoriteRaceLookup,
+                sender.Text,
+                50,
+                cancellation.Token);
+            if (!cancellation.IsCancellationRequested && _riderCreationSessionId == _session?.SessionId)
+            {
+                sender.ItemsSource = options;
+                UpdateFavoriteRaceStatus(options.Count == 0 ? "No matching races found." : null);
+            }
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // A newer search or database session owns the suggestions.
+        }
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+        {
+            sender.ItemsSource = Array.Empty<RiderLookupOption>();
+            UpdateFavoriteRaceStatus("Race search is unavailable. Try again or reopen the CDB.");
+        }
+        finally
+        {
+            if (_riderLookupCancellations.TryGetValue(sender, out CancellationTokenSource? current)
+                && ReferenceEquals(current, cancellation))
+            {
+                _riderLookupCancellations.Remove(sender);
+                cancellation.Dispose();
+            }
+        }
+    }
+
+    private void RiderFavoriteRace_SuggestionChosen(
+        AutoSuggestBox sender,
+        AutoSuggestBoxSuggestionChosenEventArgs args)
+    {
+        if (args.SelectedItem is not RiderLookupOption option)
+        {
+            return;
+        }
+
+        _riderFavoriteRaceCandidate = option;
+        _suppressFavoriteRaceText = true;
+        sender.Text = option.ToString();
+        _suppressFavoriteRaceText = false;
+        AddFavoriteRaceButton.IsEnabled = true;
+        UpdateFavoriteRaceStatus("Selected. Choose Add race.");
+    }
+
+    private void AddFavoriteRace_Click(object sender, RoutedEventArgs e)
+    {
+        if (_riderFavoriteRaceCandidate is not { } option)
+        {
+            UpdateFavoriteRaceStatus("Choose a race from the search suggestions first.");
+            RiderFavoriteRaceSuggestBox.Focus(FocusState.Programmatic);
+            return;
+        }
+
+        if (_riderFavoriteRaces.Any(existing => existing.Id == option.Id))
+        {
+            UpdateFavoriteRaceStatus("That race is already selected.");
+            return;
+        }
+
+        _riderFavoriteRaces.Add(option);
+        _riderFavoriteRaceCandidate = null;
+        _suppressFavoriteRaceText = true;
+        RiderFavoriteRaceSuggestBox.Text = string.Empty;
+        RiderFavoriteRaceSuggestBox.ItemsSource = null;
+        _suppressFavoriteRaceText = false;
+        AddFavoriteRaceButton.IsEnabled = false;
+        InvalidateRiderCreationPreview();
+        UpdateFavoriteRaceStatus();
+        RiderFavoriteRaceSuggestBox.Focus(FocusState.Programmatic);
+    }
+
+    private void RemoveFavoriteRace_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is RiderLookupOption option
+            && _riderFavoriteRaces.Remove(option))
+        {
+            InvalidateRiderCreationPreview();
+            UpdateFavoriteRaceStatus();
+            RiderFavoriteRaceSuggestBox.Focus(FocusState.Programmatic);
+        }
+    }
+
+    private void MoveFavoriteRaceUp_Click(object sender, RoutedEventArgs e) =>
+        MoveFavoriteRace(sender, -1);
+
+    private void MoveFavoriteRaceDown_Click(object sender, RoutedEventArgs e) =>
+        MoveFavoriteRace(sender, 1);
+
+    private void MoveFavoriteRace(object sender, int offset)
+    {
+        if ((sender as FrameworkElement)?.Tag is not RiderLookupOption option)
+        {
+            return;
+        }
+
+        int oldIndex = _riderFavoriteRaces.IndexOf(option);
+        int newIndex = oldIndex + offset;
+        if (oldIndex < 0 || newIndex < 0 || newIndex >= _riderFavoriteRaces.Count)
+        {
+            return;
+        }
+
+        _riderFavoriteRaces.Move(oldIndex, newIndex);
+        InvalidateRiderCreationPreview();
+        UpdateFavoriteRaceStatus();
+    }
+
+    private void UpdateFavoriteRaceStatus(string? detail = null)
+    {
+        string count = _riderFavoriteRaces.Count == 0
+            ? "No favorite races selected."
+            : _riderFavoriteRaces.Count == 1
+                ? "1 favorite race selected."
+                : $"{_riderFavoriteRaces.Count:N0} favorite races selected.";
+        RiderFavoriteRaceStatusText.Text = string.IsNullOrWhiteSpace(detail)
+            ? count
+            : _riderFavoriteRaces.Count == 0
+                ? detail
+                : $"{count} {detail}";
+    }
+
+    private void InvalidateRiderCreationPreview()
+    {
+        _riderCreationPreview = null;
+        UpdateCreateRiderButtonState();
+    }
+
+    private async Task LoadInitialRiderLookupsAsync(
+        EditorSessionState session,
+        CancellationToken cancellationToken)
+    {
+        if (_riderTeamLookup is null || _riderRegionLookup is null || _riderTypeLookup is null)
+        {
+            return;
+        }
+
+        Task<IReadOnlyList<RiderLookupOption>> teams = _riderCreationService.SearchLookupAsync(
+            session.WorkingSqlitePath, _riderTeamLookup, string.Empty, 25, cancellationToken);
+        Task<IReadOnlyList<RiderLookupOption>> regions = _riderCreationService.SearchLookupAsync(
+            session.WorkingSqlitePath, _riderRegionLookup, string.Empty, 25, cancellationToken);
+        Task<IReadOnlyList<RiderLookupOption>> types = _riderCreationService.SearchLookupAsync(
+            session.WorkingSqlitePath, _riderTypeLookup, string.Empty, 25, cancellationToken);
+        await Task.WhenAll(teams, regions, types);
+        if (_session?.SessionId != session.SessionId)
+        {
+            return;
+        }
+
+        RiderTeamSuggestBox.ItemsSource = await teams;
+        RiderRegionSuggestBox.ItemsSource = await regions;
+        RiderTypeSuggestBox.ItemsSource = await types;
+    }
+
+    private async void RiderLookup_TextChanged(
+        AutoSuggestBox sender,
+        AutoSuggestBoxTextChangedEventArgs args)
+    {
+        if (_suppressRiderLookupText || args.Reason != AutoSuggestionBoxTextChangeReason.UserInput)
+        {
+            return;
+        }
+
+        SetSelectedCoreLookup(sender, null);
+        RiderLookupTarget? target = (sender.Tag as string) switch
+        {
+            "team" => _riderTeamLookup,
+            "region" => _riderRegionLookup,
+            "type" => _riderTypeLookup,
+            _ => null,
+        };
+        if (target is null || _session is null || _riderCreationSessionId != _session.SessionId)
+        {
+            return;
+        }
+
+        if (_riderLookupCancellations.Remove(sender, out CancellationTokenSource? oldCancellation))
+        {
+            oldCancellation.Cancel();
+            oldCancellation.Dispose();
+        }
+
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        _riderLookupCancellations[sender] = cancellation;
+        try
+        {
+            await Task.Delay(SearchDelayMilliseconds, cancellation.Token);
+            IReadOnlyList<RiderLookupOption> options = await _riderCreationService.SearchLookupAsync(
+                _session.WorkingSqlitePath,
+                target,
+                sender.Text,
+                25,
+                cancellation.Token);
+            if (!cancellation.IsCancellationRequested && _riderCreationSessionId == _session?.SessionId)
+            {
+                sender.ItemsSource = options;
+            }
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // A newer query or session owns the suggestions.
+        }
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+        {
+            sender.ItemsSource = Array.Empty<RiderLookupOption>();
+            RiderCreationCapabilityInfo.IsOpen = true;
+            RiderCreationCapabilityInfo.Severity = InfoBarSeverity.Warning;
+            RiderCreationCapabilityInfo.Title = $"{target.Label} lookup is unavailable";
+            RiderCreationCapabilityInfo.Message = SafeFailureMessage(
+                exception,
+                "The database was not changed. Try a different search or reopen the CDB.");
+        }
+        finally
+        {
+            if (_riderLookupCancellations.TryGetValue(sender, out CancellationTokenSource? current)
+                && ReferenceEquals(current, cancellation))
+            {
+                _riderLookupCancellations.Remove(sender);
+                cancellation.Dispose();
+            }
+        }
+    }
+
+    private void RiderLookup_SuggestionChosen(
+        AutoSuggestBox sender,
+        AutoSuggestBoxSuggestionChosenEventArgs args)
+    {
+        if (args.SelectedItem is not RiderLookupOption option)
+        {
+            return;
+        }
+
+        SetSelectedCoreLookup(sender, option);
+        _suppressRiderLookupText = true;
+        sender.Text = option.ToString();
+        _suppressRiderLookupText = false;
+        InvalidateRiderCreationPreview();
+        if (ReferenceEquals(sender, RiderTeamSuggestBox))
+        {
+            RiderContractTeamText.Text =
+                $"{option.DisplayName} ({option.Id:N0}) will be written to the rider and both contract team fields.";
+        }
+    }
+
+    private void SetSelectedCoreLookup(AutoSuggestBox sender, RiderLookupOption? option)
+    {
+        if (ReferenceEquals(sender, RiderTeamSuggestBox))
+        {
+            _riderCreationTeam = option;
+        }
+        else if (ReferenceEquals(sender, RiderRegionSuggestBox))
+        {
+            _riderCreationRegion = option;
+        }
+        else if (ReferenceEquals(sender, RiderTypeSuggestBox))
+        {
+            _riderCreationType = option;
+        }
+    }
+
+    private async void RiderAdvancedLookup_TextChanged(
+        AutoSuggestBox sender,
+        AutoSuggestBoxTextChangedEventArgs args)
+    {
+        if (args.Reason != AutoSuggestionBoxTextChangeReason.UserInput
+            || sender.Tag is not RiderAdvancedFieldEditor editor
+            || editor.Field.LookupTarget is null
+            || _session is null
+            || _riderCreationSessionId != _session.SessionId)
+        {
+            return;
+        }
+
+        editor.SelectedLookup = null;
+        editor.SearchCancellation?.Cancel();
+        editor.SearchCancellation?.Dispose();
+        editor.SearchCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        CancellationToken token = editor.SearchCancellation.Token;
+        try
+        {
+            await Task.Delay(SearchDelayMilliseconds, token);
+            sender.ItemsSource = await _riderCreationService.SearchLookupAsync(
+                _session.WorkingSqlitePath,
+                editor.Field.LookupTarget,
+                sender.Text,
+                25,
+                token);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            // A newer query or session owns the suggestions.
+        }
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+        {
+            sender.ItemsSource = Array.Empty<RiderLookupOption>();
+        }
+    }
+
+    private static void RiderAdvancedLookup_SuggestionChosen(
+        AutoSuggestBox sender,
+        AutoSuggestBoxSuggestionChosenEventArgs args)
+    {
+        if (sender.Tag is RiderAdvancedFieldEditor editor
+            && args.SelectedItem is RiderLookupOption option)
+        {
+            editor.SelectedLookup = option;
+            sender.Text = option.ToString();
+        }
+    }
+
+    private void RiderCreationStep_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is not string value
+            || !int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int step)
+            || step > _riderCreationMaxVisitedStep)
+        {
+            return;
+        }
+
+        if (step == 5)
+        {
+            OperationInfo.IsOpen = false;
+            _ = PrepareRiderCreationReviewAsync();
+            return;
+        }
+
+        OperationInfo.IsOpen = false;
+        ShowRiderCreationStep(step);
+        ViewModel.Status = $"Create Rider draft retained · Step {_riderCreationStep + 1} of 6.";
+    }
+
+    private void RiderCreationBack_Click(object sender, RoutedEventArgs e)
+    {
+        if (_riderCreationStep > 0)
+        {
+            OperationInfo.IsOpen = false;
+            ShowRiderCreationStep(_riderCreationStep - 1);
+            ViewModel.Status = $"Create Rider draft retained · Step {_riderCreationStep + 1} of 6.";
+        }
+    }
+
+    private async void RiderCreationNext_Click(object sender, RoutedEventArgs e)
+    {
+        if (!ValidateRiderCreationStep(_riderCreationStep, showError: true))
+        {
+            return;
+        }
+
+        if (_riderCreationStep == 4)
+        {
+            OperationInfo.IsOpen = false;
+            await PrepareRiderCreationReviewAsync();
+            return;
+        }
+
+        OperationInfo.IsOpen = false;
+        _riderCreationMaxVisitedStep = Math.Max(_riderCreationMaxVisitedStep, _riderCreationStep + 1);
+        ShowRiderCreationStep(_riderCreationStep + 1);
+        ViewModel.Status = $"Create Rider draft retained · Step {_riderCreationStep + 1} of 6.";
+    }
+
+    private void ShowRiderCreationStep(int step)
+    {
+        _riderCreationStep = Math.Clamp(step, 0, 5);
+        FrameworkElement[] panels =
+        [
+            RiderIdentityStep,
+            RiderProfileStep,
+            RiderAbilitiesStep,
+            RiderContractStep,
+            RiderAdvancedStep,
+            RiderReviewStep,
+        ];
+        Button[] buttons =
+        [
+            RiderStepIdentityButton,
+            RiderStepProfileButton,
+            RiderStepAbilitiesButton,
+            RiderStepContractButton,
+            RiderStepAdvancedButton,
+            RiderStepReviewButton,
+        ];
+        string[] labels = ["Identity", "Profile", "Abilities", "Contract", "Advanced", "Review"];
+        for (var index = 0; index < panels.Length; index++)
+        {
+            panels[index].Visibility = index == _riderCreationStep ? Visibility.Visible : Visibility.Collapsed;
+            buttons[index].IsEnabled = index <= _riderCreationMaxVisitedStep;
+            buttons[index].FontWeight = index == _riderCreationStep
+                ? Microsoft.UI.Text.FontWeights.SemiBold
+                : Microsoft.UI.Text.FontWeights.Normal;
+            AutomationProperties.SetHelpText(
+                buttons[index],
+                index == _riderCreationStep ? "Current step" : "Available Create Rider step");
+        }
+
+        RiderCreationBackButton.IsEnabled = _riderCreationStep > 0;
+        RiderCreationStepStatusText.Text =
+            $"Step {_riderCreationStep + 1} of 6 · {labels[_riderCreationStep]}";
+        RiderCreationNextButton.Visibility = _riderCreationStep == 5
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+        CreateRiderButton.Visibility = _riderCreationStep == 5
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        RiderCreationNextButton.Content = _riderCreationStep switch
+        {
+            0 => "Continue to Profile",
+            1 => "Continue to Abilities",
+            2 => "Continue to Contract",
+            3 => "Continue to Advanced",
+            4 => "Review rider",
+            _ => "Continue",
+        };
+        AutomationProperties.SetName(RiderCreationNextButton, RiderCreationNextButton.Content.ToString()!);
+        FocusRiderCreationStep(_riderCreationStep);
+    }
+
+    private void FocusRiderCreationStep(int step)
+    {
+        if (!RiderCreationStepContentControl.IsEnabled)
+        {
+            return;
+        }
+
+        Control target = step switch
+        {
+            0 => RiderFirstNameTextBox,
+            1 => RiderBirthDatePicker,
+            2 => _riderAbilityEditors.FirstOrDefault()?.Current ?? RiderBulkCurrentNumberBox,
+            3 => RiderRoleComboBox,
+            4 => RiderAdvancedExpander,
+            _ => RiderMissingLimitsAcknowledgement.Visibility == Visibility.Visible
+                ? RiderMissingLimitsAcknowledgement
+                : CreateRiderButton,
+        };
+        target.Focus(FocusState.Programmatic);
+    }
+
+    private void SetAllCurrentAbilities_Click(object sender, RoutedEventArgs e)
+    {
+        if (!IsWholeAbilityValue(RiderBulkCurrentNumberBox.Value))
+        {
+            PresentWarning("Check Current value", "Enter a whole number from 50 to 85 before setting every Current ability.");
+            return;
+        }
+
+        foreach (RiderAbilityEditor editor in _riderAbilityEditors)
+        {
+            editor.Current.Value = RiderBulkCurrentNumberBox.Value;
+        }
+    }
+
+    private void SetAllLimitAbilities_Click(object sender, RoutedEventArgs e)
+    {
+        if (!IsWholeAbilityValue(RiderBulkLimitNumberBox.Value))
+        {
+            PresentWarning("Check Limit value", "Enter a whole number from 50 to 85 before setting every ability Limit.");
+            return;
+        }
+
+        foreach (RiderAbilityEditor editor in _riderAbilityEditors)
+        {
+            editor.Limit.Value = RiderBulkLimitNumberBox.Value;
+        }
+    }
+
+    private void RiderAbilityValue_Changed(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (sender.Tag is RiderAbilityEditor editor)
+        {
+            UpdateRiderAbilityWarning(editor);
+        }
+
+        InvalidateRiderCreationPreview();
+    }
+
+    private void UpdateRiderAbilityWarning(RiderAbilityEditor editor)
+    {
+        bool currentValid = IsWholeAbilityValue(editor.Current.Value);
+        bool limitEntered = !double.IsNaN(editor.Limit.Value);
+        bool limitValid = !limitEntered || IsWholeAbilityValue(editor.Limit.Value);
+        bool exceeds = currentValid && limitValid && limitEntered
+            && editor.Current.Value > editor.Limit.Value;
+        editor.Warning.Text = exceeds
+            ? $"{editor.Definition.Label}: Current {editor.Current.Value:N0} exceeds Limit {editor.Limit.Value:N0}. This is allowed and will not be changed."
+            : string.Empty;
+        editor.Warning.Visibility = exceeds ? Visibility.Visible : Visibility.Collapsed;
+        string[] warnings = _riderAbilityEditors
+            .Where(static item => item.Warning.Visibility == Visibility.Visible)
+            .Select(static item => item.Warning.Text)
+            .ToArray();
+        RiderAbilityWarningInfo.Message = string.Join(' ', warnings);
+        RiderAbilityWarningInfo.IsOpen = warnings.Length != 0;
+    }
+
+    private static bool IsWholeAbilityValue(double value) =>
+        !double.IsNaN(value) && value is >= 50 and <= 85 && Math.Truncate(value) == value;
+
+    private bool ValidateRiderCreationStep(int step, bool showError)
+    {
+        switch (step)
+        {
+            case 0:
+                if (string.IsNullOrWhiteSpace(RiderFirstNameTextBox.Text))
+                {
+                    return RejectRiderStep(
+                        showError, "Enter a first name", "First name is required.", RiderFirstNameTextBox);
+                }
+
+                if (string.IsNullOrWhiteSpace(RiderLastNameTextBox.Text))
+                {
+                    return RejectRiderStep(
+                        showError, "Enter a last name", "Last name is required.", RiderLastNameTextBox);
+                }
+
+                if (_riderCreationTeam is null)
+                {
+                    return RejectRiderStep(
+                        showError, "Choose a team", "Choose a team from the search suggestions.", RiderTeamSuggestBox);
+                }
+
+                if (_riderCreationRegion is null)
+                {
+                    return RejectRiderStep(
+                        showError, "Choose a region", "Choose a region from the search suggestions.", RiderRegionSuggestBox);
+                }
+
+                if (_riderCreationType is null)
+                {
+                    return RejectRiderStep(
+                        showError, "Choose a rider type", "Choose a rider type from the search suggestions.", RiderTypeSuggestBox);
+                }
+
+                return true;
+
+            case 1:
+                if (RiderBirthDatePicker.Date is null)
+                {
+                    return RejectRiderStep(
+                        showError, "Enter a birth date", "Birth date is required.", RiderBirthDatePicker);
+                }
+
+                if (!IsPositiveWholeNumber(RiderHeightNumberBox.Value))
+                {
+                    return RejectRiderStep(
+                        showError, "Check height", "Height must be a positive whole number of centimetres.", RiderHeightNumberBox);
+                }
+
+                if (!IsPositiveWholeNumber(RiderWeightNumberBox.Value))
+                {
+                    return RejectRiderStep(
+                        showError, "Check weight", "Weight must be a positive whole number of kilograms.", RiderWeightNumberBox);
+                }
+
+                return true;
+
+            case 2:
+                if (!IsPotentialValue(RiderPotentialNumberBox.Value))
+                {
+                    return RejectRiderStep(
+                        showError,
+                        "Check potential",
+                        "Potential must be from 0.5 to 6.0 in 0.5 increments.",
+                        RiderPotentialNumberBox);
+                }
+
+                RiderAbilityEditor? invalidCurrent = _riderAbilityEditors.FirstOrDefault(editor =>
+                    !IsWholeAbilityValue(editor.Current.Value));
+                if (invalidCurrent is not null)
+                {
+                    return RejectRiderStep(
+                        showError,
+                        "Check Current abilities",
+                        $"{invalidCurrent.Definition.Label} Current must be a whole number from 50 to 85.",
+                        invalidCurrent.Current);
+                }
+
+                RiderAbilityEditor? invalidLimit = _riderAbilityEditors.FirstOrDefault(editor =>
+                    !double.IsNaN(editor.Limit.Value) && !IsWholeAbilityValue(editor.Limit.Value));
+                if (invalidLimit is not null)
+                {
+                    return RejectRiderStep(
+                        showError,
+                        "Check ability Limits",
+                        $"{invalidLimit.Definition.Label} Limit must be blank or a whole number from 50 to 85.",
+                        invalidLimit.Limit);
+                }
+
+                return _riderAbilityEditors.Count == 14;
+
+            case 3:
+                if (RiderRoleComboBox.SelectedItem is not RiderRoleOption)
+                {
+                    return RejectRiderStep(
+                        showError, "Choose a contract role", "Choose one labelled role and stored code.", RiderRoleComboBox);
+                }
+
+                if (!IsPositiveWholeNumber(RiderWageNumberBox.Value))
+                {
+                    return RejectRiderStep(
+                        showError, "Check contract wage", "Wage must be a positive whole number.", RiderWageNumberBox);
+                }
+
+                if (!IsPositiveWholeNumber(RiderContractEndYearNumberBox.Value)
+                    || _riderCreationDraft is null
+                    || RiderContractEndYearNumberBox.Value < _riderCreationDraft.SaveYear)
+                {
+                    string year = _riderCreationDraft?.SaveYear.ToString(CultureInfo.InvariantCulture) ?? "the save year";
+                    return RejectRiderStep(
+                        showError,
+                        "Check contract end year",
+                        $"Contract end year must be a whole year no earlier than {year}.",
+                        RiderContractEndYearNumberBox);
+                }
+
+                return true;
+
+            case 4:
+                if (string.IsNullOrWhiteSpace(RiderGameDisplayNameTextBox.Text))
+                {
+                    return RejectRiderStep(
+                        showError,
+                        "Check rider display name",
+                        "Rider display name cannot be blank. Reset it to the generated value or enter an override.",
+                        RiderGameDisplayNameTextBox);
+                }
+
+                return TryReadRiderAdvancedValues(out _, out _, out string? error)
+                    || RejectRiderStep(
+                        showError,
+                        "Check Advanced values",
+                        error ?? "One or more Advanced values are invalid.",
+                        RiderAdvancedExpander);
+
+            default:
+                return _riderCreationPreview is not null;
+        }
+    }
+
+    private bool RejectRiderStep(
+        bool showError,
+        string title,
+        string message,
+        Control focusTarget)
+    {
+        if (showError)
+        {
+            PresentWarning(title, message);
+            focusTarget.Focus(FocusState.Programmatic);
+        }
+
+        return false;
+    }
+
+    private static bool IsPositiveWholeNumber(double value) =>
+        !double.IsNaN(value) && value > 0 && value <= long.MaxValue && Math.Truncate(value) == value;
+
+    private static bool IsPotentialValue(double value) =>
+        double.IsFinite(value)
+        && value is >= 0.5 and <= 6.0
+        && Math.Abs((value * 2) - Math.Round(value * 2)) <= 0.0000001;
+
+    private async Task PrepareRiderCreationReviewAsync()
+    {
+        if (_session is null || _riderCreationDraft is null
+            || _riderCreationSessionId != _session.SessionId || ViewModel.IsBusy)
+        {
+            PresentWarning("Create Rider is not ready", "Open a supported CDB and wait for the wizard to finish loading.");
+            return;
+        }
+
+        for (var step = 0; step <= 4; step++)
+        {
+            if (!ValidateRiderCreationStep(step, showError: true))
+            {
+                _riderCreationMaxVisitedStep = Math.Max(_riderCreationMaxVisitedStep, step);
+                ShowRiderCreationStep(step);
+                return;
+            }
+        }
+
+        if (!TryBuildRiderCreationInput(
+                RiderMissingLimitsAcknowledgement.IsChecked == true,
+                out RiderCreationInput? input,
+                out string? error))
+        {
+            PresentWarning("Check rider values", error ?? "The rider draft is incomplete.");
+            return;
+        }
+
+        EditorSessionState session = _session;
+        await RunMaintenanceAsync(
+            "Rider creation preview",
+            async cancellationToken =>
+            {
+                RiderCreationPreview preview = await _riderCreationService.PreviewAsync(
+                    session.WorkingSqlitePath,
+                    input,
+                    cancellationToken);
+                if (_session?.SessionId != session.SessionId)
+                {
+                    return;
+                }
+
+                _riderCreationPreview = preview;
+                PopulateRiderCreationReview(preview);
+                _riderCreationMaxVisitedStep = 5;
+                ShowRiderCreationStep(5);
+                ViewModel.Status = "Review the generated rider and contract before creating them.";
+            });
+    }
+
+    private bool TryBuildRiderCreationInput(
+        bool missingLimitsAcknowledged,
+        out RiderCreationInput input,
+        out string? error)
+    {
+        input = null!;
+        error = null;
+        if (_riderCreationTeam is null || _riderCreationRegion is null || _riderCreationType is null
+            || RiderBirthDatePicker.Date is not DateTimeOffset birthDate
+            || RiderRoleComboBox.SelectedItem is not RiderRoleOption role)
+        {
+            error = "Identity, Profile, or Contract is incomplete.";
+            return false;
+        }
+
+        if (!TryReadRiderAdvancedValues(
+                out Dictionary<string, SqliteValue> riderAdvanced,
+                out Dictionary<string, SqliteValue> contractAdvanced,
+                out error))
+        {
+            return false;
+        }
+
+        try
+        {
+            RiderAbilityInput[] abilities = _riderAbilityEditors.Select(editor =>
+                new RiderAbilityInput(
+                    editor.Definition.Key,
+                    checked((int)editor.Current.Value),
+                    double.IsNaN(editor.Limit.Value) ? null : checked((int)editor.Limit.Value)))
+                .ToArray();
+            input = new RiderCreationInput(
+                RiderFirstNameTextBox.Text,
+                RiderLastNameTextBox.Text,
+                _riderCreationTeam.Id,
+                _riderCreationRegion.Id,
+                _riderCreationType.Id,
+                DateOnly.FromDateTime(birthDate.DateTime),
+                checked((int)RiderHeightNumberBox.Value),
+                checked((int)RiderWeightNumberBox.Value),
+                RiderPhotoTextBox.Text,
+                RiderSoundNameTextBox.Text,
+                abilities,
+                role.Role,
+                checked((long)RiderWageNumberBox.Value),
+                checked((int)RiderContractEndYearNumberBox.Value),
+                missingLimitsAcknowledged,
+                riderAdvanced,
+                contractAdvanced,
+                gameDisplayName: RiderGameDisplayNameTextBox.Text,
+                potential: RiderPotentialNumberBox.Value,
+                favoriteRaceIds: _riderFavoriteRaces.Select(static race => race.Id));
+            return true;
+        }
+        catch (Exception exception) when (exception is ArgumentException or OverflowException)
+        {
+            error = exception.Message;
+            return false;
+        }
+    }
+
+    private bool TryReadRiderAdvancedValues(
+        out Dictionary<string, SqliteValue> riderValues,
+        out Dictionary<string, SqliteValue> contractValues,
+        out string? error)
+    {
+        riderValues = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        contractValues = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        foreach (RiderAdvancedFieldEditor editor in _riderAdvancedEditors.Concat(_contractAdvancedEditors))
+        {
+            if (!TryReadRiderAdvancedValue(editor, out bool include, out SqliteValue value, out error))
+            {
+                return false;
+            }
+
+            if (!include)
+            {
+                continue;
+            }
+
+            Dictionary<string, SqliteValue> target = editor.Field.TableName.Equals(
+                "DYN_cyclist",
+                StringComparison.OrdinalIgnoreCase)
+                    ? riderValues
+                    : contractValues;
+            target.Add(editor.Field.Column.Name, value);
+        }
+
+        error = null;
+        return true;
+    }
+
+    private static bool TryReadRiderAdvancedValue(
+        RiderAdvancedFieldEditor editor,
+        out bool include,
+        out SqliteValue value,
+        out string? error)
+    {
+        include = false;
+        value = SqliteValue.Null;
+        error = null;
+        if (editor.UseDefaultBox?.IsChecked == true)
+        {
+            return true;
+        }
+
+        if (editor.NullBox?.IsChecked == true)
+        {
+            value = SqliteValue.Null;
+            include = editor.Field.Value.Kind != SqliteValueKind.Null;
+            return true;
+        }
+
+        if (editor.ValueEditor is AutoSuggestBox suggestBox)
+        {
+            if (editor.SelectedLookup is null)
+            {
+                if (suggestBox.Text.Equals(
+                        FormatAdvancedLookupDefault(editor.Field),
+                        StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                error = $"Choose {editor.Field.Label} from its search suggestions.";
+                return false;
+            }
+
+            value = SqliteValue.Integer(editor.SelectedLookup.Id);
+        }
+        else if (editor.ValueEditor is NumberBox numberBox)
+        {
+            if (double.IsNaN(numberBox.Value))
+            {
+                if (!editor.Field.Column.IsNullable)
+                {
+                    error = $"{editor.Field.Label} requires a value.";
+                    return false;
+                }
+
+                value = SqliteValue.Null;
+            }
+            else if (editor.Field.Column.Affinity == SqliteAffinity.Integer)
+            {
+                if (Math.Truncate(numberBox.Value) != numberBox.Value
+                    || numberBox.Value < long.MinValue
+                    || numberBox.Value > long.MaxValue)
+                {
+                    error = $"{editor.Field.Label} must be a whole SQLite integer.";
+                    return false;
+                }
+
+                value = SqliteValue.Integer(checked((long)numberBox.Value));
+            }
+            else
+            {
+                value = SqliteValue.Real(numberBox.Value);
+            }
+        }
+        else if (editor.ValueEditor is TextBox textBox)
+        {
+            value = SqliteValue.Text(textBox.Text);
+        }
+        else
+        {
+            error = $"{editor.Field.Label} uses an unsupported editor.";
+            return false;
+        }
+
+        include = value != editor.Field.Value || editor.Field.UsesDatabaseDefault;
+        return true;
+    }
+
+    private void PopulateRiderCreationReview(RiderCreationPreview preview)
+    {
+        RiderRoleOption role = (RiderRoleOption)RiderRoleComboBox.SelectedItem;
+        RiderReviewSummaryText.Text =
+            $"{preview.Input.FirstName} {preview.Input.LastName} will be rider {preview.NewCyclistId:N0} with contract {preview.NewContractId:N0}. " +
+            $"Game display name: {preview.Input.GameDisplayName}. Potential: {preview.Input.Potential:N1}. " +
+            $"Team: {_riderCreationTeam}. Region: {_riderCreationRegion}. Rider type: {_riderCreationType}. " +
+            $"Contract: {role.Label} ({(int)role.Role}), wage {preview.Input.Wage:N0}, through {preview.Input.ContractEndYear}. " +
+            "Both rows are one atomic change and one Undo operation.";
+        RiderReviewFavoriteRacesText.Text = preview.FavoriteRaces.Count == 0
+            ? "None selected · stored as ()"
+            : string.Join(Environment.NewLine, preview.FavoriteRaces.Select(static race => race.ToString()));
+        Dictionary<string, RiderAbilityInput> abilities = preview.Input.Abilities.ToDictionary(
+            static ability => ability.Key,
+            StringComparer.OrdinalIgnoreCase);
+        RiderReviewAbilitiesText.Text = string.Join(
+            Environment.NewLine,
+            _riderCreationDraft!.Abilities.Select(definition =>
+            {
+                RiderAbilityInput ability = abilities[definition.Key];
+                string limit = ability.Limit?.ToString(CultureInfo.InvariantCulture) ?? "NULL";
+                return $"{definition.Label}: Current {ability.Current}, Limit {limit}";
+            }));
+        RiderReviewWarningInfo.Message = string.Join(' ', preview.Warnings);
+        RiderReviewWarningInfo.IsOpen = preview.Warnings.Count != 0;
+        RiderMissingLimitsAcknowledgement.Visibility = preview.MissingLimitKeys.Count == 0
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+        if (preview.MissingLimitKeys.Count == 0)
+        {
+            RiderMissingLimitsAcknowledgement.IsChecked = false;
+        }
+
+        var technical = new StringBuilder();
+        foreach ((string name, SqliteValue value) in preview.RiderValues.OrderBy(
+                     static pair => pair.Key,
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            technical.Append("Rider.");
+            technical.Append(name);
+            technical.Append(" = ");
+            technical.AppendLine(FormatSqliteValue(value));
+        }
+
+        foreach ((string name, SqliteValue value) in preview.ContractValues.OrderBy(
+                     static pair => pair.Key,
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            technical.Append("Contract.");
+            technical.Append(name);
+            technical.Append(" = ");
+            technical.AppendLine(FormatSqliteValue(value));
+        }
+
+        RiderReviewTechnicalValuesTextBox.Text = technical.ToString();
+        UpdateCreateRiderButtonState();
+    }
+
+    private void RiderMissingLimitsAcknowledgement_Changed(object sender, RoutedEventArgs e) =>
+        UpdateCreateRiderButtonState();
+
+    private void UpdateCreateRiderButtonState()
+    {
+        bool hasCurrentPreview = _riderCreationPreview is not null
+            && _session is not null
+            && _riderCreationSessionId == _session.SessionId;
+        CreateRiderButton.IsEnabled = RiderCreationCommandAvailability.CanCreate(
+            hasCurrentPreview,
+            _riderCreationPreview?.MissingLimitKeys.Count ?? 0,
+            RiderMissingLimitsAcknowledgement.IsChecked == true,
+            ViewModel.IsBusy,
+            _operationLease is not null);
+    }
+
+    private async void CreateRider_Click(object sender, RoutedEventArgs e)
+    {
+        if (_session is null || _riderCreationDraft is null
+            || _riderCreationSessionId != _session.SessionId || ViewModel.IsBusy)
+        {
+            return;
+        }
+
+        if (!TryBuildRiderCreationInput(
+                RiderMissingLimitsAcknowledgement.IsChecked == true,
+                out RiderCreationInput? input,
+                out string? error))
+        {
+            PresentWarning("Check rider values", error ?? "The rider draft is incomplete.");
+            return;
+        }
+
+        if (input.Abilities.Any(static ability => ability.Limit is null)
+            && !input.MissingLimitsAcknowledged)
+        {
+            PresentWarning(
+                "Acknowledge blank Limits",
+                "Confirm that blank Limits will be stored as database NULL before creating the rider.");
+            RiderMissingLimitsAcknowledgement.Focus(FocusState.Programmatic);
+            return;
+        }
+
+        EditorSessionState session = _session;
+        await RunMaintenanceAsync(
+            "Rider creation",
+            async cancellationToken =>
+            {
+                RiderCreationPreview preview = await _riderCreationService.PreviewAsync(
+                    session.WorkingSqlitePath,
+                    input,
+                    cancellationToken);
+                _riderCreationPreview = preview;
+                PopulateRiderCreationReview(preview);
+                var dialog = new ContentDialog
+                {
+                    XamlRoot = WindowRoot.XamlRoot,
+                    Title = "Create rider and contract?",
+                    Content = $"Create rider {preview.NewCyclistId:N0} ({input.FirstName} {input.LastName}) and contract {preview.NewContractId:N0}. Both rows will be inserted atomically and can be undone together.",
+                    PrimaryButtonText = "Create",
+                    CloseButtonText = "Keep editing",
+                    DefaultButton = ContentDialogButton.Primary,
+                };
+                if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+                {
+                    return;
+                }
+
+                await PrepareMutationWriteAheadAsync(session);
+                MaintenanceApplyResult result = await _riderCreationService.ApplyAsync(
+                    session.WorkingSqlitePath,
+                    preview,
+                    cancellationToken);
+                await CompleteMaintenanceApplyAsync(session, result);
+                if (_session is not null)
+                {
+                    EditorSessionState currentSession = _session;
+                    ResetRiderCreationForSession(currentSession.SessionId);
+                    await InitializeRiderCreationAsync(currentSession, cancellationToken);
+                }
+            });
+    }
+
     private async void PreviewRiderRecovery_Click(object sender, RoutedEventArgs e)
     {
         if (!TryGetMaintenanceSession(out EditorSessionState session))
@@ -3634,12 +5412,28 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
-        if (!TryParseCyclistIds(RiderIdsTextBox.Text, out long[] cyclistIds))
+        RiderRecoveryTarget target;
+        if (RecoveryTeamModeRadioButton.IsChecked == true)
         {
-            PresentWarning(
-                "Select cyclist rows",
-                "Select one or more table rows containing an integer IDcyclist or fkIDcyclist value, then return to Maintenance.");
-            return;
+            if (RiderRecoveryTeamComboBox.SelectedItem is not RiderTeamOption team)
+            {
+                PresentWarning("Choose a team", "Choose one team to resolve its current rider roster.");
+                return;
+            }
+
+            target = RiderRecoveryTarget.ForTeam(team.TeamId);
+        }
+        else
+        {
+            RiderIdParseResult parsed = RiderIdInputParser.Parse(RiderIdsTextBox.Text, "Rider IDs");
+            if (!parsed.IsValid)
+            {
+                PresentWarning("Check rider IDs", parsed.Error!);
+                RiderIdsTextBox.Focus(FocusState.Programmatic);
+                return;
+            }
+
+            target = RiderRecoveryTarget.ForRiderIds(parsed.RiderIds);
         }
 
         await RunMaintenanceAsync(
@@ -3656,18 +5450,24 @@ public sealed partial class MainWindow : Window, IDisposable
 
                 RiderRecoveryPreview preview = await _riderRecoveryService.PreviewAsync(
                     session.WorkingSqlitePath,
-                    cyclistIds,
+                    target,
                     cancellationToken);
                 RiderRecoveryChange[] riderChanges = preview.Changes
                     .Where(static change => change.OldValues != change.NewValues)
                     .ToArray();
                 string riderRowLabel = riderChanges.Length == 1 ? "row" : "rows";
-                string cyclistIdLabel = preview.CyclistIds.Count == 1 ? "cyclist ID" : "cyclist IDs";
+                string targetSummary = preview.Target.Kind == RiderRecoveryTargetKind.Team
+                    ? $"team {preview.Target.TeamId:N0}"
+                    : $"{preview.CyclistIds.Count:N0} distinct rider ID(s)";
+                string missingSummary = preview.MissingCyclistIds.Count == 0
+                    ? "Every resolved rider has a fitness row."
+                    : $"Missing fitness rows: {string.Join(", ", preview.MissingCyclistIds)}.";
                 ContentDialog dialog = CreateMaintenancePreviewDialog(
                     "Apply rider recovery preset?",
-                    $"{riderChanges.Length:N0} existing rider {riderRowLabel} will change from {preview.CyclistIds.Count:N0} distinct {cyclistIdLabel} selected in the grid. The preset is Fit 99, Injury 0, Injury days 0, Physical fatigue 0, Freshness 100, and Preparation 99.",
+                    $"Resolved {preview.CyclistIds.Count:N0} rider(s) from {targetSummary}; {preview.FoundCyclistIds.Count:N0} fitness {riderRowLabel} were found and {riderChanges.Length:N0} need changes. {missingSummary} The exact resolved ID set is retained for apply.",
                     riderChanges.Select(change =>
-                        $"Cyclist {change.CyclistId:N0}: {FormatRiderValues(change.OldValues)} -> {FormatRiderValues(change.NewValues)}"));
+                        $"Rider {change.CyclistId:N0}: {FormatRiderValues(change.OldValues)} -> {FormatRiderValues(change.NewValues)}")
+                        .Concat(preview.MissingCyclistIds.Select(id => $"Rider {id:N0}: no fitness row found")));
                 if (await dialog.ShowAsync() != ContentDialogResult.Primary)
                 {
                     return;
@@ -3948,35 +5748,6 @@ public sealed partial class MainWindow : Window, IDisposable
         return false;
     }
 
-    private static bool TryParseCyclistIds(string text, out long[] cyclistIds)
-    {
-        cyclistIds = [];
-        string[] tokens = text.Split([',', ';', ' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
-        if (tokens.Length == 0)
-        {
-            return false;
-        }
-
-        var parsed = new HashSet<long>();
-        foreach (string token in tokens)
-        {
-            if (!long.TryParse(
-                    token,
-                    System.Globalization.NumberStyles.None,
-                    System.Globalization.CultureInfo.InvariantCulture,
-                    out long id) ||
-                id <= 0)
-            {
-                return false;
-            }
-
-            parsed.Add(id);
-        }
-
-        cyclistIds = parsed.Order().ToArray();
-        return true;
-    }
-
     private void TableTabs_TabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
     {
         if (args.Tab is not TabViewItem tab)
@@ -4158,6 +5929,7 @@ public sealed partial class MainWindow : Window, IDisposable
         DisposeTableCoordinators();
         _session = null;
         _catalog = null;
+        ResetMaintenanceTargetsForSession(sessionId: null);
         _allTables.Clear();
         _tableTabs.Clear();
         DetachEditHistory();
@@ -4262,6 +6034,7 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.IsOperationExclusive = true;
         SetConflictingCommandsEnabled(isEnabled: false);
         SetTableQueryControlsEnabled(isEnabled: false);
+        UpdateCreateRiderButtonState();
         return true;
     }
 
@@ -4279,6 +6052,7 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.IsOperationExclusive = false;
         SetConflictingCommandsEnabled(isEnabled: true);
         SetTableQueryControlsEnabled(isEnabled: true);
+        UpdateCreateRiderButtonState();
     }
 
     private void SetConflictingCommandsEnabled(bool isEnabled)

@@ -12,6 +12,7 @@
         BeginningEdit="GridControl_BeginningEdit"
         CanFilterColumns="False"
         CanSortColumns="False"
+        CellEditEnded="GridControl_CellEditEnded"
         CellEditEnding="GridControl_CellEditEnding"
         SelectionMode="Multiple"
         SelectionChanged="GridControl_SelectionChanged">

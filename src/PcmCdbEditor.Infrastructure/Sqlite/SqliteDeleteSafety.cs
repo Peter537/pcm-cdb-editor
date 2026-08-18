@@ -14,10 +14,11 @@ internal static class SqliteDeleteSafety
         ArgumentNullException.ThrowIfNull(transaction);
         ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
 
-        if (await HasUserDefinedDeleteTriggerAsync(
+        if (await HasUserDefinedTriggerAsync(
                 connection,
                 transaction,
                 tableName,
+                "DELETE",
                 cancellationToken)
             .ConfigureAwait(false))
         {
@@ -38,10 +39,34 @@ internal static class SqliteDeleteSafety
         }
     }
 
-    private static async Task<bool> HasUserDefinedDeleteTriggerAsync(
+    public static async Task EnsureInsertIsReversibleAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         string tableName,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(transaction);
+        ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
+
+        if (await HasUserDefinedTriggerAsync(
+                connection,
+                transaction,
+                tableName,
+                "INSERT",
+                cancellationToken)
+            .ConfigureAwait(false))
+        {
+            throw new InvalidOperationException(
+                $"Rows cannot be inserted into '{tableName}' safely because the table has an INSERT trigger whose side effects cannot be restored by undo.");
+        }
+    }
+
+    private static async Task<bool> HasUserDefinedTriggerAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string tableName,
+        string operation,
         CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
@@ -57,7 +82,7 @@ internal static class SqliteDeleteSafety
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            if (IsDeleteTrigger(reader.GetString(0)))
+            if (IsTriggerForOperation(reader.GetString(0), operation))
             {
                 return true;
             }
@@ -116,7 +141,7 @@ internal static class SqliteDeleteSafety
         || action.Equals("SET NULL", StringComparison.OrdinalIgnoreCase)
         || action.Equals("SET DEFAULT", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsDeleteTrigger(string sql)
+    private static bool IsTriggerForOperation(string sql, string operation)
     {
         bool foundTriggerKeyword = false;
         foreach (string word in EnumerateBareWords(sql))
@@ -127,15 +152,11 @@ internal static class SqliteDeleteSafety
                 continue;
             }
 
-            if (word.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-
-            if (word.Equals("INSERT", StringComparison.OrdinalIgnoreCase)
+            if (word.Equals("DELETE", StringComparison.OrdinalIgnoreCase)
+                || word.Equals("INSERT", StringComparison.OrdinalIgnoreCase)
                 || word.Equals("UPDATE", StringComparison.OrdinalIgnoreCase))
             {
-                return false;
+                return word.Equals(operation, StringComparison.OrdinalIgnoreCase);
             }
         }
 

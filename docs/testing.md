@@ -12,7 +12,7 @@ Complete the locked restore and Release/x64 build in [Getting started](getting-s
 dotnet test tests/PcmCdbEditor.UnitTests/PcmCdbEditor.UnitTests.csproj --configuration Release --no-build --no-restore --disable-build-servers -m:1
 ```
 
-The unit suite covers domain and view-model state, row identity and typed SQLite values, filter parsing and query composition, bounded paging and request coordination, Undo/Redo models, maintenance review projections, architecture boundaries, mutation write-ahead behavior, and source-level UI and accessibility contracts.
+The unit suite covers domain and view-model state, row identity and typed SQLite values, filter parsing and query composition, bounded paging and request coordination, Undo/Redo models, maintenance review projections, rider-ID normalization, inline-edit staging and bind-generation invalidation, Create Rider input/range/role/lookup models, live Unicode-aware game-name generation and overrides, potential validation, ordered favorite-list validation and serialization, busy-to-ready command availability, architecture boundaries, mutation write-ahead behavior, and source-level wizard, UI, and accessibility contracts.
 
 ## Integration tests
 
@@ -20,7 +20,7 @@ The unit suite covers domain and view-model state, row identity and typed SQLite
 dotnet test tests/PcmCdbEditor.IntegrationTests/PcmCdbEditor.IntegrationTests.csproj --configuration Release --no-build --no-restore --disable-build-servers -m:1
 ```
 
-The integration suite uses generated SQLite databases and fake converter processes to exercise schema discovery, typed querying and mutation, delete safety, history and settings persistence, workspace open/save/recovery behavior, converter bounds and cancellation, maintenance services, and paging responsiveness.
+The integration suite uses generated SQLite databases and fake converter processes to exercise schema discovery, typed querying and mutation, delete and trigger safety, history and settings persistence, workspace open/save/recovery behavior, converter bounds and cancellation, maintenance services, and paging responsiveness. Create Rider fixtures cover clean draft preparation, bounded team/type/region/preference/race lookups, country and race-class context, all 14 ability pairs, game display names, REAL potential values, exact empty and ordered favorite-list encoding, duplicate and missing race IDs, changed race revisions, deterministic defaults, nullable Limits, locked cross-links, checked `MAX + 1`, stale lookup rows and maxima, overflow, atomic rollback, readable lookup views, mutation-view and unknown-column rejection, BLOB restrictions, cancellation, and two-row Undo/Redo. Recovery fixtures cover teams, explicit and duplicate IDs, missing fitness rows, optional team schema, changed rosters, and no-op behavior.
 
 ## Optional local CDB round-trip test
 
@@ -51,6 +51,10 @@ Source tests can check XAML names, automation IDs, and focus-management code, bu
 - Narrator announcements and accessible names for navigation, toolbar commands, loading/cancellation state, dialogs, tables, and validation errors;
 - system, light, and dark themes; compact and comfortable density; 100- and 250-row pages; display scaling; and high-contrast behavior;
 - open, edit, Undo/Redo, **Save**, **Save as**, backup, dirty-close, and interrupted-session recovery flows on disposable copies.
+- double-click, Enter, and F2 inline edits for Integer, Real, and Text cells; click-away commit, Escape cancellation, invalid input, rapid repeated edits, Undo/Redo, multi-selection, current-column focus, and viewport stability;
+- rider recovery with a long team name, an empty team, manually entered IDs, missing IDs, and **Use selected rows** without automatic input replacement;
+- Create Rider at narrow and wide window sizes: all six steps, long rider/team/region/race names, lookup loading and errors, live game-name generation plus override/reset, keyboard race selection/removal/reordering, optional-empty favorite warning, potential range and increments, observed height/weight guidance, the 14-row matrix and both bulk actions, Current-above-Limit warnings, blank-Limit acknowledgement, collapsed Advanced groups, BLOB omission and non-editability, role labels with codes, allocation review, the preview-busy-to-Ready button transition, stale/error states, apply, Undo, and Redo;
+- Create Rider and the maintenance workflows at 200% text scaling in system, light, and dark themes, including keyboard-only operation, reduced motion, and focus restoration after dialogs.
 
 Record only non-sensitive observations. Do not include real database contents, local absolute paths, session metadata, screenshots with private rows, or `local-smoke` evidence in a public report.
 

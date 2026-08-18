@@ -74,6 +74,16 @@
           </NavigationViewItem.Icon>
         </NavigationViewItem>
         <NavigationViewItem
+            x:Name="CreateRiderNavigationItem"
+            Content="Create Rider"
+            Tag="create-rider"
+            AutomationProperties.AutomationId="NavigationCreateRider"
+            AutomationProperties.Name="Create Rider">
+          <NavigationViewItem.Icon>
+            <SymbolIcon Symbol="AddFriend" />
+          </NavigationViewItem.Icon>
+        </NavigationViewItem>
+        <NavigationViewItem
             x:Name="RecoveryNavigationItem"
             Content="Recovery"
             Tag="recovery"
@@ -430,15 +440,55 @@
               <Border Padding="16" CornerRadius="8" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
                 <StackPanel Spacing="10">
                   <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Rider recovery preset" />
-                  <TextBlock TextWrapping="Wrap" Text="Set Fit 99, Injury 0, Injury days 0, Physical fatigue 0, Freshness 100, and Preparation 99 for selected cyclist IDs." />
+                  <TextBlock TextWrapping="Wrap" Text="Set Fit 99, Injury 0, Injury days 0, Physical fatigue 0, Freshness 100, and Preparation 99 for an entire team or an explicit rider-ID list." />
+                  <StackPanel Orientation="Horizontal" Spacing="20">
+                    <RadioButton
+                        x:Name="RecoveryIdsModeRadioButton"
+                        Content="Rider IDs"
+                        GroupName="RecoveryTargetMode"
+                        IsChecked="True"
+                        Checked="RecoveryTargetMode_Changed"
+                        AutomationProperties.AutomationId="RiderRecoveryIdsMode"
+                        AutomationProperties.Name="Recover riders by ID" />
+                    <RadioButton
+                        x:Name="RecoveryTeamModeRadioButton"
+                        Content="Entire team"
+                        GroupName="RecoveryTargetMode"
+                        Checked="RecoveryTargetMode_Changed"
+                        AutomationProperties.AutomationId="RiderRecoveryTeamMode"
+                        AutomationProperties.Name="Recover an entire team" />
+                  </StackPanel>
                   <TextBox
                       x:Name="RiderIdsTextBox"
-                      Header="Cyclist IDs from selected table rows"
-                      PlaceholderText="Select rows containing IDcyclist or fkIDcyclist"
-                      IsReadOnly="True"
-                      AutomationProperties.AutomationId="SelectedRiderIds"
-                      AutomationProperties.Name="Cyclist IDs from selected table rows"
-                      AutomationProperties.HelpText="Select one or more rows containing IDcyclist or fkIDcyclist in the table grid." />
+                      Header="Rider IDs"
+                      PlaceholderText="For example: 42, 77; 103"
+                      AutomationProperties.AutomationId="RiderRecoveryIds"
+                      AutomationProperties.Name="Rider IDs"
+                      AutomationProperties.HelpText="Enter positive rider IDs separated by commas, semicolons, spaces, or line breaks." />
+                  <Button
+                      x:Name="UseSelectedRiderRowsButton"
+                      HorizontalAlignment="Left"
+                      Content="Use selected rows"
+                      Click="UseSelectedRiderRows_Click"
+                      IsEnabled="False"
+                      AutomationProperties.AutomationId="UseSelectedRiderRowsCommand"
+                      AutomationProperties.Name="Use selected rows for rider recovery"
+                      AutomationProperties.HelpText="Copy cyclist IDs from the currently selected table rows into the rider-ID field." />
+                  <ComboBox
+                      x:Name="RiderRecoveryTeamComboBox"
+                      Header="Team"
+                      PlaceholderText="Loading teams…"
+                      IsEnabled="False"
+                      HorizontalAlignment="Stretch"
+                      AutomationProperties.AutomationId="RiderRecoveryTeam"
+                      AutomationProperties.Name="Team for rider recovery"
+                      AutomationProperties.HelpText="Choose a team to resolve its current DYN_cyclist roster during preview." />
+                  <TextBlock
+                      x:Name="RiderRecoveryTeamStatusText"
+                      Text="Team choices load when a database session is open. Rider IDs remain available without team tables."
+                      TextWrapping="Wrap"
+                      Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                      AutomationProperties.AutomationId="RiderRecoveryTeamStatus" />
                   <Button
                       x:Name="PreviewRiderRecoveryButton"
                       HorizontalAlignment="Left"
@@ -479,6 +529,265 @@
               </Border>
             </StackPanel>
           </ScrollViewer>
+
+          <Grid x:Name="RiderCreationView" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="*" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <StackPanel Margin="32,20,32,12" Spacing="6">
+              <TextBlock Style="{StaticResource ShellTitleStyle}" Text="Create Rider" />
+              <TextBlock
+                  MaxWidth="760"
+                  HorizontalAlignment="Left"
+                  TextWrapping="Wrap"
+                  Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                  Text="Create one clean rider and contract. The database is unchanged until you review and confirm both rows." />
+            </StackPanel>
+
+            <ScrollViewer
+                Grid.Row="1"
+                Margin="32,0,32,12"
+                HorizontalScrollBarVisibility="Auto"
+                HorizontalScrollMode="Enabled"
+                VerticalScrollMode="Disabled">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <Button x:Name="RiderStepIdentityButton" Content="1  Identity" Tag="0" Click="RiderCreationStep_Click" AutomationProperties.AutomationId="RiderCreationStepIdentity" AutomationProperties.Name="Step 1, Identity" />
+                <Button x:Name="RiderStepProfileButton" Content="2  Profile" Tag="1" Click="RiderCreationStep_Click" AutomationProperties.AutomationId="RiderCreationStepProfile" AutomationProperties.Name="Step 2, Profile" />
+                <Button x:Name="RiderStepAbilitiesButton" Content="3  Abilities" Tag="2" Click="RiderCreationStep_Click" AutomationProperties.AutomationId="RiderCreationStepAbilities" AutomationProperties.Name="Step 3, Abilities" />
+                <Button x:Name="RiderStepContractButton" Content="4  Contract" Tag="3" Click="RiderCreationStep_Click" AutomationProperties.AutomationId="RiderCreationStepContract" AutomationProperties.Name="Step 4, Contract" />
+                <Button x:Name="RiderStepAdvancedButton" Content="5  Advanced" Tag="4" Click="RiderCreationStep_Click" AutomationProperties.AutomationId="RiderCreationStepAdvanced" AutomationProperties.Name="Step 5, Advanced" />
+                <Button x:Name="RiderStepReviewButton" Content="6  Review" Tag="5" Click="RiderCreationStep_Click" AutomationProperties.AutomationId="RiderCreationStepReview" AutomationProperties.Name="Step 6, Review" />
+              </StackPanel>
+            </ScrollViewer>
+
+            <InfoBar
+                x:Name="RiderCreationCapabilityInfo"
+                Grid.Row="2"
+                Margin="32,0,32,12"
+                IsOpen="True"
+                IsClosable="False"
+                Severity="Informational"
+                Title="Open a CDB to create a rider"
+                Message="The wizard checks the open database schema before enabling creation."
+                AutomationProperties.AutomationId="RiderCreationCapabilityStatus"
+                AutomationProperties.LiveSetting="Polite" />
+
+            <ContentControl x:Name="RiderCreationStepContentControl" Grid.Row="3" IsEnabled="False">
+              <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel MaxWidth="900" Margin="32,0,32,24" HorizontalAlignment="Left">
+                  <Border x:Name="RiderIdentityStep" Padding="20" CornerRadius="8" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+                    <StackPanel Spacing="14">
+                      <TextBlock FontSize="18" FontWeight="SemiBold" Text="Identity" />
+                      <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Name the rider and choose the database records that define their team, region, and rider type." />
+                      <Grid ColumnSpacing="12" RowSpacing="12">
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="RiderFirstNameTextBox" Header="First name" MaxLength="80" TextChanged="RiderIdentityName_TextChanged" AutomationProperties.AutomationId="RiderCreationFirstName" AutomationProperties.Name="First name" />
+                        <TextBox x:Name="RiderLastNameTextBox" Grid.Column="1" Header="Last name" MaxLength="80" TextChanged="RiderIdentityName_TextChanged" AutomationProperties.AutomationId="RiderCreationLastName" AutomationProperties.Name="Last name" />
+                      </Grid>
+                      <AutoSuggestBox x:Name="RiderTeamSuggestBox" Header="Team" PlaceholderText="Search by team name or ID" TextChanged="RiderLookup_TextChanged" SuggestionChosen="RiderLookup_SuggestionChosen" Tag="team" AutomationProperties.AutomationId="RiderCreationTeam" AutomationProperties.Name="Team" AutomationProperties.HelpText="Searches DYN_team and shows each team name with its stored ID." />
+                      <AutoSuggestBox x:Name="RiderRegionSuggestBox" Header="Region" PlaceholderText="Search by region name or ID" TextChanged="RiderLookup_TextChanged" SuggestionChosen="RiderLookup_SuggestionChosen" Tag="region" AutomationProperties.AutomationId="RiderCreationRegion" AutomationProperties.Name="Region" AutomationProperties.HelpText="Searches STA_region and shows region, country when available, and the stored ID." />
+                      <AutoSuggestBox x:Name="RiderTypeSuggestBox" Header="Rider type" PlaceholderText="Search by rider type or ID" TextChanged="RiderLookup_TextChanged" SuggestionChosen="RiderLookup_SuggestionChosen" Tag="type" AutomationProperties.AutomationId="RiderCreationType" AutomationProperties.Name="Rider type" AutomationProperties.HelpText="Searches STA_type_rider and shows the rider-type name with its stored ID." />
+                    </StackPanel>
+                  </Border>
+
+                  <Border x:Name="RiderProfileStep" Padding="20" CornerRadius="8" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" Visibility="Collapsed">
+                    <StackPanel Spacing="14">
+                      <TextBlock FontSize="18" FontWeight="SemiBold" Text="Profile" />
+                      <TextBlock x:Name="RiderProfileGuidanceText" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Birth date, height, and weight are required. Height and weight use centimetres and kilograms." />
+                      <CalendarDatePicker x:Name="RiderBirthDatePicker" Header="Birth date" DateFormat="{}{day.integer(2)}/{month.integer(2)}/{year.full}" AutomationProperties.AutomationId="RiderCreationBirthDate" AutomationProperties.Name="Birth date" />
+                      <Grid ColumnSpacing="12">
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <NumberBox x:Name="RiderHeightNumberBox" Header="Height (cm)" Minimum="1" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="RiderCreationHeight" AutomationProperties.Name="Height in centimetres" />
+                        <NumberBox x:Name="RiderWeightNumberBox" Grid.Column="1" Header="Weight (kg)" Minimum="1" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="RiderCreationWeight" AutomationProperties.Name="Weight in kilograms" />
+                      </Grid>
+                      <TextBox x:Name="RiderPhotoTextBox" Header="Photo (optional)" PlaceholderText="For example: wdb-ridername" AutomationProperties.AutomationId="RiderCreationPhoto" AutomationProperties.Name="Photo identifier" />
+                      <TextBox x:Name="RiderSoundNameTextBox" Header="Sound name (optional)" AutomationProperties.AutomationId="RiderCreationSoundName" AutomationProperties.Name="Sound name" />
+                      <StackPanel Spacing="8">
+                        <TextBlock FontWeight="SemiBold" Text="Favorite races (optional)" />
+                        <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Search the race calendar, then add races in the order you want stored. An empty list is allowed but will be flagged on Review." />
+                        <Grid ColumnSpacing="8">
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                          </Grid.ColumnDefinitions>
+                          <AutoSuggestBox
+                              x:Name="RiderFavoriteRaceSuggestBox"
+                              Header="Find a race"
+                              PlaceholderText="Search by race name, abbreviation, constant, or ID"
+                              TextChanged="RiderFavoriteRace_TextChanged"
+                              SuggestionChosen="RiderFavoriteRace_SuggestionChosen"
+                              AutomationProperties.AutomationId="RiderCreationFavoriteRaceSearch"
+                              AutomationProperties.Name="Find a favorite race"
+                              AutomationProperties.HelpText="Searches STA_race and shows race name, country and class when available, and the stored ID." />
+                          <Button
+                              x:Name="AddFavoriteRaceButton"
+                              Grid.Column="1"
+                              VerticalAlignment="Bottom"
+                              Content="Add race"
+                              IsEnabled="False"
+                              Click="AddFavoriteRace_Click"
+                              AutomationProperties.AutomationId="AddRiderFavoriteRaceCommand"
+                              AutomationProperties.Name="Add selected favorite race" />
+                        </Grid>
+                        <ListView
+                            x:Name="RiderFavoriteRacesList"
+                            SelectionMode="None"
+                            MaxHeight="260"
+                            AutomationProperties.AutomationId="RiderCreationFavoriteRaces"
+                            AutomationProperties.Name="Selected favorite races">
+                          <ListView.ItemTemplate>
+                            <DataTemplate>
+                              <Grid Padding="0,4" ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                  <ColumnDefinition Width="*" />
+                                  <ColumnDefinition Width="Auto" />
+                                  <ColumnDefinition Width="Auto" />
+                                  <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock VerticalAlignment="Center" Text="{Binding}" TextWrapping="Wrap" />
+                                <Button Grid.Column="1" Content="↑" Tag="{Binding}" Click="MoveFavoriteRaceUp_Click" AutomationProperties.AutomationId="MoveRiderFavoriteRaceUpCommand" AutomationProperties.Name="Move favorite race up" />
+                                <Button Grid.Column="2" Content="↓" Tag="{Binding}" Click="MoveFavoriteRaceDown_Click" AutomationProperties.AutomationId="MoveRiderFavoriteRaceDownCommand" AutomationProperties.Name="Move favorite race down" />
+                                <Button Grid.Column="3" Content="Remove" Tag="{Binding}" Click="RemoveFavoriteRace_Click" AutomationProperties.AutomationId="RemoveRiderFavoriteRaceCommand" AutomationProperties.Name="Remove favorite race" />
+                              </Grid>
+                            </DataTemplate>
+                          </ListView.ItemTemplate>
+                        </ListView>
+                        <TextBlock x:Name="RiderFavoriteRaceStatusText" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="No favorite races selected." TextWrapping="Wrap" AutomationProperties.AutomationId="RiderCreationFavoriteRaceStatus" AutomationProperties.LiveSetting="Polite" />
+                      </StackPanel>
+                    </StackPanel>
+                  </Border>
+
+                  <Border x:Name="RiderAbilitiesStep" Padding="20" CornerRadius="8" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" Visibility="Collapsed">
+                    <StackPanel Spacing="14">
+                      <TextBlock FontSize="18" FontWeight="SemiBold" Text="Abilities" />
+                      <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Enter every Current value from 50 to 85. Limits are optional; blank Limits are stored as database NULL." />
+                      <NumberBox
+                          x:Name="RiderPotentialNumberBox"
+                          Header="Potential"
+                          Minimum="0.5"
+                          Maximum="6"
+                          SmallChange="0.5"
+                          SpinButtonPlacementMode="Compact"
+                          Value="3"
+                          AutomationProperties.AutomationId="RiderCreationPotential"
+                          AutomationProperties.Name="Rider potential"
+                          AutomationProperties.HelpText="Stored in DYN_cyclist.value_f_potentiel. Enter a value from 0.5 to 6.0 in 0.5 increments." />
+                      <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Potential is stored separately from Current abilities and Limits. The clean default is 3.0." />
+                      <ScrollViewer HorizontalScrollMode="Enabled" HorizontalScrollBarVisibility="Auto" VerticalScrollMode="Disabled" VerticalScrollBarVisibility="Disabled">
+                        <StackPanel MinWidth="620" Spacing="14">
+                          <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                              <ColumnDefinition Width="160" />
+                              <ColumnDefinition Width="Auto" />
+                              <ColumnDefinition Width="160" />
+                              <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <NumberBox x:Name="RiderBulkCurrentNumberBox" Header="Set all Current" Minimum="50" Maximum="85" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="RiderCreationBulkCurrent" AutomationProperties.Name="Value for all Current abilities" />
+                            <Button Grid.Column="1" VerticalAlignment="Bottom" Content="Set Current" Click="SetAllCurrentAbilities_Click" AutomationProperties.AutomationId="SetAllRiderCurrentAbilitiesCommand" AutomationProperties.Name="Set every Current ability" />
+                            <NumberBox x:Name="RiderBulkLimitNumberBox" Grid.Column="2" Header="Set all Limits" Minimum="50" Maximum="85" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="RiderCreationBulkLimit" AutomationProperties.Name="Value for all ability Limits" />
+                            <Button Grid.Column="3" VerticalAlignment="Bottom" Content="Set Limits" Click="SetAllLimitAbilities_Click" AutomationProperties.AutomationId="SetAllRiderLimitAbilitiesCommand" AutomationProperties.Name="Set every ability Limit" />
+                          </Grid>
+                          <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                              <ColumnDefinition Width="220" />
+                              <ColumnDefinition Width="160" />
+                              <ColumnDefinition Width="160" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock FontWeight="SemiBold" Text="Ability" />
+                            <TextBlock Grid.Column="1" FontWeight="SemiBold" Text="Current" />
+                            <TextBlock Grid.Column="2" FontWeight="SemiBold" Text="Limit (optional)" />
+                          </Grid>
+                          <StackPanel x:Name="RiderAbilityRowsPanel" Spacing="8" AutomationProperties.AutomationId="RiderCreationAbilityMatrix" />
+                        </StackPanel>
+                      </ScrollViewer>
+                      <InfoBar x:Name="RiderAbilityWarningInfo" IsOpen="False" IsClosable="False" Severity="Warning" Title="Check ability combinations" AutomationProperties.AutomationId="RiderCreationAbilityWarnings" AutomationProperties.LiveSetting="Polite" />
+                    </StackPanel>
+                  </Border>
+
+                  <Border x:Name="RiderContractStep" Padding="20" CornerRadius="8" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" Visibility="Collapsed">
+                    <StackPanel Spacing="14">
+                      <TextBlock FontSize="18" FontWeight="SemiBold" Text="Contract" />
+                      <TextBlock x:Name="RiderContractTeamText" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="The selected team is written to the rider, current team, and previous team fields." />
+                      <ComboBox x:Name="RiderRoleComboBox" Header="Role" HorizontalAlignment="Stretch" AutomationProperties.AutomationId="RiderCreationRole" AutomationProperties.Name="Contract role" AutomationProperties.HelpText="Shows the English contract role and stored iRole code." />
+                      <NumberBox x:Name="RiderWageNumberBox" Header="Wage" Minimum="1" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="RiderCreationWage" AutomationProperties.Name="Contract wage" />
+                      <NumberBox x:Name="RiderContractEndYearNumberBox" Header="Contract end year" Minimum="1" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="RiderCreationContractEndYear" AutomationProperties.Name="Contract end year" />
+                      <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Contract start is stored as 0 and the new contract is active. These values match the open save's contract model." />
+                    </StackPanel>
+                  </Border>
+
+                  <Border x:Name="RiderAdvancedStep" Padding="20" CornerRadius="8" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" Visibility="Collapsed">
+                    <StackPanel Spacing="14">
+                      <TextBlock FontSize="18" FontWeight="SemiBold" Text="Advanced" />
+                      <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Clean defaults are ready. Expand these fields only when you need to inspect or override lower-level game data." />
+                      <Expander x:Name="RiderAdvancedExpander" Header="Rider game data" IsExpanded="False">
+                        <StackPanel Margin="0,12,0,0" Spacing="12">
+                          <StackPanel Spacing="5">
+                            <TextBlock FontWeight="SemiBold" Text="Rider display name" />
+                            <TextBlock FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="DYN_cyclist.gene_sz_firstlastname · Text" TextWrapping="Wrap" />
+                            <TextBlock FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Generated as Last name plus the first-name initial. A manual override is preserved until you reset it." TextWrapping="Wrap" />
+                            <Grid ColumnSpacing="8">
+                              <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                              </Grid.ColumnDefinitions>
+                              <TextBox x:Name="RiderGameDisplayNameTextBox" TextChanged="RiderGameDisplayName_TextChanged" AutomationProperties.AutomationId="RiderCreationGameDisplayName" AutomationProperties.Name="Rider game display name" />
+                              <Button x:Name="ResetRiderGameDisplayNameButton" Grid.Column="1" VerticalAlignment="Bottom" Content="Reset to generated" Click="ResetRiderGameDisplayName_Click" AutomationProperties.AutomationId="ResetRiderGameDisplayNameCommand" AutomationProperties.Name="Reset rider display name to generated value" />
+                            </Grid>
+                          </StackPanel>
+                          <StackPanel x:Name="RiderAdvancedFieldsPanel" Spacing="12" />
+                        </StackPanel>
+                      </Expander>
+                      <Expander x:Name="ContractAdvancedExpander" Header="Contract game data" IsExpanded="False">
+                        <StackPanel x:Name="ContractAdvancedFieldsPanel" Margin="0,12,0,0" Spacing="12" />
+                      </Expander>
+                    </StackPanel>
+                  </Border>
+
+                  <Border x:Name="RiderReviewStep" Padding="20" CornerRadius="8" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" Visibility="Collapsed">
+                    <StackPanel Spacing="14">
+                      <TextBlock FontSize="18" FontWeight="SemiBold" Text="Review" />
+                      <TextBlock x:Name="RiderReviewSummaryText" TextWrapping="Wrap" AutomationProperties.AutomationId="RiderCreationReviewSummary" />
+                      <InfoBar x:Name="RiderReviewWarningInfo" IsOpen="False" IsClosable="False" Severity="Warning" Title="Review warnings" AutomationProperties.AutomationId="RiderCreationReviewWarnings" AutomationProperties.LiveSetting="Polite" />
+                      <CheckBox x:Name="RiderMissingLimitsAcknowledgement" Content="I understand that blank Limits will be stored as database NULL and that in-game generation is unverified." Visibility="Collapsed" Checked="RiderMissingLimitsAcknowledgement_Changed" Unchecked="RiderMissingLimitsAcknowledgement_Changed" AutomationProperties.AutomationId="AcknowledgeMissingRiderLimits" AutomationProperties.Name="Acknowledge blank ability limits" />
+                      <TextBlock FontWeight="SemiBold" Text="Favorite races" />
+                      <TextBlock x:Name="RiderReviewFavoriteRacesText" TextWrapping="Wrap" AutomationProperties.AutomationId="RiderCreationReviewFavoriteRaces" />
+                      <TextBlock FontWeight="SemiBold" Text="Abilities" />
+                      <TextBlock x:Name="RiderReviewAbilitiesText" TextWrapping="Wrap" />
+                      <Expander Header="Complete typed insert values" IsExpanded="False">
+                        <TextBox x:Name="RiderReviewTechnicalValuesTextBox" Margin="0,12,0,0" IsReadOnly="True" AcceptsReturn="True" TextWrapping="NoWrap" FontFamily="Consolas" ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.VerticalScrollBarVisibility="Auto" MaxHeight="360" AutomationProperties.AutomationId="RiderCreationTechnicalPreview" AutomationProperties.Name="Complete typed rider and contract values" />
+                      </Expander>
+                    </StackPanel>
+                  </Border>
+                </StackPanel>
+              </ScrollViewer>
+            </ContentControl>
+
+            <Border Grid.Row="4" Padding="32,12" BorderBrush="{StaticResource ShellDividerBrush}" BorderThickness="0,1,0,0" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+              <Grid ColumnSpacing="12">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Button x:Name="RiderCreationBackButton" Content="Back" Click="RiderCreationBack_Click" IsEnabled="False" AutomationProperties.AutomationId="RiderCreationBackCommand" AutomationProperties.Name="Go to previous Create Rider step" />
+                <TextBlock x:Name="RiderCreationStepStatusText" Grid.Column="1" VerticalAlignment="Center" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Step 1 of 6 · Identity" AutomationProperties.AutomationId="RiderCreationStepStatus" AutomationProperties.LiveSetting="Polite" />
+                <Button x:Name="RiderCreationNextButton" Grid.Column="2" Content="Continue to Profile" Click="RiderCreationNext_Click" IsEnabled="False" AutomationProperties.AutomationId="RiderCreationNextCommand" AutomationProperties.Name="Continue to Profile" />
+                <Button x:Name="CreateRiderButton" Grid.Column="3" Content="Create rider and contract" Click="CreateRider_Click" Visibility="Collapsed" IsEnabled="False" AutomationProperties.AutomationId="CreateRiderCommand" AutomationProperties.Name="Create rider and contract" AutomationProperties.HelpText="Recheck the preview and insert both rows atomically." />
+              </Grid>
+            </Border>
+          </Grid>
 
           <ScrollViewer x:Name="RecoveryView" Visibility="Collapsed">
             <StackPanel MaxWidth="760" Margin="32,20" HorizontalAlignment="Left" Spacing="12">

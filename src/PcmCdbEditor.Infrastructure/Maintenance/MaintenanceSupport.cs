@@ -13,15 +13,17 @@ internal static class MaintenanceSupport
         string sqlitePath,
         MaintenanceToolKind tool,
         IReadOnlyDictionary<string, IReadOnlyCollection<string>> requirements,
+        IReadOnlyCollection<string> mutationTargets,
         CancellationToken cancellationToken) =>
         SqliteOperationRunner.RunAsync(
-            () => CheckCoreAsync(sqlitePath, tool, requirements, cancellationToken),
+            () => CheckCoreAsync(sqlitePath, tool, requirements, mutationTargets, cancellationToken),
             cancellationToken);
 
     private static async Task<MaintenanceCapability> CheckCoreAsync(
         string sqlitePath,
         MaintenanceToolKind tool,
         IReadOnlyDictionary<string, IReadOnlyCollection<string>> requirements,
+        IReadOnlyCollection<string> mutationTargets,
         CancellationToken cancellationToken)
     {
         await using var connection = SqliteSupport.CreateConnection(sqlitePath, SqliteOpenMode.ReadOnly);
@@ -41,10 +43,27 @@ internal static class MaintenanceSupport
                 .Select(column => $"{requirement.Key}.{column}"));
         }
 
-        var enabled = missingTables.Length == 0 && missingColumns.Count == 0;
-        var reasons = enabled
-            ? Array.Empty<string>()
-            : new[] { "The database does not expose the complete schema required by this tool." };
+        var reasons = new List<string>();
+        if (missingTables.Length != 0 || missingColumns.Count != 0)
+        {
+            reasons.Add("The database does not expose the complete schema required by this tool.");
+        }
+
+        DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
+            .DiscoverAsync(sqlitePath, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (string target in mutationTargets.Where(target => tables.Contains(target)))
+        {
+            if (!catalog.TryGetTable(target, out TableSchema? table) ||
+                table.ObjectKind != TableObjectKind.Table ||
+                table.EditCapability != TableEditCapability.Editable)
+            {
+                reasons.Add(
+                    $"The mutation target '{target}' must be an ordinary editable table with a stable row identity.");
+            }
+        }
+
+        var enabled = missingTables.Length == 0 && missingColumns.Count == 0 && reasons.Count == 0;
         return new MaintenanceCapability(tool, enabled, reasons, missingTables, missingColumns.Order());
     }
 
@@ -67,4 +86,14 @@ internal static class MaintenanceSupport
     public static string CanonicalNumber(double value) => value.ToString("R", CultureInfo.InvariantCulture);
 
     public static string CanonicalNumber(long value) => value.ToString(CultureInfo.InvariantCulture);
+
+    public static string CanonicalValue(SqliteValue value) => value.Kind switch
+    {
+        SqliteValueKind.Null => "N",
+        SqliteValueKind.Integer => $"I:{CanonicalNumber(value.IntegerValue)}",
+        SqliteValueKind.Real => $"R:{BitConverter.DoubleToInt64Bits(value.RealValue):X16}",
+        SqliteValueKind.Text => $"T:{Convert.ToBase64String(Encoding.UTF8.GetBytes(value.TextValue ?? string.Empty))}",
+        SqliteValueKind.Blob => $"B:{value.BlobBase64}",
+        _ => throw new InvalidOperationException($"Unsupported SQLite value kind '{value.Kind}'.")
+    };
 }

@@ -25,6 +25,7 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
             sqlitePath,
             MaintenanceToolKind.JanuaryFirstSeasonStageRepair,
             Requirements,
+            [TargetTable],
             cancellationToken);
 
     public Task<JanuaryFirstRepairPreview> PreviewAsync(
@@ -90,6 +91,13 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
             {
                 throw new DBConcurrencyException("Season-stage data changed after the preview was generated.");
             }
+
+            await SqliteDeleteSafety.EnsureDeleteIsReversibleAsync(
+                    connection,
+                    sqliteTransaction,
+                    TargetTable,
+                    cancellationToken)
+                .ConfigureAwait(false);
 
             IReadOnlyList<TypedRow> deletedRows = await MaintenanceHistoryCapture.ReadAllAsync(
                     connection,

@@ -13,10 +13,12 @@ I built PCM CDB Editor as a Windows desktop editor for Pro Cycling Manager CDB s
 
 - Copy-first open, save, backup, and recovery workflows
 - Bounded table browsing with search, filters, multi-column sorting, and lazy counts
-- Typed inline and full-row editing for safely identified rows
+- Typed inline and full-row editing for safely identified rows, with inline mutations deferred until TableView finishes its commit lifecycle
 - Disk-backed undo and redo across row edits and confirmed maintenance operations
 - Schema-aware foreign-key display and persisted table layouts
-- Preview-first **Rider recovery preset**, **January 1 season-stage repair**, and **World and European country quotas** when their schema and date requirements are met
+- A dedicated, preview-first **Create Rider** wizard, plus **Rider recovery preset**, **January 1 season-stage repair**, and **World and European country quotas** when their schema and date requirements are met
+
+Rider recovery accepts an entire current team roster or manually entered rider IDs; selecting table rows is an explicit convenience rather than a requirement. Create Rider guides identity, profile, ordered favorite races, all 14 Current/Limit ability pairs, potential, contract data, advanced fields, and review. Its game display name follows `Last name F.` until it is manually overridden. The workflow starts from schema-gated clean defaults and inserts one `DYN_contract_cyclist` row and one `DYN_cyclist` row as a guarded, undoable operation.
 
 ## Quick start
 

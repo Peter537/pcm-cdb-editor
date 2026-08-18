@@ -42,6 +42,17 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         var sqliteTransaction = (SqliteTransaction)transaction;
         try
         {
+            if (replay.Operation is MaintenanceEditOperation
+                {
+                    Tool: MaintenanceToolKind.RiderCreation
+                })
+            {
+                await using var deferCommand = connection.CreateCommand();
+                deferCommand.Transaction = sqliteTransaction;
+                deferCommand.CommandText = "PRAGMA defer_foreign_keys = ON";
+                await deferCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             foreach (RowReplayGuard guard in replay.Guards)
             {
                 await ValidateGuardAsync(connection, sqliteTransaction, catalog, guard, cancellationToken)
@@ -339,6 +350,12 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         CancellationToken cancellationToken)
     {
         ValidateIdentity(table, identity);
+        await SqliteDeleteSafety.EnsureInsertIsReversibleAsync(
+                connection,
+                transaction,
+                table.Name,
+                cancellationToken)
+            .ConfigureAwait(false);
         var insertValues = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
         foreach (KeyValuePair<string, SqliteValue> pair in values)
         {

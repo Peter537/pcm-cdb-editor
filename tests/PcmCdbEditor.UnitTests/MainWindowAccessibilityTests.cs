@@ -12,6 +12,7 @@ public sealed class MainWindowAccessibilityTests
             ["Navigation"] = "NavigationShell",
             ["TablesNavigationItem"] = "NavigationTables",
             ["MaintenanceNavigationItem"] = "NavigationMaintenance",
+            ["CreateRiderNavigationItem"] = "NavigationCreateRider",
             ["RecoveryNavigationItem"] = "NavigationRecovery",
             ["WorkspaceCommandBar"] = "WorkspaceCommandBar",
             ["OpenButton"] = "OpenDatabaseCommand",
@@ -41,6 +42,32 @@ public sealed class MainWindowAccessibilityTests
             ["OverflowDeleteRowButton"] = "OverflowDeleteSelectedRowCommand",
             ["OverflowInsertRowButton"] = "OverflowInsertTableRowCommand",
             ["PreviewRiderRecoveryButton"] = "PreviewRiderRecoveryCommand",
+            ["RecoveryIdsModeRadioButton"] = "RiderRecoveryIdsMode",
+            ["RecoveryTeamModeRadioButton"] = "RiderRecoveryTeamMode",
+            ["RiderIdsTextBox"] = "RiderRecoveryIds",
+            ["UseSelectedRiderRowsButton"] = "UseSelectedRiderRowsCommand",
+            ["RiderRecoveryTeamComboBox"] = "RiderRecoveryTeam",
+            ["RiderRecoveryTeamStatusText"] = "RiderRecoveryTeamStatus",
+            ["RiderCreationCapabilityInfo"] = "RiderCreationCapabilityStatus",
+            ["RiderFirstNameTextBox"] = "RiderCreationFirstName",
+            ["RiderLastNameTextBox"] = "RiderCreationLastName",
+            ["RiderTeamSuggestBox"] = "RiderCreationTeam",
+            ["RiderRegionSuggestBox"] = "RiderCreationRegion",
+            ["RiderTypeSuggestBox"] = "RiderCreationType",
+            ["RiderFavoriteRaceSuggestBox"] = "RiderCreationFavoriteRaceSearch",
+            ["AddFavoriteRaceButton"] = "AddRiderFavoriteRaceCommand",
+            ["RiderFavoriteRacesList"] = "RiderCreationFavoriteRaces",
+            ["RiderFavoriteRaceStatusText"] = "RiderCreationFavoriteRaceStatus",
+            ["RiderPotentialNumberBox"] = "RiderCreationPotential",
+            ["RiderBulkCurrentNumberBox"] = "RiderCreationBulkCurrent",
+            ["RiderBulkLimitNumberBox"] = "RiderCreationBulkLimit",
+            ["RiderGameDisplayNameTextBox"] = "RiderCreationGameDisplayName",
+            ["ResetRiderGameDisplayNameButton"] = "ResetRiderGameDisplayNameCommand",
+            ["RiderReviewFavoriteRacesText"] = "RiderCreationReviewFavoriteRaces",
+            ["RiderRoleComboBox"] = "RiderCreationRole",
+            ["RiderCreationBackButton"] = "RiderCreationBackCommand",
+            ["RiderCreationNextButton"] = "RiderCreationNextCommand",
+            ["CreateRiderButton"] = "CreateRiderCommand",
             ["PreviewJanuaryRepairButton"] = "PreviewJanuaryRepairCommand",
             ["PreviewCountryQuotasButton"] = "PreviewCountryQuotasCommand",
             ["CheckRecoveryButton"] = "CheckRecoverySessionsCommand",
@@ -124,6 +151,121 @@ public sealed class MainWindowAccessibilityTests
             buttons.All(static button =>
                 !string.IsNullOrWhiteSpace((string?)button.Attribute("AutomationProperties.HelpText"))),
             "Each maintenance preview button requires action-specific help text.");
+    }
+
+    [TestMethod]
+    public void CreateRiderIsASixStepDestinationWithoutTemplateControls()
+    {
+        XDocument document = XDocument.Load(GetMainWindowXamlPath());
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        XElement navigation = document.Descendants().Single(element =>
+            (string?)element.Attribute(xaml + "Name") == "CreateRiderNavigationItem");
+        Assert.AreEqual("create-rider", (string?)navigation.Attribute("Tag"));
+
+        string[] stepIds =
+        [
+            "RiderCreationStepIdentity",
+            "RiderCreationStepProfile",
+            "RiderCreationStepAbilities",
+            "RiderCreationStepContract",
+            "RiderCreationStepAdvanced",
+            "RiderCreationStepReview"
+        ];
+        foreach (string stepId in stepIds)
+        {
+            Assert.IsNotNull(document.Descendants().SingleOrDefault(element =>
+                (string?)element.Attribute("AutomationProperties.AutomationId") == stepId));
+        }
+
+        string xamlSource = File.ReadAllText(GetMainWindowXamlPath());
+        Assert.IsFalse(xamlSource.Contains(string.Concat("Rider", "Template"), StringComparison.Ordinal));
+        Assert.IsFalse(xamlSource.Contains(
+            string.Concat("Create rider from ", "template"),
+            StringComparison.OrdinalIgnoreCase));
+
+        string codeSource = File.ReadAllText(GetMainWindowCodePath());
+        StringAssert.Contains(codeSource, "CreateRiderRoleOptions", StringComparison.Ordinal);
+        StringAssert.Contains(codeSource, "Absolute leader", StringComparison.Ordinal);
+        StringAssert.Contains(codeSource, "Luxury teammate", StringComparison.Ordinal);
+        StringAssert.Contains(codeSource, "RiderAbilityCurrent_", StringComparison.Ordinal);
+        StringAssert.Contains(codeSource, "RiderAbilityLimit_", StringComparison.Ordinal);
+        StringAssert.Contains(codeSource, "RiderCreationCommandAvailability.CanCreate", StringComparison.Ordinal);
+        int endOperationStart = codeSource.IndexOf("private void EndOperation()", StringComparison.Ordinal);
+        int nextMethod = codeSource.IndexOf("private void SetConflictingCommandsEnabled", endOperationStart, StringComparison.Ordinal);
+        StringAssert.Contains(
+            codeSource[endOperationStart..nextMethod],
+            "UpdateCreateRiderButtonState();",
+            StringComparison.Ordinal);
+        StringAssert.Contains(xamlSource, "Favorite races (optional)", StringComparison.Ordinal);
+        StringAssert.Contains(xamlSource, "Reset to generated", StringComparison.Ordinal);
+        StringAssert.Contains(xamlSource, "value_f_potentiel", StringComparison.Ordinal);
+    }
+
+    [TestMethod]
+    public void CreateRiderDraftIsSessionScopedAndNavigationOnlyUnlocksVisitedSteps()
+    {
+        XDocument document = XDocument.Load(GetMainWindowXamlPath());
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        string[] stepNames =
+        [
+            "RiderStepIdentityButton",
+            "RiderStepProfileButton",
+            "RiderStepAbilitiesButton",
+            "RiderStepContractButton",
+            "RiderStepAdvancedButton",
+            "RiderStepReviewButton"
+        ];
+        for (var index = 0; index < stepNames.Length; index++)
+        {
+            XElement step = document.Descendants().Single(element =>
+                (string?)element.Attribute(xaml + "Name") == stepNames[index]);
+            Assert.AreEqual(index.ToString(System.Globalization.CultureInfo.InvariantCulture), (string?)step.Attribute("Tag"));
+        }
+
+        XElement abilityRows = document.Descendants().Single(element =>
+            (string?)element.Attribute(xaml + "Name") == "RiderAbilityRowsPanel");
+        XElement abilityScroller = abilityRows.Ancestors().First(element =>
+            element.Name.LocalName == "ScrollViewer");
+        Assert.AreEqual("Enabled", (string?)abilityScroller.Attribute("HorizontalScrollMode"));
+        Assert.AreEqual("Auto", (string?)abilityScroller.Attribute("HorizontalScrollBarVisibility"));
+
+        string source = File.ReadAllText(GetMainWindowCodePath());
+        StringAssert.Contains(
+            source,
+            "if (_riderCreationSessionId == session.SessionId && _riderCreationDraft is not null)",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            source,
+            "|| step > _riderCreationMaxVisitedStep)",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            source,
+            "ResetRiderCreationForSession(sessionId);",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            source,
+            "Create Rider draft retained · Step",
+            StringComparison.Ordinal);
+    }
+
+    [TestMethod]
+    public void RiderRecoveryKeepsManualInputUntilUseSelectedRowsIsInvoked()
+    {
+        XDocument document = XDocument.Load(GetMainWindowXamlPath());
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        XElement riderIds = document.Descendants().Single(element =>
+            (string?)element.Attribute(xaml + "Name") == "RiderIdsTextBox");
+        Assert.IsNull(riderIds.Attribute("IsReadOnly"));
+
+        string source = File.ReadAllText(GetMainWindowCodePath());
+        int selectionStart = source.IndexOf("private void TableGrid_SelectionChanged", StringComparison.Ordinal);
+        int selectionEnd = source.IndexOf("private async void TableGrid_EditCommitted", selectionStart, StringComparison.Ordinal);
+        string selectionHandler = source[selectionStart..selectionEnd];
+        Assert.IsFalse(
+            selectionHandler.Contains("RiderIdsTextBox.Text =", StringComparison.Ordinal),
+            "Ordinary grid selection must not overwrite manual rider IDs.");
+        StringAssert.Contains(source, "private void UseSelectedRiderRows_Click", StringComparison.Ordinal);
+        StringAssert.Contains(source, "RiderIdInputParser.Parse", StringComparison.Ordinal);
     }
 
     [TestMethod]

@@ -29,6 +29,7 @@ public partial class App : Microsoft.UI.Xaml.Application
         var tableCatalog = new SqliteTableCatalog();
         var tableDataStore = new SqliteTableDataStore();
         var riderRecoveryService = new RiderRecoveryService();
+        var riderCreationService = new RiderCreationService();
         var januaryFirstRepairService = new JanuaryFirstRepairService();
         var countryQuotaMaintenanceService = new CountryQuotaMaintenanceService();
         string applicationDataRoot = Path.Combine(
@@ -43,6 +44,7 @@ public partial class App : Microsoft.UI.Xaml.Application
             tableCatalog,
             tableDataStore,
             riderRecoveryService,
+            riderCreationService,
             januaryFirstRepairService,
             countryQuotaMaintenanceService,
             settingsStore,

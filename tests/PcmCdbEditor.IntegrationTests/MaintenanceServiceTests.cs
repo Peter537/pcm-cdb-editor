@@ -132,6 +132,100 @@ public sealed class MaintenanceServiceTests
     }
 
     [TestMethod]
+    public async Task RiderRecoverySupportsTeamRostersAndExplicitMissingIds()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            RiderSchema,
+            "INSERT INTO DYN_cyclist_fitness VALUES(1,10,1,5,50,20,30),(2,11,2,6,51,21,31)",
+            "CREATE TABLE DYN_team(IDteam INTEGER PRIMARY KEY, gene_sz_name TEXT); " +
+            "INSERT INTO DYN_team VALUES(10,'Alpha Team'),(20,'Empty Team')",
+            "CREATE TABLE DYN_cyclist(IDcyclist INTEGER PRIMARY KEY, fkIDteam INTEGER); " +
+            "INSERT INTO DYN_cyclist VALUES(1,10),(2,10),(3,10)")
+            .ConfigureAwait(false);
+        var service = new RiderRecoveryService();
+
+        IReadOnlyList<RiderTeamOption> teams = await service.ListTeamsAsync(
+            database.Path,
+            CancellationToken.None).ConfigureAwait(false);
+        RiderTeamOption alpha = teams.Single(team => team.TeamId == 10);
+        Assert.AreEqual("Alpha Team", alpha.DisplayName);
+        Assert.AreEqual(3L, alpha.RiderCount);
+        Assert.AreEqual(0L, teams.Single(team => team.TeamId == 20).RiderCount);
+
+        RiderRecoveryPreview teamPreview = await service.PreviewAsync(
+            database.Path,
+            RiderRecoveryTarget.ForTeam(10),
+            CancellationToken.None).ConfigureAwait(false);
+        CollectionAssert.AreEqual(new long[] { 1, 2, 3 }, teamPreview.CyclistIds.ToArray());
+        CollectionAssert.AreEqual(new long[] { 1, 2 }, teamPreview.FoundCyclistIds.ToArray());
+        CollectionAssert.AreEqual(new long[] { 3 }, teamPreview.MissingCyclistIds.ToArray());
+        Assert.AreEqual(2, teamPreview.RowsNeedingChanges);
+
+        RiderRecoveryPreview explicitPreview = await service.PreviewAsync(
+            database.Path,
+            RiderRecoveryTarget.ForRiderIds([2, 99, 2]),
+            CancellationToken.None).ConfigureAwait(false);
+        CollectionAssert.AreEqual(new long[] { 2, 99 }, explicitPreview.CyclistIds.ToArray());
+        CollectionAssert.AreEqual(new long[] { 99 }, explicitPreview.MissingCyclistIds.ToArray());
+    }
+
+    [TestMethod]
+    public async Task TeamRecoveryRejectsAChangedRosterButManualIdsNeedNoTeamSchema()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            RiderSchema,
+            "INSERT INTO DYN_cyclist_fitness VALUES(1,10,1,5,50,20,30)",
+            "CREATE TABLE DYN_team(IDteam INTEGER PRIMARY KEY); INSERT INTO DYN_team VALUES(10),(20)",
+            "CREATE TABLE DYN_cyclist(IDcyclist INTEGER PRIMARY KEY, fkIDteam INTEGER); " +
+            "INSERT INTO DYN_cyclist VALUES(1,10)")
+            .ConfigureAwait(false);
+        var service = new RiderRecoveryService();
+        RiderRecoveryPreview teamPreview = await service.PreviewAsync(
+            database.Path,
+            RiderRecoveryTarget.ForTeam(10),
+            CancellationToken.None).ConfigureAwait(false);
+        await database.ExecuteAsync("UPDATE DYN_cyclist SET fkIDteam=20 WHERE IDcyclist=1")
+            .ConfigureAwait(false);
+
+        await Assert.ThrowsExactlyAsync<DBConcurrencyException>(() =>
+            service.ApplyAsync(database.Path, teamPreview, CancellationToken.None)).ConfigureAwait(false);
+        Assert.AreEqual(10D, await database.ScalarAsync<double>(
+            "SELECT value_f_FIT FROM DYN_cyclist_fitness WHERE IDcyclist=1").ConfigureAwait(false));
+
+        await using var manualOnly = await SqliteTestDatabase.CreateAsync(
+            RiderSchema,
+            "INSERT INTO DYN_cyclist_fitness VALUES(1,10,1,5,50,20,30)")
+            .ConfigureAwait(false);
+        RiderRecoveryPreview manualPreview = await service.PreviewAsync(
+            manualOnly.Path,
+            RiderRecoveryTarget.ForRiderIds([1]),
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.HasCount(1, manualPreview.Changes);
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+            service.ListTeamsAsync(manualOnly.Path, CancellationToken.None)).ConfigureAwait(false);
+    }
+
+    [TestMethod]
+    public async Task MaintenanceCapabilityRejectsAViewMutationTarget()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            @"CREATE TABLE fitness_source(
+              IDcyclist INTEGER PRIMARY KEY, value_f_FIT REAL, value_f_injury REAL,
+              value_i_injury_num_days INTEGER, value_f_fat_phy REAL,
+              value_f_freshness REAL, value_f_prepa REAL)",
+            "CREATE VIEW DYN_cyclist_fitness AS SELECT * FROM fitness_source")
+            .ConfigureAwait(false);
+
+        MaintenanceCapability capability = await new RiderRecoveryService()
+            .CheckCapabilityAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+
+        Assert.IsFalse(capability.IsEnabled);
+        Assert.IsTrue(capability.Reasons.Any(reason =>
+            reason.Contains("ordinary editable table", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
     public async Task JanuaryRepairRequiresOneJanuaryFirstDateAndRejectsStalePreview()
     {
         await using var database = await CreateJanuaryDatabaseAsync().ConfigureAwait(false);
@@ -204,7 +298,7 @@ public sealed class MaintenanceServiceTests
     }
 
     [TestMethod]
-    public async Task JanuaryRepairRollsBackAllDeletesWhenATriggerRejectsOneRow()
+    public async Task JanuaryRepairRejectsDeleteTriggersBeforeChangingRows()
     {
         await using var database = await CreateJanuaryDatabaseAsync().ConfigureAwait(false);
         var service = new JanuaryFirstRepairService();
@@ -215,10 +309,35 @@ public sealed class MaintenanceServiceTests
             "WHEN OLD.IDresult_season_stage=2 BEGIN SELECT RAISE(ABORT,'synthetic failure'); END")
             .ConfigureAwait(false);
 
-        await Assert.ThrowsExactlyAsync<SqliteException>(() =>
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
             service.ApplyAsync(database.Path, preview, CancellationToken.None)).ConfigureAwait(false);
         Assert.AreEqual(2L, await database.ScalarAsync<long>(
             "SELECT COUNT(*) FROM DYN_result_season_stage").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    public async Task JanuaryRepairRejectsInboundCascadeBeforeChangingRows()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE GAM_config(gene_i_date TEXT); INSERT INTO GAM_config VALUES('20270101')",
+            "CREATE TABLE DYN_result_season_stage(IDresult_season_stage INTEGER PRIMARY KEY)",
+            "INSERT INTO DYN_result_season_stage VALUES(1)",
+            @"CREATE TABLE child(
+              IDchild INTEGER PRIMARY KEY,
+              fkIDstage INTEGER REFERENCES DYN_result_season_stage(IDresult_season_stage) ON DELETE CASCADE);
+              INSERT INTO child VALUES(1,1)")
+            .ConfigureAwait(false);
+        var service = new JanuaryFirstRepairService();
+        JanuaryFirstRepairPreview preview = await service.PreviewAsync(
+            database.Path,
+            CancellationToken.None).ConfigureAwait(false);
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+            service.ApplyAsync(database.Path, preview, CancellationToken.None)).ConfigureAwait(false);
+        Assert.AreEqual(1L, await database.ScalarAsync<long>(
+            "SELECT COUNT(*) FROM DYN_result_season_stage").ConfigureAwait(false));
+        Assert.AreEqual(1L, await database.ScalarAsync<long>(
+            "SELECT COUNT(*) FROM child").ConfigureAwait(false));
     }
 
     [TestMethod]
