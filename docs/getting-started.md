@@ -2,7 +2,7 @@
 
 PCM CDB Editor 0.1.0 is an unreleased Windows x64 app for inspecting and editing Pro Cycling Manager CDB files through the bundled SQLiteExporter. Keep an independent backup of any valuable database.
 
-I do not claim compatibility with any specific Pro Cycling Manager release. A file works only when the bundled exporter can convert it, the app can open the resulting SQLite database, and the required schema is present. Generic browsing and editing adapt to the discovered schema. The optional maintenance tools have stricter schema and date requirements.
+Compatibility testing has covered only Pro Cycling Manager 2025 (PCM 25). Other releases may work, but I have not tested them and do not claim compatibility with them. A file works only when the bundled exporter can convert it, the app can open the resulting SQLite database, and the required schema is present. Generic browsing and editing adapt to the discovered schema. The optional maintenance tools have stricter schema and date requirements.
 
 ## Requirements
 

@@ -7,7 +7,7 @@
 
 I built PCM CDB Editor as a Windows desktop editor for Pro Cycling Manager CDB save files. The app works on an isolated copy, provides schema-aware browsing and typed SQLite editing, and creates staged CDB output through the bundled SQLiteExporter tool.
 
-> **Version 0.1.0 is an unsigned prerelease for building and testing from source.** I have not published a supported binary. Real-world testing is still limited, so expect bugs, untested edge cases, and compatibility problems with some PCM releases or CDB files.
+> **Version 0.1.0 is an unsigned prerelease for building and testing from source.** I have not published a supported binary. Real-world compatibility testing is still limited and has covered only Pro Cycling Manager 2025 (PCM 25). Other PCM releases may work, but they are untested; individual CDB files may still expose bugs, untested edge cases, or compatibility problems.
 
 ## Capabilities
 

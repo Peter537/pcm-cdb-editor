@@ -1,6 +1,6 @@
 # Testing
 
-The automated suites use synthetic fixtures by default, so they do not require or disclose a real Pro Cycling Manager database. Test totals will change as coverage grows; use the commands below and check that they pass.
+The automated suites use synthetic fixtures by default, so they do not require or disclose a real Pro Cycling Manager database. Real-CDB compatibility testing has covered only Pro Cycling Manager 2025 (PCM 25); other releases remain untested. Test totals will change as coverage grows; use the commands below and check that they pass.
 
 ## Prerequisites
 
