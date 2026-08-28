@@ -343,6 +343,32 @@ public sealed class TableGridAdapterSourceTests
         StringAssert.Contains(clearBody, "0d", StringComparison.Ordinal);
     }
 
+    [TestMethod]
+    public void CapturedViewStateContainsOnlyPersistentColumnLayout()
+    {
+        string source = File.ReadAllText(GetAdapterSourcePath());
+        int captureStart = source.IndexOf(
+            "public TableViewState CaptureViewState(",
+            StringComparison.Ordinal);
+        int selectionStart = source.IndexOf(
+            "public GridSelection CaptureSelection()",
+            captureStart,
+            StringComparison.Ordinal);
+        Assert.IsTrue(captureStart >= 0 && selectionStart > captureStart);
+
+        string captureBody = source[captureStart..selectionStart];
+        StringAssert.Contains(
+            captureBody,
+            "new ColumnDisplayState(",
+            StringComparison.Ordinal);
+        Assert.IsFalse(
+            captureBody.Contains("SortDescriptor", StringComparison.Ordinal),
+            "Persisted adapter state must not accept sort descriptors.");
+        Assert.IsFalse(
+            captureBody.Contains("sorts", StringComparison.OrdinalIgnoreCase),
+            "Persisted adapter state must not capture session-only sorting.");
+    }
+
     private static string GetAdapterSourcePath()
     {
         DirectoryInfo? directory = new(AppContext.BaseDirectory);

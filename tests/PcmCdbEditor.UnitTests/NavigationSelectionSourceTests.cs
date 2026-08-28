@@ -68,6 +68,75 @@ public sealed class NavigationSelectionSourceTests
             StringComparison.Ordinal);
     }
 
+    [TestMethod]
+    public void TableLoadingUsesOnlyExplicitOrOpenTabSorts()
+    {
+        string source = File.ReadAllText(GetMainWindowCodePath());
+        int openStart = source.IndexOf(
+            "private async Task OpenTableAsync(",
+            StringComparison.Ordinal);
+        int bindStart = source.IndexOf(
+            "private void EnsureTabBound(",
+            openStart,
+            StringComparison.Ordinal);
+        Assert.IsTrue(openStart >= 0 && bindStart > openStart);
+
+        string openBody = source[openStart..bindStart];
+        StringAssert.Contains(
+            openBody,
+            "sorts ?? existingContext?.Sorts",
+            StringComparison.Ordinal);
+        Assert.IsFalse(
+            openBody.Contains("viewState?.Sorts", StringComparison.Ordinal),
+            "A newly opened table must not restore sorting from persisted view state.");
+        StringAssert.Contains(
+            openBody,
+            "query.Sorts",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            openBody,
+            "new TableTabContext(",
+            StringComparison.Ordinal);
+    }
+
+    [TestMethod]
+    public void OpenTabQueryReloadsRetainInMemorySortsWithoutPersistingThem()
+    {
+        string source = File.ReadAllText(GetMainWindowCodePath());
+        int reloadStart = source.IndexOf(
+            "private async Task LoadTableQueryAsync(",
+            StringComparison.Ordinal);
+        int parseFilterStart = source.IndexOf(
+            "private static bool TryParseFilterValue(",
+            reloadStart,
+            StringComparison.Ordinal);
+        Assert.IsTrue(reloadStart >= 0 && parseFilterStart > reloadStart);
+
+        string reloadBody = source[reloadStart..parseFilterStart];
+        StringAssert.Contains(
+            reloadBody,
+            "sorts ?? context.Sorts",
+            StringComparison.Ordinal);
+
+        int captureStart = source.IndexOf(
+            "private void CaptureCurrentTabState(",
+            StringComparison.Ordinal);
+        int persistStart = source.IndexOf(
+            "private async Task PersistActiveTableStateAsync(",
+            captureStart,
+            StringComparison.Ordinal);
+        Assert.IsTrue(captureStart >= 0 && persistStart > captureStart);
+
+        string captureBody = source[captureStart..persistStart];
+        StringAssert.Contains(
+            captureBody,
+            "TableGrid.CaptureViewState(",
+            StringComparison.Ordinal);
+        Assert.IsFalse(
+            captureBody.Contains("context.Sorts", StringComparison.Ordinal),
+            "Capturing a persistent column layout must not include the open tab's sort descriptors.");
+    }
+
     private static string GetMainWindowCodePath()
     {
         DirectoryInfo? directory = new(AppContext.BaseDirectory);

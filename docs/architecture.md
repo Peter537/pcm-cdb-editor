@@ -46,11 +46,11 @@ No package-specific UI event or SQLite connection type crosses these contracts.
 - native cancellation through `sqlite3_interrupt`, with the interrupt registration disposed before its connection and a canceled `SQLITE_INTERRUPT` translated to `OperationCanceledException`;
 - bounded parameterized queries, counts, and searches, plus transactional typed insert, update, and delete operations;
 - batched foreign-key display resolution and stable database-side sorting;
-- atomic settings and schema-signature-keyed view state;
+- atomic settings and schema-signature-keyed column-layout state;
 - disk-backed session history and guarded replay for updates, inserts, deletes, and maintenance commands; and
 - per-user Windows file association plus the schema-gated maintenance workflows and the clean, atomic rider/contract creation service.
 
-History snapshots live inside the active session because undoing deletes and maintenance requires complete typed rows. Settings and view state do not contain database row values, but recent-file settings can contain local filesystem paths.
+History snapshots live inside the active session because undoing deletes and maintenance requires complete typed rows. Settings and column-layout state do not contain database row values, but recent-file settings can contain local filesystem paths. Sort descriptors remain in the App context for each open table tab and are never written to settings.
 
 ### App
 
@@ -66,11 +66,11 @@ History snapshots live inside the active session because undoing deletes and mai
 - rider recovery by explicit ID list or lazily loaded team roster, with selected rows available through an explicit copy action;
 - a dedicated six-step Create Rider destination with live game-name generation, bounded name/ID lookups, ordered favorite races, the complete ability matrix and potential, typed Advanced controls, and complete insert review;
 - disk-backed undo/redo with saved-baseline tracking; and
-- theme, density, page size, recent files, view state, and file-association controls.
+- theme, density, page size, recent files, schema-keyed column layouts, and file-association controls.
 
 Inline commits use the row identity and revision captured with the visible page, then pass through the same transactional edit, dirty-state, history, refresh, and error path as row-inspector edits. `CellEditEnding` only validates and stages an immutable update. `CellEditEnded` publishes it exactly once after a successful commit; cancellation, validation failure, rebinding, or a changed bind generation clears the pending update. The TableView adapter prepares a completed page before replacing its source and reuses compatible columns, current column, multi-selection, and viewport state.
 
-Header sorting also preserves the TableView lifecycle boundary. The adapter handles the native `Sorting` event to prevent a page-local reorder, then defers a framework-neutral physical-column activation until the header tap has completed. Application mapping resolves the raw or displayed foreign-key descriptor and the priority-1 toggle or promotion; the App reloads offset zero through the existing cancellable query path. Only the committed or restored tab context drives the primary header arrow.
+Header sorting also preserves the TableView lifecycle boundary. The adapter handles the native `Sorting` event to prevent a page-local reorder, then defers a framework-neutral physical-column activation until the header tap has completed. Application mapping resolves the raw or displayed foreign-key descriptor and the priority-1 toggle or promotion; the App reloads offset zero through the existing cancellable query path. Only the committed in-memory context for an open tab drives its sort and primary header arrow. Switching among open tabs retains each tab's descriptors. Closing a tab discards them, so reopening that table, replacing or opening the database, or restarting the application starts without a sort.
 
 Horizontal viewport restoration crosses a separate TableView ownership boundary. WinUI.TableView owns horizontal position through `TableView.HorizontalOffsetProperty`; its internal or nested `ScrollViewer` is not the horizontal owner. Before replacing one table's column topology with another, the adapter synchronously neutralizes the shared TableView offset after the outgoing tab has captured its viewport, preventing a far-right offset from being arranged against a narrower header. After replacing the row source, the adapter defers the selected tab's restoration and rejects a stale bind generation. It then awaits TableView's selected-row scrolling followed by its current-cell scrolling, rejecting a stale generation after each await, before bringing the saved first row into view and finally writing the saved horizontal offset to the TableView property. Both package operations must finish because selection-driven scrolling can otherwise complete later and overwrite the restored offset. The adapter must not discover a descendant `ScrollViewer` or call `ChangeView` with the horizontal offset. Doing so bypasses TableView's coordinated header and row position and can leave the two presenters translated independently.
 
@@ -81,7 +81,7 @@ Create Rider keeps wizard state and typed controls in the App, immutable draft/i
 - **Original CDB:** user-owned input; validated and copied, never passed directly to the exporter.
 - **Session:** `%LOCALAPPDATA%\PcmCdbEditor\Sessions\<session-id>`; copied CDB, working SQLite, lifecycle metadata, and edit history.
 - **Backup:** `%LOCALAPPDATA%\PcmCdbEditor\Backups`; retained separately from session cleanup.
-- **Settings:** theme, density, page size, FK mode, recent CDB paths, and schema-keyed table layout; no database row values.
+- **Settings:** theme, density, page size, FK mode, recent CDB paths, and schema-keyed column layouts; no sort descriptors or database row values.
 - **Converter:** the bundled `SQLiteExporter.exe`; an opaque third-party process that receives only session copies and staged output paths.
 - **Release payload:** one staged self-contained `win-x64` directory intended to be used unchanged for ZIP and installer input.
 

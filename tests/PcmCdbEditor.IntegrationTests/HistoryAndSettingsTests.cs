@@ -77,7 +77,6 @@ public sealed class HistoryAndSettingsTests
                 new TableViewState(
                     "signature", "DYN_table",
                     [new ColumnDisplayState("value", 120, 0, true, false)],
-                    [new SortDescriptor("value", SortDirection.Ascending)],
                     GridDensity.Compact,
                     frozenColumnCount: 0),
                 CancellationToken.None).ConfigureAwait(false);
@@ -153,7 +152,6 @@ public sealed class HistoryAndSettingsTests
                 "signature",
                 "DYN_table",
                 [new ColumnDisplayState("value", 120, 0, true, false)],
-                [new SortDescriptor("value", SortDirection.Ascending)],
                 GridDensity.Compact,
                 frozenColumnCount: 0);
             await store.SaveTableViewStateAsync(expected, CancellationToken.None).ConfigureAwait(false);
@@ -166,6 +164,99 @@ public sealed class HistoryAndSettingsTests
             Assert.IsNotNull(actual);
             Assert.AreEqual("DYN_table", actual.TableName);
             Assert.HasCount(1, actual.Columns);
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task LegacyPersistedSortsAreIgnoredAndRemovedWhenColumnLayoutIsResaved()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "PcmCdbEditorTests", Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "settings.json");
+        Directory.CreateDirectory(directory);
+        try
+        {
+            await File.WriteAllTextAsync(
+                    path,
+                    """
+                    {
+                      "PREFERENCES": {
+                        "THEME": 0,
+                        "DENSITY": 0,
+                        "PAGESIZE": 100,
+                        "FOREIGNKEYDISPLAYMODE": 2,
+                        "RECENTFILES": []
+                      },
+                      "TABLEVIEWSTATES": {
+                        "signature\u001fDYN_table": {
+                          "SCHEMASIGNATURE": "signature",
+                          "TABLENAME": "DYN_table",
+                          "COLUMNS": [
+                            {
+                              "COLUMNNAME": "value",
+                              "WIDTH": 147.5,
+                              "DISPLAYINDEX": 2,
+                              "ISVISIBLE": false,
+                              "ISFROZEN": true
+                            }
+                          ],
+                          "SORTS": [
+                            {
+                              "COLUMNNAME": "value",
+                              "DIRECTION": 1
+                            }
+                          ],
+                          "DENSITY": 1,
+                          "FROZENCOLUMNCOUNT": 1
+                        }
+                      }
+                    }
+                    """)
+                .ConfigureAwait(false);
+
+            var store = new JsonSettingsStore(path);
+            TableViewState? restored = await store.LoadTableViewStateAsync(
+                    "SIGNATURE",
+                    "dyn_TABLE",
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+
+            Assert.IsNotNull(restored);
+            Assert.IsNull(
+                typeof(TableViewState).GetProperty("Sorts"),
+                "Legacy sort descriptors must not re-enter the persisted view-state model.");
+            Assert.AreEqual("DYN_table", restored.TableName);
+            Assert.AreEqual(GridDensity.Comfortable, restored.Density);
+            Assert.AreEqual(1, restored.FrozenColumnCount);
+            Assert.HasCount(1, restored.Columns);
+            ColumnDisplayState column = restored.Columns[0];
+            Assert.AreEqual("value", column.ColumnName);
+            Assert.AreEqual(147.5, column.Width);
+            Assert.AreEqual(2, column.DisplayIndex);
+            Assert.IsFalse(column.IsVisible);
+            Assert.IsTrue(column.IsFrozen);
+
+            await store.SaveTableViewStateAsync(restored, CancellationToken.None).ConfigureAwait(false);
+
+            string rewrittenJson = await File.ReadAllTextAsync(path).ConfigureAwait(false);
+            Assert.IsFalse(
+                rewrittenJson.Contains("\"Sorts\"", StringComparison.OrdinalIgnoreCase),
+                "Rewriting a legacy layout must retire its obsolete persisted sort descriptors.");
+            TableViewState? reloaded = await store.LoadTableViewStateAsync(
+                    "signature",
+                    "DYN_table",
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.IsNotNull(reloaded);
+            Assert.AreEqual(restored.Columns[0], reloaded.Columns[0]);
+            Assert.AreEqual(restored.Density, reloaded.Density);
+            Assert.AreEqual(restored.FrozenColumnCount, reloaded.FrozenColumnCount);
         }
         finally
         {

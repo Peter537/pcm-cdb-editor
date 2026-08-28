@@ -53,14 +53,12 @@ public sealed record TableViewState
         string schemaSignature,
         string tableName,
         IEnumerable<ColumnDisplayState> columns,
-        IEnumerable<SortDescriptor> sorts,
         GridDensity density,
         int frozenColumnCount)
     {
         SchemaSignature = schemaSignature;
         TableName = tableName;
         Columns = ModelCollections.Freeze(columns);
-        Sorts = ModelCollections.Freeze(sorts);
         Density = density;
         FrozenColumnCount = frozenColumnCount;
     }
@@ -70,8 +68,6 @@ public sealed record TableViewState
     public string TableName { get; }
 
     public IReadOnlyList<ColumnDisplayState> Columns { get; }
-
-    public IReadOnlyList<SortDescriptor> Sorts { get; }
 
     public GridDensity Density { get; }
 

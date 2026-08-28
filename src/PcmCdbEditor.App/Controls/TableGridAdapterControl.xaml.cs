@@ -278,7 +278,6 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
     public TableViewState CaptureViewState(
         string schemaSignature,
         string tableName,
-        IReadOnlyList<SortDescriptor> sorts,
         GridDensity density)
     {
         var columns = GridControl.Columns
@@ -293,7 +292,6 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
             schemaSignature,
             tableName,
             columns,
-            sorts,
             density,
             GridControl.FrozenColumnCount);
     }

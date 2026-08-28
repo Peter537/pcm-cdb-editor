@@ -621,7 +621,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 catalog,
                 table,
                 _preferences.ForeignKeyDisplayMode,
-                sorts ?? existingContext?.Sorts ?? viewState?.Sorts);
+                sorts ?? existingContext?.Sorts);
         var query = new TableQuery(
             table.Name,
             new PageRequest(0, VirtualTableQueryCoordinator.ChunkSize),
@@ -6265,7 +6265,6 @@ public sealed partial class MainWindow : Window, IDisposable
         TableViewState viewState = TableGrid.CaptureViewState(
             _catalog.SchemaSignature,
             context.Schema.Name,
-            context.Sorts,
             _preferences.Density);
         tab.Tag = context with
         {

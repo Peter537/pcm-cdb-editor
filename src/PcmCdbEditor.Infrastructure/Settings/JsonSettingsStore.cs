@@ -136,7 +136,6 @@ public sealed class JsonSettingsStore : ISettingsStore
         string SchemaSignature,
         string TableName,
         ColumnDisplayStateDocument[] Columns,
-        SortDescriptorDocument[] Sorts,
         GridDensity Density,
         int FrozenColumnCount)
     {
@@ -144,7 +143,6 @@ public sealed class JsonSettingsStore : ISettingsStore
             state.SchemaSignature,
             state.TableName,
             state.Columns.Select(ColumnDisplayStateDocument.From).ToArray(),
-            state.Sorts.Select(SortDescriptorDocument.From).ToArray(),
             state.Density,
             state.FrozenColumnCount);
 
@@ -152,7 +150,6 @@ public sealed class JsonSettingsStore : ISettingsStore
             SchemaSignature,
             TableName,
             (Columns ?? []).Select(static column => column.ToModel()),
-            (Sorts ?? []).Select(static sort => sort.ToModel()),
             Density,
             FrozenColumnCount);
     }
@@ -172,12 +169,5 @@ public sealed class JsonSettingsStore : ISettingsStore
             state.IsFrozen);
 
         public ColumnDisplayState ToModel() => new(ColumnName, Width, DisplayIndex, IsVisible, IsFrozen);
-    }
-
-    private sealed record SortDescriptorDocument(string ColumnName, SortDirection Direction)
-    {
-        public static SortDescriptorDocument From(SortDescriptor sort) => new(sort.ColumnName, sort.Direction);
-
-        public SortDescriptor ToModel() => new(ColumnName, Direction);
     }
 }

@@ -36,23 +36,20 @@ public sealed class SessionAndViewModelTests
     }
 
     [TestMethod]
-    public void TableViewStateFreezesColumnsAndSortsUnderSchemaSignature()
+    public void TableViewStateFreezesOnlyPersistentColumnLayoutUnderSchemaSignature()
     {
         var columns = new List<ColumnDisplayState>
         {
             new("name", 120, 0, true, true)
         };
-        var sorts = new List<SortDescriptor>
-        {
-            new("name", SortDirection.Ascending)
-        };
-        var state = new TableViewState("schema-a", "people", columns, sorts, GridDensity.Compact, 1);
+        var state = new TableViewState("schema-a", "people", columns, GridDensity.Compact, 1);
         columns.Clear();
-        sorts.Clear();
 
         Assert.AreEqual("schema-a", state.SchemaSignature);
         Assert.HasCount(1, state.Columns);
-        Assert.HasCount(1, state.Sorts);
+        Assert.IsNull(
+            typeof(TableViewState).GetProperty("Sorts"),
+            "Session-only sort descriptors must not be exposed by persisted table view state.");
         Assert.AreEqual(GridDensity.Compact, state.Density);
         Assert.AreEqual(1, state.FrozenColumnCount);
     }

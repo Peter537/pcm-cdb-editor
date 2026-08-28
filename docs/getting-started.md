@@ -49,7 +49,7 @@ The app scans its arguments in order and opens the first value whose name ends i
 1. Open a non-empty CDB. The app creates a session under `%LOCALAPPDATA%\PcmCdbEditor\Sessions`, copies the source into it, and gives only that copy to SQLiteExporter. Opening a file does not change the original.
 2. Choose a table or view. The catalog exposes discovered columns, keys, foreign keys, and edit capability. Views, virtual tables, and tables without a safe primary-key or `rowid` identity remain read-only.
 3. Browse, search, filter, and sort the isolated SQLite working copy. Row counts begin as **Unknown** while they are calculated independently.
-4. Edit identified table rows, then use Undo or Redo if needed. Closing a table tab does not discard database changes.
+4. Edit identified table rows, then use Undo or Redo if needed. Closing a table tab does not discard database changes, but it does discard that tab's in-memory sort.
 5. Choose **Save** to replace the current CDB destination, or **Save as** to choose another destination. Saving exports to a same-directory staging file, requires a non-empty output, backs up an existing non-empty destination, and then replaces it. A new or zero-byte destination has no prior content to back up.
 
 The staged-output check confirms only that the exporter produced a non-empty file. It does not guarantee that every Pro Cycling Manager release will accept the result.
@@ -63,6 +63,7 @@ A failure before destination replacement preserves the session's prior dirty sta
 - Advanced filters combine the positive rule numbers shown in the filter editor with `AND`, `OR`, and parentheses. `AND` binds more tightly than `OR`; for example, `1 AND (2 OR 3)`. Unknown rule numbers, malformed operators, and unbalanced parentheses are rejected.
 - Use **Sort** to edit or clear the ordered multi-column sort. Click or tap a visible column header to make it priority 1; a newly promoted column starts descending, and activating the same primary header again toggles between ascending and descending. Existing secondary priorities keep their relative order, while the single header arrow shows only priority 1.
 - Header and dialog sorting run against the database, return to the first page, and retain the current search, filters, and page size. The result is ordered across pages rather than only within the rows currently loaded.
+- Sorting remains in memory for each open table tab. Switching among open tabs retains their individual sorts. Closing and reopening a table, opening or replacing the CDB, or restarting the application starts the table unsorted.
 - Foreign-key display modes use the discovered schema. When a header shows resolved foreign-key text, header sorting uses that displayed text when the projection is available; displaying a referenced name never changes the stored key.
 - Preferences offer page sizes of 100 or 250 rows. Loading, filtering, sorting, and counting remain cancellable; a superseded request cannot replace the newer result.
 
@@ -78,7 +79,7 @@ A failure before destination replacement preserves the session's prior dirty sta
 
 ## Preferences
 
-Preferences include system, light, and dark themes; compact or comfortable density; 100- or 250-row pages; foreign-key display mode; recent files; and per-user `.cdb` registration. Table widths, order, visibility, sorting, and frozen-column state are keyed by schema signature.
+Preferences include system, light, and dark themes; compact or comfortable density; 100- or 250-row pages; foreign-key display mode; recent files; and per-user `.cdb` registration. Table widths, order, visibility, and frozen-column state persist by schema signature. Sorts are not stored in preferences or `settings.json`.
 
 `settings.json` does not store database row contents. It can store up to 12 absolute recent-file paths, so use **Clear recent files** before sharing a settings file or screenshot when those paths are sensitive.
 
@@ -86,13 +87,13 @@ Preferences include system, light, and dark themes; compact or comfortable densi
 
 The app stores per-user data under `%LOCALAPPDATA%\PcmCdbEditor`:
 
-- `settings.json` contains preferences, recent absolute paths, and saved table layouts;
+- `settings.json` contains preferences, recent absolute paths, and saved column layouts;
 - `Sessions` contains isolated CDB and SQLite working files, metadata with source and destination paths, and `edit-history.json`;
 - `Backups` contains copies made before replacing existing non-empty destinations.
 
 Undo history contains complete typed row snapshots and can encode BLOB values. Treat the entire directory as sensitive: do not commit it or attach it to an issue. At startup, the app offers interrupted dirty sessions with **Resume**, **Discard**, and **Not now**.
 
-Normal close and discard paths clean the active session, but there is no age- or size-based retention limit for history, sessions, or backups, and uninstall preserves this directory. Backups are not removed automatically. With the application closed, you may remove backups and stale sessions only after confirming that none is needed for recovery. Deleting the whole directory also removes preferences, recents, layouts, recovery data, and backups.
+Normal close and discard paths clean the active session, but there is no age- or size-based retention limit for history, sessions, or backups, and uninstall preserves this directory. Backups are not removed automatically. With the application closed, you may remove backups and stale sessions only after confirming that none is needed for recovery. Deleting the whole directory also removes preferences, recents, column layouts, recovery data, and backups.
 
 ## Maintenance tools
 
