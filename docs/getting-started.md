@@ -61,7 +61,9 @@ A failure before destination replacement preserves the session's prior dirty sta
 - Search applies to the current table. `%`, `_`, and `\` are treated as literal substring characters rather than SQLite wildcard syntax.
 - Quick filters use the selected column's discovered type. Unsupported numeric conversions are rejected rather than silently coerced.
 - Advanced filters combine the positive rule numbers shown in the filter editor with `AND`, `OR`, and parentheses. `AND` binds more tightly than `OR`; for example, `1 AND (2 OR 3)`. Unknown rule numbers, malformed operators, and unbalanced parentheses are rejected.
-- Ordered multi-column sorting and foreign-key display modes use the discovered schema. Displaying a referenced name does not change the stored key.
+- Use **Sort** to edit or clear the ordered multi-column sort. Click or tap a visible column header to make it priority 1; a newly promoted column starts descending, and activating the same primary header again toggles between ascending and descending. Existing secondary priorities keep their relative order, while the single header arrow shows only priority 1.
+- Header and dialog sorting run against the database, return to the first page, and retain the current search, filters, and page size. The result is ordered across pages rather than only within the rows currently loaded.
+- Foreign-key display modes use the discovered schema. When a header shows resolved foreign-key text, header sorting uses that displayed text when the projection is available; displaying a referenced name never changes the stored key.
 - Preferences offer page sizes of 100 or 250 rows. Loading, filtering, sorting, and counting remain cancellable; a superseded request cannot replace the newer result.
 
 ## Edit safely

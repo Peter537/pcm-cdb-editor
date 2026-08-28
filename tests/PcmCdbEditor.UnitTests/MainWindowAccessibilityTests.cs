@@ -154,6 +154,20 @@ public sealed class MainWindowAccessibilityTests
     }
 
     [TestMethod]
+    public void SortHelpDistinguishesTheHeaderShortcutFromTheFullEditor()
+    {
+        XDocument document = XDocument.Load(GetMainWindowXamlPath());
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        XElement sortButton = document
+            .Descendants()
+            .Single(element => (string?)element.Attribute(xaml + "Name") == "SortButton");
+        string helpText = (string?)sortButton.Attribute("AutomationProperties.HelpText") ?? string.Empty;
+
+        StringAssert.Contains(helpText, "Edit or clear the ordered multi-column sort.", StringComparison.Ordinal);
+        StringAssert.Contains(helpText, "make it priority 1", StringComparison.Ordinal);
+    }
+
+    [TestMethod]
     public void CreateRiderIsASixStepDestinationWithoutTemplateControls()
     {
         XDocument document = XDocument.Load(GetMainWindowXamlPath());

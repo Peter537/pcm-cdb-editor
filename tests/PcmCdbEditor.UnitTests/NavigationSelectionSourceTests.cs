@@ -31,6 +31,43 @@ public sealed class NavigationSelectionSourceTests
             StringComparison.Ordinal);
     }
 
+    [TestMethod]
+    public void TabBindingRestoresCommittedViewportAndSortIndicatorFromContext()
+    {
+        string source = File.ReadAllText(GetMainWindowCodePath());
+        int methodStart = source.IndexOf(
+            "private void EnsureTabBound(TabViewItem tab)",
+            StringComparison.Ordinal);
+        Assert.IsGreaterThanOrEqualTo(0, methodStart);
+        int methodEnd = source.IndexOf(
+            "private void UpdateTabChrome(",
+            methodStart,
+            StringComparison.Ordinal);
+        Assert.IsGreaterThan(methodStart, methodEnd);
+
+        string methodBody = source[methodStart..methodEnd];
+        StringAssert.Contains(
+            methodBody,
+            "TableGrid.RestoreViewport(context.Viewport);",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            methodBody,
+            "context.Sorts",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            methodBody,
+            "TableGrid.SetPrimarySortIndicator(",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            methodBody,
+            "sortIndicator?.HeaderColumnName",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            methodBody,
+            "sortIndicator?.Direction",
+            StringComparison.Ordinal);
+    }
+
     private static string GetMainWindowCodePath()
     {
         DirectoryInfo? directory = new(AppContext.BaseDirectory);

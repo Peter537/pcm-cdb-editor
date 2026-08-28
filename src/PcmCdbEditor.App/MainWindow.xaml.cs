@@ -126,6 +126,7 @@ public sealed partial class MainWindow : Window, IDisposable
         SetTitleBar(AppTitleBar);
         ConfigureWindow();
         TableGrid.SelectionChanged += TableGrid_SelectionChanged;
+        TableGrid.ColumnHeaderActivated += TableGrid_ColumnHeaderActivated;
         TableGrid.EditCommitted += TableGrid_EditCommitted;
         TableGrid.EditRejected += TableGrid_EditRejected;
         Activated += MainWindow_Activated;
@@ -752,11 +753,22 @@ public sealed partial class MainWindow : Window, IDisposable
             context.Page.Rows,
             context.ViewState,
             () => TableGrid.Bind(context.Schema, context.Page.Rows, context.ViewState));
+        TableHeaderSortIndicator? sortIndicator = _catalog is null
+            ? null
+            : ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(
+                _catalog,
+                context.Schema,
+                context.ForeignKeyDisplayMode,
+                context.Sorts);
         if (switchingTabs)
         {
             TableGrid.RestoreSelection(context.Selection);
             TableGrid.RestoreViewport(context.Viewport);
         }
+
+        TableGrid.SetPrimarySortIndicator(
+            sortIndicator?.HeaderColumnName,
+            sortIndicator?.Direction);
 
         SetTableLoadingSurface(isVisible: false);
         SetTableGridPresented(isPresented: true);
@@ -937,6 +949,37 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         return false;
+    }
+
+    private async void TableGrid_ColumnHeaderActivated(object? sender, string headerColumnName)
+    {
+        if (_operationLease is not null ||
+            _activeTableLoad is not null ||
+            _catalog is null ||
+            TableTabs.SelectedItem is not TabViewItem tab ||
+            tab.Tag is not TableTabContext context)
+        {
+            return;
+        }
+
+        SortDescriptor[] sorts = ForeignKeySortDescriptorMapper.PlanHeaderClick(
+            _catalog,
+            context.Schema,
+            context.ForeignKeyDisplayMode,
+            context.Sorts,
+            headerColumnName);
+        if (sorts.SequenceEqual(context.Sorts))
+        {
+            return;
+        }
+
+        await LoadTableQueryAsync(
+            context,
+            context.SearchText,
+            context.Filter,
+            context.Page.Request.Limit,
+            offset: 0,
+            sorts);
     }
 
     private void TableGrid_SelectionChanged(object? sender, GridSelection selection)
@@ -6106,6 +6149,7 @@ public sealed partial class MainWindow : Window, IDisposable
         FiltersButton.IsEnabled = isEnabled;
         SortButton.IsEnabled = isEnabled;
         PageSizeBox.IsEnabled = isEnabled;
+        TableGrid.SetHeaderSortingEnabled(isEnabled);
         if (isEnabled && TableTabs.SelectedItem is TabViewItem tab &&
             tab.Tag is TableTabContext context)
         {

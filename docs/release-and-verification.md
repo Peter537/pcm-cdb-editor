@@ -100,6 +100,7 @@ Before I publish a release, I will:
 
 - review the generated dependency, vulnerability, SBOM, license, notice, content, and provenance evidence;
 - build the candidate from a clean checkout;
+- complete the [manual Windows and accessibility checks](testing.md#manual-windows-and-accessibility-checks), including the nonzero-offset wide-table header-sort regression; reject the candidate if headers and rows misalign or the application crashes;
 - test the installed application, file association, uninstall behavior, and representative CDB round trips;
 - review the recorded local build environment and external-tool provenance; and
 - decide whether the separately licensed SQLiteExporter executable and PDF may be redistributed.

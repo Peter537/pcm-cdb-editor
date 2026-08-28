@@ -92,6 +92,205 @@ public sealed class ForeignKeySortDescriptorMapperTests
             restored);
     }
 
+    [TestMethod]
+    [DataRow(
+        ForeignKeyDisplayMode.ResolvedName,
+        "fkIDcountry",
+        "fkIDcountry__display")]
+    [DataRow(
+        ForeignKeyDisplayMode.RawAndName,
+        "FKIDCOUNTRY",
+        "fkIDcountry__display")]
+    [DataRow(ForeignKeyDisplayMode.RawValue, "fkIDcountry", "fkIDcountry")]
+    [DataRow(ForeignKeyDisplayMode.ResolvedName, "fkIDambiguous", "fkIDambiguous")]
+    [DataRow(ForeignKeyDisplayMode.ResolvedName, "LABEL", "label")]
+    public void PlanHeaderClickUsesTheDescriptorRepresentedByTheVisibleHeader(
+        ForeignKeyDisplayMode displayMode,
+        string headerColumnName,
+        string expectedDescriptorColumnName)
+    {
+        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
+
+        SortDescriptor[] planned = ForeignKeySortDescriptorMapper.PlanHeaderClick(
+            catalog,
+            table,
+            displayMode,
+            descriptors: null,
+            headerColumnName);
+
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                new SortDescriptor(
+                    expectedDescriptorColumnName,
+                    SortDirection.Descending),
+            },
+            planned);
+    }
+
+    [TestMethod]
+    public void PlanHeaderClickPromotesAndTogglesOnlyTheResolvedDescriptor()
+    {
+        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
+        SortDescriptor[] initial =
+        [
+            new SortDescriptor("ID", SortDirection.Ascending),
+            new SortDescriptor("FKIDCOUNTRY__DISPLAY", SortDirection.Ascending),
+            new SortDescriptor("fkIDcountry__display", SortDirection.Descending),
+            new SortDescriptor("fkIDambiguous", SortDirection.Ascending),
+        ];
+
+        SortDescriptor[] descending = ForeignKeySortDescriptorMapper.PlanHeaderClick(
+            catalog,
+            table,
+            ForeignKeyDisplayMode.ResolvedName,
+            initial,
+            "fkIDcountry");
+        SortDescriptor[] ascending = ForeignKeySortDescriptorMapper.PlanHeaderClick(
+            catalog,
+            table,
+            ForeignKeyDisplayMode.ResolvedName,
+            descending,
+            "FKIDCOUNTRY");
+        SortDescriptor[] descendingAgain = ForeignKeySortDescriptorMapper.PlanHeaderClick(
+            catalog,
+            table,
+            ForeignKeyDisplayMode.ResolvedName,
+            ascending,
+            "fkIDcountry");
+
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                new SortDescriptor("fkIDcountry__display", SortDirection.Descending),
+                new SortDescriptor("ID", SortDirection.Ascending),
+                new SortDescriptor("fkIDambiguous", SortDirection.Ascending),
+            },
+            descending);
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                new SortDescriptor("fkIDcountry__display", SortDirection.Ascending),
+                new SortDescriptor("ID", SortDirection.Ascending),
+                new SortDescriptor("fkIDambiguous", SortDirection.Ascending),
+            },
+            ascending);
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                new SortDescriptor("fkIDcountry__display", SortDirection.Descending),
+                new SortDescriptor("ID", SortDirection.Ascending),
+                new SortDescriptor("fkIDambiguous", SortDirection.Ascending),
+            },
+            descendingAgain);
+    }
+
+    [TestMethod]
+    [DataRow(null)]
+    [DataRow("")]
+    [DataRow("unknown")]
+    [DataRow("hidden")]
+    public void PlanHeaderClickLeavesSortsUnchangedForInvalidOrHiddenHeaders(
+        string? headerColumnName)
+    {
+        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
+        SortDescriptor[] current =
+        [
+            new SortDescriptor("label", SortDirection.Ascending),
+            new SortDescriptor("ID", SortDirection.Descending),
+        ];
+
+        SortDescriptor[] planned = ForeignKeySortDescriptorMapper.PlanHeaderClick(
+            catalog,
+            table,
+            ForeignKeyDisplayMode.ResolvedName,
+            current,
+            headerColumnName);
+
+        CollectionAssert.AreEqual(current, planned);
+    }
+
+    [TestMethod]
+    [DataRow(
+        ForeignKeyDisplayMode.ResolvedName,
+        "FKIDCOUNTRY__DISPLAY",
+        SortDirection.Ascending,
+        "fkIDcountry")]
+    [DataRow(
+        ForeignKeyDisplayMode.RawAndName,
+        "fkIDcountry__display",
+        SortDirection.Descending,
+        "fkIDcountry")]
+    [DataRow(
+        ForeignKeyDisplayMode.ResolvedName,
+        "FKIDCOUNTRY",
+        SortDirection.Descending,
+        "fkIDcountry")]
+    [DataRow(
+        ForeignKeyDisplayMode.RawValue,
+        "LABEL",
+        SortDirection.Ascending,
+        "label")]
+    public void GetPrimaryHeaderIndicatorMapsValidPrimarySortsToPhysicalHeaders(
+        ForeignKeyDisplayMode displayMode,
+        string descriptorColumnName,
+        SortDirection direction,
+        string expectedHeaderColumnName)
+    {
+        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
+
+        TableHeaderSortIndicator? indicator =
+            ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(
+                catalog,
+                table,
+                displayMode,
+                [new SortDescriptor(descriptorColumnName, direction)]);
+
+        Assert.AreEqual(
+            new TableHeaderSortIndicator(expectedHeaderColumnName, direction),
+            indicator);
+    }
+
+    [TestMethod]
+    [DataRow(ForeignKeyDisplayMode.RawValue, "fkIDcountry__display", 0)]
+    [DataRow(ForeignKeyDisplayMode.ResolvedName, "hidden", 1)]
+    [DataRow(ForeignKeyDisplayMode.ResolvedName, "unknown", 0)]
+    [DataRow(ForeignKeyDisplayMode.ResolvedName, "label", 99)]
+    public void GetPrimaryHeaderIndicatorRejectsInvalidOrHiddenPrimarySorts(
+        ForeignKeyDisplayMode displayMode,
+        string descriptorColumnName,
+        int directionValue)
+    {
+        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
+
+        TableHeaderSortIndicator? indicator =
+            ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(
+                catalog,
+                table,
+                displayMode,
+                [new SortDescriptor(descriptorColumnName, (SortDirection)directionValue)]);
+
+        Assert.IsNull(indicator);
+    }
+
+    [TestMethod]
+    public void GetPrimaryHeaderIndicatorDoesNotPromoteALaterValidSort()
+    {
+        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
+
+        TableHeaderSortIndicator? indicator =
+            ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(
+                catalog,
+                table,
+                ForeignKeyDisplayMode.ResolvedName,
+                [
+                    new SortDescriptor("unknown", SortDirection.Descending),
+                    new SortDescriptor("label", SortDirection.Ascending),
+                ]);
+
+        Assert.IsNull(indicator);
+    }
+
     private static (DatabaseSchemaCatalog Catalog, TableSchema Source) CreateCatalog()
     {
         var source = new TableSchema(

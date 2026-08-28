@@ -1,7 +1,6 @@
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Media;
 using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
 
@@ -17,16 +16,25 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
     private ColumnFingerprintHeader? _columnFingerprintHeader;
     private GridColumnFingerprint[] _columnFingerprint = [];
     private long _bindGeneration;
+    private long _pendingSortIndicatorBindGeneration;
+    private long _sortIndicatorGeneration;
+    private long _pendingSortIndicatorGeneration;
+    private string? _pendingSortIndicatorColumnName;
+    private SortDirection? _pendingSortIndicatorDirection;
+    private bool _hasPendingSortIndicator;
     private bool _isBinding;
 
     public TableGridAdapterControl()
     {
         InitializeComponent();
+        GridControl.LayoutUpdated += GridControl_LayoutUpdated;
     }
 
     public IReadOnlyList<GridRowPresentation> Rows => _rowSource.Items;
 
     public event EventHandler<GridSelection>? SelectionChanged;
+
+    public event EventHandler<string>? ColumnHeaderActivated;
 
     public event EventHandler<EditOperation>? EditCommitted;
 
@@ -58,6 +66,11 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
             !_columnFingerprint.SequenceEqual(nextFingerprint);
         GridSelection selection = columnsChanged ? new GridSelection(null, null, []) : CaptureSelection();
         GridViewport viewport = columnsChanged ? new GridViewport(null, 0) : CaptureViewport();
+        if (columnsChanged)
+        {
+            NeutralizeHorizontalOffsetForColumnTopologyChange();
+        }
+
         _rowSource.Replace(
             rows,
             row => new GridRowPresentation(schema.Name, row, visibleColumns));
@@ -97,6 +110,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         _isBinding = true;
         try
         {
+            NeutralizeHorizontalOffsetForColumnTopologyChange();
             GridControl.ItemsSource = null;
             GridControl.Columns.Clear();
             _rowSource.Clear();
@@ -110,6 +124,18 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         }
 
         AnnounceSelection(new GridSelection(null, null, []));
+    }
+
+    private void NeutralizeHorizontalOffsetForColumnTopologyChange()
+    {
+        if (GridControl.HorizontalOffset == 0)
+        {
+            return;
+        }
+
+        GridControl.SetValue(
+            WinUI.TableView.TableView.HorizontalOffsetProperty,
+            0d);
     }
 
     private void RebuildColumns(
@@ -135,7 +161,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
                 Header = column.Name,
                 IsReadOnly = isReadOnly,
                 CanFilter = false,
-                CanSort = false,
+                CanSort = true,
                 CanReorder = true,
                 CanResize = true,
                 Visibility = saved is null || saved.IsVisible ? Visibility.Visible : Visibility.Collapsed,
@@ -187,6 +213,66 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
     {
         GridControl.RowHeight = density == GridDensity.Compact ? 30 : 40;
         GridControl.HeaderRowHeight = density == GridDensity.Compact ? 34 : 44;
+    }
+
+    public void SetHeaderSortingEnabled(bool isEnabled) =>
+        GridControl.CanSortColumns = isEnabled;
+
+    public void SetPrimarySortIndicator(string? columnName, SortDirection? direction)
+    {
+        _pendingSortIndicatorGeneration = ++_sortIndicatorGeneration;
+        _pendingSortIndicatorBindGeneration = _bindGeneration;
+        _pendingSortIndicatorColumnName = columnName;
+        _pendingSortIndicatorDirection = direction;
+        _hasPendingSortIndicator = true;
+        ApplyPrimarySortIndicator(columnName, direction);
+    }
+
+    private void GridControl_LayoutUpdated(object? sender, object e)
+    {
+        if (!_hasPendingSortIndicator)
+        {
+            return;
+        }
+
+        // A bind or tab switch can replace native header presenters during layout.
+        // Reapply the latest committed direction once those presenters exist.
+        _hasPendingSortIndicator = false;
+        if (_pendingSortIndicatorGeneration == _sortIndicatorGeneration &&
+            _pendingSortIndicatorBindGeneration == _bindGeneration)
+        {
+            ApplyPrimarySortIndicator(
+                _pendingSortIndicatorColumnName,
+                _pendingSortIndicatorDirection);
+        }
+    }
+
+    private void ApplyPrimarySortIndicator(string? columnName, SortDirection? direction)
+    {
+        foreach (WinUI.TableView.TableViewColumn column in GridControl.Columns)
+        {
+            column.SortDirection = null;
+        }
+
+        if (string.IsNullOrWhiteSpace(columnName) || direction is null)
+        {
+            return;
+        }
+
+        WinUI.TableView.TableViewColumn? primaryColumn = GridControl.Columns.FirstOrDefault(column =>
+            column.Tag is string name &&
+            name.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+        if (primaryColumn is null)
+        {
+            return;
+        }
+
+        primaryColumn.SortDirection = direction switch
+        {
+            SortDirection.Ascending => WinUI.TableView.SortDirection.Ascending,
+            SortDirection.Descending => WinUI.TableView.SortDirection.Descending,
+            _ => null,
+        };
     }
 
     public TableViewState CaptureViewState(
@@ -297,8 +383,28 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
             () => RestoreViewport(viewport, generation));
     }
 
-    private void RestoreViewport(GridViewport viewport, long generation)
+    private async void RestoreViewport(GridViewport viewport, long generation)
     {
+        if (generation != _bindGeneration)
+        {
+            return;
+        }
+
+        if (GridControl.SelectedIndex >= 0)
+        {
+            await GridControl.ScrollRowIntoView(GridControl.SelectedIndex);
+        }
+
+        if (generation != _bindGeneration)
+        {
+            return;
+        }
+
+        if (GridControl.CurrentCellSlot is { } currentCellSlot)
+        {
+            await GridControl.ScrollCellIntoView(currentCellSlot);
+        }
+
         if (generation != _bindGeneration)
         {
             return;
@@ -311,31 +417,9 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
             GridControl.ScrollIntoView(first);
         }
 
-        FindDescendantScrollViewer(GridControl)?.ChangeView(
-            viewport.HorizontalOffset,
-            null,
-            null,
-            disableAnimation: true);
-    }
-
-    private static ScrollViewer? FindDescendantScrollViewer(DependencyObject root)
-    {
-        int children = VisualTreeHelper.GetChildrenCount(root);
-        for (var index = 0; index < children; index++)
-        {
-            DependencyObject child = VisualTreeHelper.GetChild(root, index);
-            if (child is ScrollViewer scrollViewer)
-            {
-                return scrollViewer;
-            }
-
-            if (FindDescendantScrollViewer(child) is { } descendant)
-            {
-                return descendant;
-            }
-        }
-
-        return null;
+        GridControl.SetValue(
+            WinUI.TableView.TableView.HorizontalOffsetProperty,
+            (double)viewport.HorizontalOffset);
     }
 
     private void GridControl_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -346,6 +430,29 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         }
 
         AnnounceSelection(CaptureSelection());
+    }
+
+    private void GridControl_Sorting(
+        object sender,
+        WinUI.TableView.TableViewSortingEventArgs args)
+    {
+        // Sorting is database-side. Never let TableView reorder only the loaded page.
+        args.Handled = true;
+        if (args.Column.Tag is string columnName && !string.IsNullOrWhiteSpace(columnName))
+        {
+            long generation = _bindGeneration;
+            // TableView raises Sorting before its header tap has finished. Defer
+            // downstream grid state changes until that native callback returns.
+            DispatcherQueue.TryEnqueue(
+                DispatcherQueuePriority.Low,
+                () =>
+                {
+                    if (generation == _bindGeneration)
+                    {
+                        AnnounceColumnHeaderActivation(columnName);
+                    }
+                });
+        }
     }
 
     private void GridControl_BeginningEdit(
@@ -502,6 +609,9 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
     // Kept explicit so future TableView edit events can enter the application port without
     // leaking package-specific event arguments into Application.
     internal void AnnounceSelection(GridSelection selection) => SelectionChanged?.Invoke(this, selection);
+
+    internal void AnnounceColumnHeaderActivation(string columnName) =>
+        ColumnHeaderActivated?.Invoke(this, columnName);
 
     internal void AnnounceEdit(EditOperation operation) => EditCommitted?.Invoke(this, operation);
 

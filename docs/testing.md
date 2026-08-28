@@ -12,7 +12,9 @@ Complete the locked restore and Release/x64 build in [Getting started](getting-s
 dotnet test tests/PcmCdbEditor.UnitTests/PcmCdbEditor.UnitTests.csproj --configuration Release --no-build --no-restore --disable-build-servers -m:1
 ```
 
-The unit suite covers domain and view-model state, row identity and typed SQLite values, filter parsing and query composition, bounded paging and request coordination, Undo/Redo models, maintenance review projections, rider-ID normalization, inline-edit staging and bind-generation invalidation, Create Rider input/range/role/lookup models, live Unicode-aware game-name generation and overrides, potential validation, ordered favorite-list validation and serialization, busy-to-ready command availability, architecture boundaries, mutation write-ahead behavior, and source-level wizard, UI, and accessibility contracts.
+The unit suite covers domain and view-model state, row identity and typed SQLite values, filter parsing and query composition, bounded paging and request coordination, header-sort transitions and foreign-key descriptor mapping, Undo/Redo models, maintenance review projections, rider-ID normalization, inline-edit staging and bind-generation invalidation, Create Rider input/range/role/lookup models, live Unicode-aware game-name generation and overrides, potential validation, ordered favorite-list validation and serialization, busy-to-ready command availability, architecture boundaries, mutation write-ahead behavior, and source-level wizard, UI, accessibility, and TableView adapter contracts.
+
+The source-level TableView checks verify event deferral, committed primary-indicator wiring, bind-generation guards, the selection-scroll completion barrier, and viewport restoration through `TableView.HorizontalOffsetProperty`. They do not run the WinUI layout engine. A passing unit suite therefore does not prove rendered header and row alignment or crash-free header sorting.
 
 ## Integration tests
 
@@ -52,9 +54,20 @@ Source tests can check XAML names, automation IDs, and focus-management code, bu
 - system, light, and dark themes; compact and comfortable density; 100- and 250-row pages; display scaling; and high-contrast behavior;
 - open, edit, Undo/Redo, **Save**, **Save as**, backup, dirty-close, and interrupted-session recovery flows on disposable copies.
 - double-click, Enter, and F2 inline edits for Integer, Real, and Text cells; click-away commit, Escape cancellation, invalid input, rapid repeated edits, Undo/Redo, multi-selection, current-column focus, and viewport stability;
+- header sorting on wide and horizontally scrolled tables: first activation descending, repeated activation toggling, another column promoted above preserved secondary priorities, **Sort** dialog parity and clearing, database-wide order across pages, foreign-key display modes, tab and persisted-state restoration, cancellation and failure rollback, busy-state disabling, keyboard and Narrator access through **Sort**, visible primary-arrow direction, and stable header, row, and viewport alignment;
 - rider recovery with a long team name, an empty team, manually entered IDs, missing IDs, and **Use selected rows** without automatic input replacement;
 - Create Rider at narrow and wide window sizes: all six steps, long rider/team/region/race names, lookup loading and errors, live game-name generation plus override/reset, keyboard race selection/removal/reordering, optional-empty favorite warning, potential range and increments, observed height/weight guidance, the 14-row matrix and both bulk actions, Current-above-Limit warnings, blank-Limit acknowledgement, collapsed Advanced groups, BLOB omission and non-editability, role labels with codes, allocation review, the preview-busy-to-Ready button transition, stale/error states, apply, Undo, and Redo;
 - Create Rider and the maintenance workflows at 200% text scaling in system, light, and dark themes, including keyboard-only operation, reduced motion, and focus restoration after dialogs.
+
+Run the nonzero-offset header-sort regression exactly as follows:
+
+1. Open a table wide enough to require horizontal scrolling, make a visible middle-column cell current, then scroll about 60 device-independent pixels away from the left edge so the horizontal offset is clearly nonzero.
+2. Without returning to the left edge, click a visible column header and wait for the descending database query and row bind to finish.
+3. Confirm that the app did not crash, the horizontal position was preserved, every visible header boundary still aligns with its row-cell boundary, and exactly one descending primary-sort arrow is visible.
+4. Click the same header again, wait for the ascending reload, and repeat the alignment, position, arrow, and no-crash checks.
+5. Switch to a narrower table tab and back. Confirm that the exact saved position, header and row alignment, current cell, and ascending primary-sort arrow are restored.
+
+The regression covered by this sequence shifted the header row left by roughly the saved horizontal offset while the column widths remained unchanged. A passing check must not show that translation at any step.
 
 Record only non-sensitive observations. Do not include real database contents, local absolute paths, session metadata, screenshots with private rows, or `local-smoke` evidence in a public report.
 

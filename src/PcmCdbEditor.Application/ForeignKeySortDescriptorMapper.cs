@@ -4,6 +4,10 @@ namespace PcmCdbEditor.Application;
 
 internal sealed record TableSortOption(string DescriptorColumnName, string Label);
 
+internal sealed record TableHeaderSortIndicator(
+    string HeaderColumnName,
+    SortDirection Direction);
+
 internal static class ForeignKeySortDescriptorMapper
 {
     private const string DisplaySuffix = "__display";
@@ -75,6 +79,113 @@ internal static class ForeignKeySortDescriptorMapper
         }
 
         return restored.ToArray();
+    }
+
+    public static SortDescriptor[] PlanHeaderClick(
+        DatabaseSchemaCatalog catalog,
+        TableSchema table,
+        ForeignKeyDisplayMode displayMode,
+        IEnumerable<SortDescriptor>? descriptors,
+        string? headerColumnName)
+    {
+        ArgumentNullException.ThrowIfNull(catalog);
+        ArgumentNullException.ThrowIfNull(table);
+        if (!Enum.IsDefined(displayMode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(displayMode));
+        }
+
+        SortDescriptor[] current = descriptors?.ToArray() ?? [];
+        HashSet<string> displayableSources = displayMode == ForeignKeyDisplayMode.RawValue
+            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            : GetDisplayableSources(catalog, table);
+        if (!TryResolveHeaderDescriptor(
+                table,
+                displayableSources,
+                headerColumnName,
+                out string descriptorColumnName))
+        {
+            return current;
+        }
+
+        SortDirection direction = current.FirstOrDefault() is { } primary &&
+                                  primary.ColumnName.Equals(
+                                      descriptorColumnName,
+                                      StringComparison.OrdinalIgnoreCase) &&
+                                  primary.Direction == SortDirection.Descending
+            ? SortDirection.Ascending
+            : SortDirection.Descending;
+
+        return
+        [
+            new SortDescriptor(descriptorColumnName, direction),
+            .. current.Where(descriptor => !descriptor.ColumnName.Equals(
+                descriptorColumnName,
+                StringComparison.OrdinalIgnoreCase)),
+        ];
+    }
+
+    public static TableHeaderSortIndicator? GetPrimaryHeaderIndicator(
+        DatabaseSchemaCatalog catalog,
+        TableSchema table,
+        ForeignKeyDisplayMode displayMode,
+        IEnumerable<SortDescriptor>? descriptors)
+    {
+        ArgumentNullException.ThrowIfNull(catalog);
+        ArgumentNullException.ThrowIfNull(table);
+        if (!Enum.IsDefined(displayMode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(displayMode));
+        }
+
+        SortDescriptor? primary = descriptors?.FirstOrDefault();
+        if (primary is null || !Enum.IsDefined(primary.Direction))
+        {
+            return null;
+        }
+
+        HashSet<string> displayableSources = displayMode == ForeignKeyDisplayMode.RawValue
+            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            : GetDisplayableSources(catalog, table);
+        foreach (ColumnSchema column in table.Columns.Where(static column => !column.IsHidden))
+        {
+            if (column.Name.Equals(primary.ColumnName, StringComparison.OrdinalIgnoreCase) ||
+                displayableSources.Contains(column.Name) &&
+                $"{column.Name}{DisplaySuffix}".Equals(
+                    primary.ColumnName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return new TableHeaderSortIndicator(column.Name, primary.Direction);
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryResolveHeaderDescriptor(
+        TableSchema table,
+        HashSet<string> displayableSources,
+        string? headerColumnName,
+        out string descriptorColumnName)
+    {
+        descriptorColumnName = string.Empty;
+        if (string.IsNullOrWhiteSpace(headerColumnName))
+        {
+            return false;
+        }
+
+        ColumnSchema? column = table.Columns.FirstOrDefault(column =>
+            !column.IsHidden &&
+            column.Name.Equals(headerColumnName, StringComparison.OrdinalIgnoreCase));
+        if (column is null)
+        {
+            return false;
+        }
+
+        descriptorColumnName = displayableSources.Contains(column.Name)
+            ? $"{column.Name}{DisplaySuffix}"
+            : column.Name;
+        return true;
     }
 
     private static HashSet<string> GetDisplayableSources(
