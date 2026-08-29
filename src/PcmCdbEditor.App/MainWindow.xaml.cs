@@ -333,9 +333,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 openedSession.WorkingSqlitePath,
                 cancellationToken);
             await ActivateSessionAsync(openedSession, catalog, cancellationToken);
-            PresentSuccess(
-                "Working copy ready",
-                "The original CDB remains untouched until you choose Save.");
+            PresentWorkingCopyReady();
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -5970,6 +5968,7 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         CancelActiveTableLoad();
         DisposeTableCoordinators();
+        WorkingCopyStatus.Visibility = Visibility.Collapsed;
         _session = null;
         _catalog = null;
         ResetMaintenanceTargetsForSession(sessionId: null);
@@ -6043,8 +6042,15 @@ public sealed partial class MainWindow : Window, IDisposable
     private void PresentError(string title, string message) =>
         PresentInfoBar(title, message, InfoBarSeverity.Error);
 
+    private void PresentWorkingCopyReady()
+    {
+        OperationInfo.IsOpen = false;
+        WorkingCopyStatus.Visibility = Visibility.Visible;
+    }
+
     private void PresentInfoBar(string title, string message, InfoBarSeverity severity)
     {
+        WorkingCopyStatus.Visibility = Visibility.Collapsed;
         OperationInfo.Title = title;
         OperationInfo.Message = message;
         OperationInfo.Severity = severity;

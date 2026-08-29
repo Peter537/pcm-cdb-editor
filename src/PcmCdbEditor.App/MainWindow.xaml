@@ -108,9 +108,45 @@
             Grid.Row="0"
             DefaultLabelPosition="Right"
             IsDynamicOverflowEnabled="True"
+            VerticalContentAlignment="Center"
             Background="Transparent"
             AutomationProperties.AutomationId="WorkspaceCommandBar"
             AutomationProperties.Name="Database commands">
+          <CommandBar.Content>
+            <Grid
+                x:Name="WorkingCopyStatus"
+                MaxWidth="220"
+                Margin="12,0,8,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                Background="Transparent"
+                Visibility="Collapsed"
+                ToolTipService.ToolTip="The original CDB remains untouched until you choose Save.">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
+              <SymbolIcon
+                  Symbol="Accept"
+                  Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                  AutomationProperties.AccessibilityView="Raw" />
+              <TextBlock
+                  x:Name="WorkingCopyStatusText"
+                  Grid.Column="1"
+                  Margin="8,0,0,0"
+                  VerticalAlignment="Center"
+                  FontFamily="Segoe UI Variable Text"
+                  FontSize="13"
+                  FontWeight="SemiBold"
+                  Text="Working copy ready"
+                  TextWrapping="NoWrap"
+                  TextTrimming="CharacterEllipsis"
+                  AutomationProperties.AutomationId="WorkingCopyReadyStatus"
+                  AutomationProperties.Name="Working copy ready"
+                  AutomationProperties.HelpText="The original CDB remains untouched until you choose Save."
+                  AutomationProperties.LiveSetting="Polite" />
+            </Grid>
+          </CommandBar.Content>
           <AppBarButton x:Name="OpenButton" Icon="OpenFile" Label="Open" Click="Open_Click" AutomationProperties.AutomationId="OpenDatabaseCommand" AutomationProperties.Name="Open database" AutomationProperties.HelpText="Open a CDB file from a safe working copy. Shortcut Ctrl+O.">
             <AppBarButton.KeyboardAccelerators>
               <KeyboardAccelerator Key="O" Modifiers="Control" />

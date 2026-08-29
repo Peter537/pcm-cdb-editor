@@ -15,6 +15,7 @@ public sealed class MainWindowAccessibilityTests
             ["CreateRiderNavigationItem"] = "NavigationCreateRider",
             ["RecoveryNavigationItem"] = "NavigationRecovery",
             ["WorkspaceCommandBar"] = "WorkspaceCommandBar",
+            ["WorkingCopyStatusText"] = "WorkingCopyReadyStatus",
             ["OpenButton"] = "OpenDatabaseCommand",
             ["SaveButton"] = "SaveDatabaseCommand",
             ["SaveAsButton"] = "SaveDatabaseAsCommand",
@@ -357,6 +358,98 @@ public sealed class MainWindowAccessibilityTests
         StringAssert.Contains(source, "OverflowDeleteRowButton.IsEnabled = isEnabled;", StringComparison.Ordinal);
     }
 
+    [TestMethod]
+    public void WorkingCopyStatusIsCompactAccessibleCommandBarContent()
+    {
+        const string workingCopyLabel = "Working copy ready";
+        const string workingCopyHelp =
+            "The original CDB remains untouched until you choose Save.";
+        XDocument document = XDocument.Load(GetMainWindowXamlPath());
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        XElement commandBar = document
+            .Descendants()
+            .Single(element => (string?)element.Attribute(xaml + "Name") == "WorkspaceCommandBar");
+        XElement commandContent = commandBar
+            .Elements()
+            .Single(element => element.Name.LocalName == "CommandBar.Content");
+        XElement workingCopyStatus = commandContent
+            .Descendants()
+            .Single(element => (string?)element.Attribute(xaml + "Name") == "WorkingCopyStatus");
+        XElement visibleLabel = workingCopyStatus
+            .Descendants()
+            .Single(element =>
+                element.Name.LocalName == "TextBlock"
+                && (string?)element.Attribute("Text") == workingCopyLabel);
+
+        Assert.AreEqual("True", (string?)commandBar.Attribute("IsDynamicOverflowEnabled"));
+        Assert.AreEqual("Center", (string?)commandBar.Attribute("VerticalContentAlignment"));
+        Assert.AreEqual("Collapsed", (string?)workingCopyStatus.Attribute("Visibility"));
+        Assert.AreEqual("Transparent", (string?)workingCopyStatus.Attribute("Background"));
+        Assert.AreEqual(
+            "WorkingCopyReadyStatus",
+            (string?)visibleLabel.Attribute("AutomationProperties.AutomationId"));
+        Assert.AreEqual(
+            workingCopyLabel,
+            (string?)visibleLabel.Attribute("AutomationProperties.Name"));
+        Assert.AreEqual(
+            workingCopyHelp,
+            (string?)visibleLabel.Attribute("AutomationProperties.HelpText"));
+        Assert.AreEqual(
+            "Polite",
+            (string?)visibleLabel.Attribute("AutomationProperties.LiveSetting"));
+        Assert.AreEqual(
+            workingCopyHelp,
+            (string?)workingCopyStatus.Attribute("ToolTipService.ToolTip"));
+        Assert.AreEqual("NoWrap", (string?)visibleLabel.Attribute("TextWrapping"));
+        Assert.AreEqual("CharacterEllipsis", (string?)visibleLabel.Attribute("TextTrimming"));
+
+        XElement operationInfo = document
+            .Descendants()
+            .Single(element => (string?)element.Attribute(xaml + "Name") == "OperationInfo");
+        Assert.IsFalse(
+            operationInfo.Ancestors().Contains(commandContent),
+            "Consequential operation messages must remain separate from compact command-bar content.");
+        Assert.AreEqual("1", (string?)operationInfo.Attribute("Grid.Row"));
+        Assert.AreEqual(
+            "OperationStatusMessage",
+            (string?)operationInfo.Attribute("AutomationProperties.AutomationId"));
+    }
+
+    [TestMethod]
+    public void WorkingCopyStatusOnlyReplacesTheRoutineOpenSuccessMessage()
+    {
+        string source = File.ReadAllText(GetMainWindowCodePath());
+        string openPath = GetMethodSource(source, "private async Task OpenPathAsync(string path)");
+        string presentWorkingCopy = GetMethodSource(source, "private void PresentWorkingCopyReady()");
+        string presentInfoBar = GetMethodSource(
+            source,
+            "private void PresentInfoBar(string title, string message, InfoBarSeverity severity)");
+        string resetToNoFile = GetMethodSource(source, "private void ResetToNoFile()");
+
+        StringAssert.Contains(openPath, "PresentWorkingCopyReady();", StringComparison.Ordinal);
+        Assert.IsFalse(
+            openPath.Contains("PresentSuccess(", StringComparison.Ordinal),
+            "The routine open result must use the compact working-copy presenter.");
+        Assert.IsFalse(
+            openPath.Contains("\"Working copy ready\"", StringComparison.Ordinal),
+            "The compact presenter's accessible text belongs to its XAML contract, not a generic InfoBar call.");
+
+        AssertAppearsBefore(
+            presentWorkingCopy,
+            "OperationInfo.IsOpen = false;",
+            "WorkingCopyStatus.Visibility = Visibility.Visible;",
+            "The full-width InfoBar must close before the compact status becomes visible.");
+        AssertAppearsBefore(
+            presentInfoBar,
+            "WorkingCopyStatus.Visibility = Visibility.Collapsed;",
+            "OperationInfo.IsOpen = true;",
+            "Generic operation feedback must hide the compact status before opening the InfoBar.");
+        StringAssert.Contains(
+            resetToNoFile,
+            "WorkingCopyStatus.Visibility = Visibility.Collapsed;",
+            StringComparison.Ordinal);
+    }
+
     private static string GetMainWindowXamlPath()
     {
         return GetMainWindowSourcePath("MainWindow.xaml");
@@ -365,6 +458,49 @@ public sealed class MainWindowAccessibilityTests
     private static string GetMainWindowCodePath()
     {
         return GetMainWindowSourcePath("MainWindow.xaml.cs");
+    }
+
+    private static string GetMethodSource(string source, string signature)
+    {
+        int signatureStart = source.IndexOf(signature, StringComparison.Ordinal);
+        Assert.IsTrue(signatureStart >= 0, $"Expected method '{signature}' was not found.");
+
+        int bodyStart = source.IndexOf('{', signatureStart);
+        Assert.IsTrue(bodyStart >= 0, $"Expected method '{signature}' has no body.");
+
+        var depth = 0;
+        for (int index = bodyStart; index < source.Length; index++)
+        {
+            switch (source[index])
+            {
+                case '{':
+                    depth++;
+                    break;
+                case '}':
+                    depth--;
+                    if (depth == 0)
+                    {
+                        return source[signatureStart..(index + 1)];
+                    }
+                    break;
+            }
+        }
+
+        Assert.Fail($"Expected method '{signature}' has an unterminated body.");
+        return string.Empty;
+    }
+
+    private static void AssertAppearsBefore(
+        string source,
+        string first,
+        string second,
+        string message)
+    {
+        int firstIndex = source.IndexOf(first, StringComparison.Ordinal);
+        int secondIndex = source.IndexOf(second, StringComparison.Ordinal);
+        Assert.IsTrue(firstIndex >= 0, $"{message} Missing '{first}'.");
+        Assert.IsTrue(secondIndex >= 0, $"{message} Missing '{second}'.");
+        Assert.IsTrue(firstIndex < secondIndex, message);
     }
 
     private static string GetMainWindowSourcePath(string fileName)
