@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Data;
 using System.Globalization;
 using System.Text;
@@ -77,9 +78,66 @@ public sealed class SqliteTableDataStore : ITableDataStore
         Action<CommandKind>? commandObserver,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(query);
+        RowsQueryResult result = await ExecuteRowsQueryAsync(
+                sqlitePath,
+                catalog,
+                query.Definition,
+                query.Page,
+                commandObserver,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return new TableSlice(
+            query.TableName,
+            query.Page,
+            result.Rows,
+            result.HasMore);
+    }
+
+    public Task<IReadOnlyList<TypedRow>> QueryAllRowsAsync(
+        string sqlitePath,
+        DatabaseSchemaCatalog catalog,
+        TableQueryDefinition query,
+        CancellationToken cancellationToken) =>
+        SqliteOperationRunner.RunAsync(
+            () => QueryAllRowsCoreAsync(sqlitePath, catalog, query, _commandObserver, cancellationToken),
+            cancellationToken);
+
+    private static async Task<IReadOnlyList<TypedRow>> QueryAllRowsCoreAsync(
+        string sqlitePath,
+        DatabaseSchemaCatalog catalog,
+        TableQueryDefinition query,
+        Action<CommandKind>? commandObserver,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        RowsQueryResult result = await ExecuteRowsQueryAsync(
+                sqlitePath,
+                catalog,
+                query,
+                page: null,
+                commandObserver,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (result.HasMore)
+        {
+            throw new InvalidDataException("An unbounded table query returned a partial result.");
+        }
+
+        return FreezeRows(result.Rows, cancellationToken);
+    }
+
+    private static async Task<RowsQueryResult> ExecuteRowsQueryAsync(
+        string sqlitePath,
+        DatabaseSchemaCatalog catalog,
+        TableQueryDefinition query,
+        PageRequest? page,
+        Action<CommandKind>? commandObserver,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(catalog);
         ArgumentNullException.ThrowIfNull(query);
-        PageQueryPlan plan = BuildPageQueryPlan(catalog, query);
+        RowsQueryPlan plan = BuildRowsQueryPlan(catalog, query, page is not null);
         TableSchema table = plan.Table;
         ColumnSchema[] columns = plan.Columns;
         QueryProjection projection = plan.Projection;
@@ -93,17 +151,22 @@ public sealed class SqliteTableDataStore : ITableDataStore
         await using var command = connection.CreateCommand();
         command.CommandText = plan.CommandText;
         AddParameters(command, plan.Parameters);
-        command.Parameters.AddWithValue("$limit", query.Page.Limit + 1);
-        command.Parameters.AddWithValue("$offset", query.Page.Offset);
+        if (page is not null)
+        {
+            command.Parameters.AddWithValue("$limit", page.Limit + 1);
+            command.Parameters.AddWithValue("$offset", page.Offset);
+        }
 
-        var rows = new List<TypedRow>(query.Page.Limit);
+        var rows = page is null
+            ? new List<TypedRow>()
+            : new List<TypedRow>(page.Limit);
         var hasMore = false;
         commandObserver?.Invoke(CommandKind.Page);
         await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                if (rows.Count == query.Page.Limit)
+                if (page is not null && rows.Count == page.Limit)
                 {
                     hasMore = true;
                     break;
@@ -128,16 +191,16 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 cancellationToken)
             .ConfigureAwait(false);
 
-        return new TableSlice(
-            table.Name,
-            query.Page,
-            projectedRows,
-            hasMore);
+        return new RowsQueryResult(projectedRows, hasMore);
     }
 
     internal static string BuildPageCommandTextForDiagnostics(
         DatabaseSchemaCatalog catalog,
-        TableQuery query) => BuildPageQueryPlan(catalog, query).CommandText;
+        TableQuery query) => BuildRowsQueryPlan(catalog, query.Definition, includePage: true).CommandText;
+
+    internal static string BuildAllRowsCommandTextForDiagnostics(
+        DatabaseSchemaCatalog catalog,
+        TableQueryDefinition query) => BuildRowsQueryPlan(catalog, query, includePage: false).CommandText;
 
     public Task<long> CountAsync(
         string sqlitePath,
@@ -636,16 +699,26 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 .Select(static resolved => resolved.SourceColumn)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
-            SqliteValue[] keys = sourceColumns
-                .SelectMany(sourceColumn => rows.Select(row => row.Values[sourceColumn]))
-                .Where(static value => value.Kind != SqliteValueKind.Null)
-                .Distinct()
-                .ToArray();
+            var distinctKeys = new HashSet<SqliteValue>();
+            var keys = new List<SqliteValue>();
+            foreach (string sourceColumn in sourceColumns)
+            {
+                foreach (TypedRow row in rows)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    SqliteValue value = row.Values[sourceColumn];
+                    if (value.Kind != SqliteValueKind.Null && distinctKeys.Add(value))
+                    {
+                        keys.Add(value);
+                    }
+                }
+            }
+
             lookups[group.Key] = await ReadResolvedLookupsAsync(
                     connection,
                     transaction,
                     group.Key,
-                    keys,
+                    keys.ToArray(),
                     commandObserver,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -654,6 +727,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
         var projectedRows = new List<TypedRow>(rows.Count);
         foreach (TypedRow row in rows)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var values = new Dictionary<string, SqliteValue>(row.Values, StringComparer.OrdinalIgnoreCase);
             foreach (ResolvedColumn resolved in projection.ResolvedColumns)
             {
@@ -667,7 +741,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 if (!lookups[resolved.LookupTarget].TryGetValue(source, out ResolvedLookup? lookup)
                     || lookup is null)
                 {
-                    throw new InvalidDataException("A bounded foreign-key lookup did not return its source key.");
+                    throw new InvalidDataException("A foreign-key lookup did not return its source key.");
                 }
 
                 string display = lookup.ResolvedName is null
@@ -682,6 +756,21 @@ public sealed class SqliteTableDataStore : ITableDataStore
         }
 
         return projectedRows;
+    }
+
+    private static ReadOnlyCollection<TypedRow> FreezeRows(
+        IReadOnlyList<TypedRow> rows,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = new TypedRow[rows.Count];
+        for (var index = 0; index < snapshot.Length; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            snapshot[index] = rows[index];
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return Array.AsReadOnly(snapshot);
     }
 
     private static async Task<IReadOnlyDictionary<SqliteValue, ResolvedLookup>> ReadResolvedLookupsAsync(
@@ -745,7 +834,7 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
                 int ordinal = reader.GetInt32(0);
                 if ((uint)ordinal >= (uint)batch.Length || reader.IsDBNull(1))
                 {
-                    throw new InvalidDataException("SQLite returned an invalid bounded foreign-key lookup row.");
+                    throw new InvalidDataException("SQLite returned an invalid foreign-key lookup row.");
                 }
 
                 results[batch[ordinal]] = new ResolvedLookup(
@@ -772,9 +861,10 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
             CultureInfo.InvariantCulture);
     }
 
-    private static PageQueryPlan BuildPageQueryPlan(
+    private static RowsQueryPlan BuildRowsQueryPlan(
         DatabaseSchemaCatalog catalog,
-        TableQuery query)
+        TableQueryDefinition query,
+        bool includePage)
     {
         TableSchema table = RequireTable(catalog, query.TableName);
         ColumnSchema[] columns = table.Columns.Where(static column => !column.IsHidden).ToArray();
@@ -786,8 +876,9 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
         string commandText =
             $"SELECT {BuildSelectColumns(table, columns, qualify: true)} " +
             $"FROM {SqliteSupport.QuoteIdentifier(table.Name)} AS {QueryProjection.BaseAlias}" +
-            $"{joins}{where}{orderBy} LIMIT $limit OFFSET $offset";
-        return new PageQueryPlan(
+            $"{joins}{where}{orderBy}" +
+            (includePage ? " LIMIT $limit OFFSET $offset" : string.Empty);
+        return new RowsQueryPlan(
             table,
             columns,
             projection,
@@ -960,12 +1051,16 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
 
     private sealed record SqlParameterValue(string Name, SqliteValue Value);
 
-    private sealed record PageQueryPlan(
+    private sealed record RowsQueryPlan(
         TableSchema Table,
         ColumnSchema[] Columns,
         QueryProjection Projection,
         string CommandText,
         IReadOnlyList<SqlParameterValue> Parameters);
+
+    private sealed record RowsQueryResult(
+        IReadOnlyList<TypedRow> Rows,
+        bool HasMore);
 
     private sealed record ResolvedLookup(string RawText, string? ResolvedName);
 

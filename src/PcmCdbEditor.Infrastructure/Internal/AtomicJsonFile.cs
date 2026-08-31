@@ -28,29 +28,8 @@ internal static class AtomicJsonFile
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (!File.Exists(fullPath))
-            {
-                return defaultFactory();
-            }
-
-            try
-            {
-                await using var stream = new FileStream(
-                    fullPath,
-                    FileMode.Open,
-                    FileAccess.Read,
-                    FileShare.Read,
-                    bufferSize: 4096,
-                    FileOptions.Asynchronous | FileOptions.SequentialScan);
-                return await JsonSerializer.DeserializeAsync<T>(stream, SerializerOptions, cancellationToken)
-                    .ConfigureAwait(false)
-                    ?? defaultFactory();
-            }
-            catch (JsonException)
-            {
-                PreserveCorruptFile(fullPath);
-                return defaultFactory();
-            }
+            return await ReadOrCreateCoreAsync(fullPath, defaultFactory, cancellationToken)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -63,41 +42,104 @@ internal static class AtomicJsonFile
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
 
         var fullPath = Path.GetFullPath(path);
-        var directory = Path.GetDirectoryName(fullPath)
-            ?? throw new ArgumentException("The settings path must have a parent directory.", nameof(path));
         var gate = Gates.GetOrAdd(fullPath, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            Directory.CreateDirectory(directory);
-            var temporaryPath = Path.Combine(
-                directory,
-                $".{Path.GetFileName(fullPath)}.{Guid.NewGuid():N}.tmp");
-            try
-            {
-                await using (var stream = new FileStream(
-                    temporaryPath,
-                    FileMode.CreateNew,
-                    FileAccess.Write,
-                    FileShare.None,
-                    bufferSize: 4096,
-                    FileOptions.Asynchronous | FileOptions.WriteThrough))
-                {
-                    await JsonSerializer.SerializeAsync(stream, value, SerializerOptions, cancellationToken)
-                        .ConfigureAwait(false);
-                    await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                File.Move(temporaryPath, fullPath, overwrite: true);
-            }
-            finally
-            {
-                TryDelete(temporaryPath);
-            }
+            await WriteCoreAsync(fullPath, value, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             gate.Release();
+        }
+    }
+
+    public static async Task UpdateAsync<T>(
+        string path,
+        Func<T> defaultFactory,
+        Func<T, T> update,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentNullException.ThrowIfNull(defaultFactory);
+        ArgumentNullException.ThrowIfNull(update);
+
+        var fullPath = Path.GetFullPath(path);
+        var gate = Gates.GetOrAdd(fullPath, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            T current = await ReadOrCreateCoreAsync(fullPath, defaultFactory, cancellationToken)
+                .ConfigureAwait(false);
+            await WriteCoreAsync(fullPath, update(current), cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private static async Task<T> ReadOrCreateCoreAsync<T>(
+        string fullPath,
+        Func<T> defaultFactory,
+        CancellationToken cancellationToken)
+    {
+        if (!File.Exists(fullPath))
+        {
+            return defaultFactory();
+        }
+
+        try
+        {
+            await using var stream = new FileStream(
+                fullPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 4096,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            return await JsonSerializer.DeserializeAsync<T>(stream, SerializerOptions, cancellationToken)
+                .ConfigureAwait(false)
+                ?? defaultFactory();
+        }
+        catch (JsonException)
+        {
+            PreserveCorruptFile(fullPath);
+            return defaultFactory();
+        }
+    }
+
+    private static async Task WriteCoreAsync<T>(
+        string fullPath,
+        T value,
+        CancellationToken cancellationToken)
+    {
+        var directory = Path.GetDirectoryName(fullPath)
+            ?? throw new ArgumentException("The settings path must have a parent directory.", nameof(fullPath));
+        Directory.CreateDirectory(directory);
+        var temporaryPath = Path.Combine(
+            directory,
+            $".{Path.GetFileName(fullPath)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            await using (var stream = new FileStream(
+                temporaryPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 4096,
+                FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                await JsonSerializer.SerializeAsync(stream, value, SerializerOptions, cancellationToken)
+                    .ConfigureAwait(false);
+                await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            File.Move(temporaryPath, fullPath, overwrite: true);
+        }
+        finally
+        {
+            TryDelete(temporaryPath);
         }
     }
 

@@ -312,9 +312,11 @@
                 <Button x:Name="FiltersButton" Height="32" Content="Filters" Click="Filters_Click" AutomationProperties.AutomationId="ConfigureTableFiltersCommand" AutomationProperties.Name="Filters" AutomationProperties.HelpText="Build quick rules and numbered advanced filter rules for the current table." />
                 <Button x:Name="SortButton" Height="32" Content="Sort" Click="Sort_Click" AutomationProperties.AutomationId="ConfigureTableSortCommand" AutomationProperties.Name="Sort" AutomationProperties.HelpText="Edit or clear the ordered multi-column sort. Click or tap a column header to make it priority 1." />
               </StackPanel>
-              <ComboBox x:Name="PageSizeBox" Grid.Column="2" Width="120" Height="32" SelectedIndex="0" SelectionChanged="PageSizeBox_SelectionChanged" AutomationProperties.AutomationId="TablePageSize" AutomationProperties.Name="Page size" AutomationProperties.HelpText="Choose how many table rows appear on each page.">
+              <ComboBox x:Name="PageSizeBox" Grid.Column="2" Width="120" Height="32" SelectedIndex="0" SelectionChanged="PageSizeBox_SelectionChanged" AutomationProperties.AutomationId="TablePageSize" AutomationProperties.Name="Rows to show" AutomationProperties.HelpText="Choose 100, 250, or 500 rows per page, or load all matching rows for the current table. Loading all rows may require substantial time and memory.">
                 <ComboBoxItem Content="100 rows" />
                 <ComboBoxItem Content="250 rows" />
+                <ComboBoxItem Content="500 rows" />
+                <ComboBoxItem Content="All rows" />
               </ComboBox>
               <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="4">
                 <Button x:Name="PreviousPageButton" Width="34" Height="32" Click="PreviousPage_Click" IsEnabled="False" ToolTipService.ToolTip="Previous page" AutomationProperties.AutomationId="PreviousTablePageCommand" AutomationProperties.Name="Previous page" AutomationProperties.HelpText="Show the previous page of rows in the current table.">

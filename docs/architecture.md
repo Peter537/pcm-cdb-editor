@@ -20,7 +20,7 @@ Solid arrows between projects show compile-time dependencies. `PcmCdbEditor.App`
 
 ### Domain
 
-`PcmCdbEditor.Domain` defines immutable SQLite storage values, row identities and revisions, runtime schema metadata, page/filter/sort requests, row-count state, view preferences, lifecycle models, reversible edit operations, replay guards, and maintenance previews. It has no WinUI, SQLite-package, process, registry, or filesystem dependency.
+`PcmCdbEditor.Domain` defines immutable SQLite storage values, row identities and revisions, runtime schema metadata, the page-independent `TableQueryDefinition`, bounded page requests, row-count state, view preferences, lifecycle models, reversible edit operations, replay guards, and maintenance previews. It has no WinUI, SQLite-package, process, registry, or filesystem dependency.
 
 ### Application
 
@@ -31,7 +31,7 @@ Solid arrows between projects show compile-time dependencies. `PcmCdbEditor.App`
 - stable query models;
 - operation gates that prevent conflicting work and suppress stale asynchronous completions;
 - an inline-edit commit stager that separates pre-commit parsing from post-lifecycle mutation, plus the shared rider-ID parser; and
-- bounded virtual-query coordination with independently cancellable row and count work.
+- virtual-query coordination for bounded pages and lazy counts, plus independently cancellable complete-result materialization through `VirtualTableQueryCoordinator.LoadAllRowsAsync`.
 
 No package-specific UI event or SQLite connection type crosses these contracts.
 
@@ -44,7 +44,7 @@ No package-specific UI event or SQLite connection type crosses these contracts.
 - runtime table/view/column/key/FK discovery, conservative relationship inference, signatures, and safe edit-capability classification;
 - an internal SQLite operation runner that moves UI-reachable catalog, query/count, edit/replay, workspace validation, and maintenance work off the WinUI dispatcher;
 - native cancellation through `sqlite3_interrupt`, with the interrupt registration disposed before its connection and a canceled `SQLITE_INTERRUPT` translated to `OperationCanceledException`;
-- bounded parameterized queries, counts, and searches, plus transactional typed insert, update, and delete operations;
+- parameterized bounded page queries, counts, and searches; `ITableDataStore.QueryAllRowsAsync` queries without `LIMIT` or `OFFSET`; and transactional typed insert, update, and delete operations;
 - batched foreign-key display resolution and stable database-side sorting;
 - atomic settings and schema-signature-keyed column-layout state;
 - disk-backed session history and guarded replay for updates, inserts, deletes, and maintenance commands; and
@@ -58,17 +58,22 @@ History snapshots live inside the active session because undoing deletes and mai
 
 - copy-first picker, command-line, recent-file, and association activation;
 - target-named table loading in which only the current request may bind rows, change status, or dismiss the loading surface;
-- cancellation that restores the previous completed tab and focus, plus lazy per-tab counts that update count text without rebinding rows;
-- bounded virtual browsing and lazy counts;
+- cancellation that restores the previous completed tab and focus, plus lazy finite-page counts that update count text without rebinding rows;
+- an App-private `TableDisplayWindow` that owns the selected row choice, offset, completed rows, and `HasMore` state independently of the bounded `PageRequest`;
+- bounded 100-, 250-, and 500-row browsing, plus an explicit all-row mode that uses offset zero, `HasMore = false`, an exact completed-row count, disabled paging controls, and no lazy count;
 - raw, resolved-name, and `raw | name` FK display modes;
 - typed inline edits that preserve the existing SQLite storage class;
 - a full-row editor with explicit Integer, Real, Text, and NULL choices while treating BLOBs as read-only metadata;
 - rider recovery by explicit ID list or lazily loaded team roster, with selected rows available through an explicit copy action;
 - a dedicated six-step Create Rider destination with live game-name generation, bounded name/ID lookups, ordered favorite races, the complete ability matrix and potential, typed Advanced controls, and complete insert review;
 - disk-backed undo/redo with saved-baseline tracking; and
-- theme, density, page size, recent files, schema-keyed column layouts, and file-association controls.
+- theme, density, finite page size, recent files, schema-keyed column layouts, and file-association controls.
 
 Inline commits use the row identity and revision captured with the visible page, then pass through the same transactional edit, dirty-state, history, refresh, and error path as row-inspector edits. `CellEditEnding` only validates and stages an immutable update. `CellEditEnded` publishes it exactly once after a successful commit; cancellation, validation failure, rebinding, or a changed bind generation clears the pending update. The TableView adapter prepares a completed page before replacing its source and reuses compatible columns, current column, multi-selection, and viewport state.
+
+The all-row path reuses the same projection, foreign-key resolution, search, filters, database sorting, and native SQLite interruption as finite paging. It publishes rows only after the complete query succeeds, so cancellation, failure, reset, invalidation, disposal, or supersession cannot partially bind the result or replace the previous completed view.
+
+The selected table tab retains **All rows** across query changes, edits, refreshes, foreign-key display changes, and tab switching. Closing the tab or editor discards it; a new tab uses the last finite global preference. Saving unrelated preferences does not change an all-row tab, while explicitly selecting a finite page-size preference may apply that finite choice to the selected tab.
 
 Header sorting also preserves the TableView lifecycle boundary. The adapter handles the native `Sorting` event to prevent a page-local reorder, then defers a framework-neutral physical-column activation until the header tap has completed. Application mapping resolves the raw or displayed foreign-key descriptor and the priority-1 toggle or promotion; the App reloads offset zero through the existing cancellable query path. Only the committed in-memory context for an open tab drives its sort and primary header arrow. Switching among open tabs retains each tab's descriptors. Closing a tab discards them, so reopening that table, replacing or opening the database, or restarting the application starts without a sort.
 
@@ -81,7 +86,7 @@ Create Rider keeps wizard state and typed controls in the App, immutable draft/i
 - **Original CDB:** user-owned input; validated and copied, never passed directly to the exporter.
 - **Session:** `%LOCALAPPDATA%\PcmCdbEditor\Sessions\<session-id>`; copied CDB, working SQLite, lifecycle metadata, and edit history.
 - **Backup:** `%LOCALAPPDATA%\PcmCdbEditor\Backups`; retained separately from session cleanup.
-- **Settings:** theme, density, page size, FK mode, recent CDB paths, and schema-keyed column layouts; no sort descriptors or database row values.
+- **Settings:** theme, density, a finite page size of 100, 250, or 500, FK mode, recent CDB paths, and schema-keyed column layouts; no all-row sentinel, sort descriptors, or database row values. Invalid or obsolete page-size values normalize to 100.
 - **Converter:** the bundled `SQLiteExporter.exe`; an opaque third-party process that receives only session copies and staged output paths.
 - **Release payload:** one staged self-contained `win-x64` directory intended to be used unchanged for ZIP and installer input.
 

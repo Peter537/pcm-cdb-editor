@@ -23,7 +23,6 @@ namespace PcmCdbEditor.App;
 
 public sealed partial class MainWindow : Window, IDisposable
 {
-    private const int DefaultPageSize = 100;
     private const int SearchDelayMilliseconds = 250;
 
     private readonly string? _launchPath;
@@ -45,6 +44,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly List<TableListItem> _allTables = [];
     private readonly Dictionary<string, TabViewItem> _tableTabs = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<TabViewItem, CancellationTokenSource> _countCancellations = [];
+    private readonly SemaphoreSlim _pageSizePreferenceSaveGate = new(1, 1);
 
     private AppWindow? _appWindow;
     private EditorSessionState? _session;
@@ -60,7 +60,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private EditorPreferences _preferences = new(
         EditorApplicationTheme.System,
         GridDensity.Compact,
-        DefaultPageSize,
+        TableRowDisplayOptions.DefaultPageSize,
         ForeignKeyDisplayMode.RawAndName);
     private bool _suppressTableSelection;
     private bool _suppressTabSelection;
@@ -473,7 +473,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 ViewModel.Tables[0].Name,
                 searchText: string.Empty,
                 cancellationToken,
-                pageSize: _preferences.PageSize);
+                rowDisplay: TableRowDisplayChoice.FromPageSize(_preferences.PageSize));
         }
         else
         {
@@ -536,7 +536,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 tableName,
                 searchText,
                 request.Token,
-                pageSize: _preferences.PageSize,
+                rowDisplay: TableRowDisplayChoice.FromPageSize(_preferences.PageSize),
                 loadRequest: request);
             request.Lease.ThrowIfSuperseded(request.Token);
         }
@@ -566,7 +566,7 @@ public sealed partial class MainWindow : Window, IDisposable
         string searchText,
         CancellationToken cancellationToken,
         FilterExpression? filter = null,
-        int pageSize = DefaultPageSize,
+        TableRowDisplayChoice? rowDisplay = null,
         long offset = 0,
         IReadOnlyList<SortDescriptor>? sorts = null,
         TableFilterDefinition? filterDefinition = null,
@@ -579,6 +579,14 @@ public sealed partial class MainWindow : Window, IDisposable
         if (!catalog.TryGetTable(tableName, out TableSchema table))
         {
             throw new InvalidDataException("The selected table is no longer in the schema catalog.");
+        }
+
+        TableRowDisplayChoice effectiveRowDisplay = rowDisplay ??
+            TableRowDisplayChoice.FromPageSize(TableRowDisplayOptions.DefaultPageSize);
+        ForeignKeyDisplayMode foreignKeyDisplayMode = _preferences.ForeignKeyDisplayMode;
+        if (effectiveRowDisplay.IsAllRows)
+        {
+            offset = 0;
         }
 
         GlobalSearchRequest? search = null;
@@ -618,7 +626,7 @@ public sealed partial class MainWindow : Window, IDisposable
             ForeignKeySortDescriptorMapper.Restore(
                 catalog,
                 table,
-                _preferences.ForeignKeyDisplayMode,
+                foreignKeyDisplayMode,
                 sorts ?? existingContext?.Sorts);
         var query = new TableQuery(
             table.Name,
@@ -626,12 +634,12 @@ public sealed partial class MainWindow : Window, IDisposable
             sorts: effectiveSorts,
             filter: filter,
             search: search,
-            foreignKeyDisplayMode: _preferences.ForeignKeyDisplayMode);
+            foreignKeyDisplayMode: foreignKeyDisplayMode);
         bool canReuseCoordinator = existingContext is not null &&
             existingContext.SearchText.Equals(searchText, StringComparison.Ordinal) &&
             ReferenceEquals(existingContext.Filter, filter) &&
             existingContext.Sorts.SequenceEqual(query.Sorts) &&
-            existingContext.ForeignKeyDisplayMode == _preferences.ForeignKeyDisplayMode;
+            existingContext.ForeignKeyDisplayMode == foreignKeyDisplayMode;
         var coordinator = canReuseCoordinator
             ? existingContext!.Coordinator
             : new VirtualTableQueryCoordinator(
@@ -642,33 +650,40 @@ public sealed partial class MainWindow : Window, IDisposable
         bool ownsCoordinator = !canReuseCoordinator;
         try
         {
-            if (ownsCoordinator &&
-                existingTab is not null &&
-                existingContext is not null &&
-                CancelVirtualCount(existingTab) &&
-                existingTab.Tag is TableTabContext currentExisting &&
-                ReferenceEquals(currentExisting.Coordinator, existingContext.Coordinator) &&
-                currentExisting.CountState.Status == TableRowCountStatus.Loading)
+            TableDisplayWindow display;
+            TableRowCountState countState;
+            if (effectiveRowDisplay.IsAllRows)
             {
-                existingContext = currentExisting with { CountState = TableRowCountState.Cancelled };
-                existingTab.Tag = existingContext;
+                IReadOnlyList<TypedRow> rows = await coordinator.LoadAllRowsAsync(cancellationToken);
+                EnsureTableLoadCurrent(loadRequest, cancellationToken);
+                display = new TableDisplayWindow(
+                    effectiveRowDisplay,
+                    Offset: 0,
+                    rows,
+                    HasMore: false);
+                countState = TableRowCountState.Available(rows.Count);
             }
+            else
+            {
+                int pageSize = effectiveRowDisplay.PageSize!.Value;
+                VirtualChunk<TypedRow> chunk = await coordinator.LoadChunkContainingAsync(
+                    offset,
+                    cancellationToken);
+                EnsureTableLoadCurrent(loadRequest, cancellationToken);
 
-            VirtualChunk<TypedRow> chunk = await coordinator.LoadChunkContainingAsync(
-                offset,
-                cancellationToken);
-            EnsureTableLoadCurrent(loadRequest, cancellationToken);
-
-            int chunkIndex = checked((int)(offset - chunk.Offset));
-            TypedRow[] rows = chunk.Items.Skip(chunkIndex).Take(pageSize).ToArray();
-            bool provisionalHasMore = chunkIndex + rows.Length < chunk.Items.Count ||
-                chunk.Items.Count == VirtualTableQueryCoordinator.ChunkSize;
-            var page = new TablePage(
-                table.Name,
-                new PageRequest(offset, pageSize),
-                totalRows: -1,
-                rows,
-                provisionalHasMore);
+                int chunkIndex = checked((int)(offset - chunk.Offset));
+                TypedRow[] rows = chunk.Items.Skip(chunkIndex).Take(pageSize).ToArray();
+                bool provisionalHasMore = chunkIndex + rows.Length < chunk.Items.Count ||
+                    chunk.Items.Count == VirtualTableQueryCoordinator.ChunkSize;
+                display = new TableDisplayWindow(
+                    effectiveRowDisplay,
+                    offset,
+                    rows,
+                    provisionalHasMore);
+                countState = canReuseCoordinator
+                    ? existingContext!.CountState
+                    : TableRowCountState.Loading;
+            }
 
             if (_session?.SessionId != session.SessionId)
             {
@@ -677,19 +692,17 @@ public sealed partial class MainWindow : Window, IDisposable
 
             EnsureTableLoadCurrent(loadRequest, cancellationToken);
 
-            TableRowCountState countState = canReuseCoordinator
-                ? existingContext!.CountState
-                : TableRowCountState.Loading;
             var context = new TableTabContext(
                 table,
-                page,
+                display,
+                PendingRowDisplay: null,
                 searchText,
                 filter,
                 filterDefinition ?? existingContext?.FilterDefinition ?? TableFilterDefinition.Empty,
                 query.Sorts,
                 viewState,
                 coordinator,
-                _preferences.ForeignKeyDisplayMode,
+                foreignKeyDisplayMode,
                 countState,
                 IsInvalidated: false,
                 Selection: existingContext?.Selection ?? new GridSelection(null, null, []),
@@ -705,13 +718,20 @@ public sealed partial class MainWindow : Window, IDisposable
                 TableTabs.TabItems.Add(tab);
                 ViewModel.Tabs.Add(new TableTabState(
                     table.Name,
-                    "Count pending",
+                    countState.Status == TableRowCountStatus.Available
+                        ? FormatCount(countState.Value ?? display.Rows.Count)
+                        : "Count pending",
                     table.EditCapability != TableEditCapability.Editable));
             }
 
             TableTabContext? staleContext = !canReuseCoordinator
                 ? tab.Tag as TableTabContext
                 : null;
+            if ((ownsCoordinator || effectiveRowDisplay.IsAllRows) && existingTab is not null)
+            {
+                CancelVirtualCount(existingTab);
+            }
+
             tab.Tag = context;
             ownsCoordinator = false;
             staleContext?.Coordinator.Dispose();
@@ -748,9 +768,9 @@ public sealed partial class MainWindow : Window, IDisposable
         TableGrid.SetDensity(_preferences.Density);
         _gridBindingSession.BindIfChanged(
             tab,
-            context.Page.Rows,
+            context.Display.Rows,
             context.ViewState,
-            () => TableGrid.Bind(context.Schema, context.Page.Rows, context.ViewState));
+            () => TableGrid.Bind(context.Schema, context.Display.Rows, context.ViewState));
         TableHeaderSortIndicator? sortIndicator = _catalog is null
             ? null
             : ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(
@@ -773,7 +793,14 @@ public sealed partial class MainWindow : Window, IDisposable
         EmptyState.Visibility = Visibility.Collapsed;
         BusyIndicator.Visibility = Visibility.Collapsed;
         UpdateTabChrome(tab, context);
-        if (context.CountState.Status != TableRowCountStatus.Available &&
+        if (context.CountState.Status == TableRowCountStatus.Available)
+        {
+            UpdateTabCountLabel(
+                context.Schema.Name,
+                FormatCount(context.CountState.Value ?? context.Display.Rows.Count));
+        }
+        if (!context.Display.RowDisplay.IsAllRows &&
+            context.CountState.Status != TableRowCountStatus.Available &&
             !_countCancellations.ContainsKey(tab))
         {
             StartVirtualCount(tab, context);
@@ -791,14 +818,14 @@ public sealed partial class MainWindow : Window, IDisposable
         CurrentTableSearchBox.Text = context.SearchText;
         _suppressCurrentTableSearch = false;
         _suppressPageSizeSelection = true;
-        PageSizeBox.SelectedIndex = context.Page.Request.Limit == 250 ? 1 : 0;
+        PageSizeBox.SelectedIndex = TableRowDisplayOptions.GetToolbarIndex(context.Display.RowDisplay);
         _suppressPageSizeSelection = false;
 
         ViewModel.Status = context.Schema.EditCapability == TableEditCapability.Editable
             ? "Ready"
             : "Read-only table";
         UpdateCountAndPagingChrome(tab, context);
-        ViewModel.PageSizeLabel = $"{context.Page.Request.Limit:N0} rows/page";
+        ViewModel.PageSizeLabel = context.Display.RowDisplay.StatusLabel;
         FiltersButton.Content = context.FilterDefinition.RuleCount == 0
             ? "Filters"
             : $"Filters ({context.FilterDefinition.RuleCount:N0})";
@@ -818,8 +845,8 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
-        long first = context.Page.Rows.Count == 0 ? 0 : context.Page.Request.Offset + 1;
-        long last = context.Page.Request.Offset + context.Page.Rows.Count;
+        long first = context.Display.Rows.Count == 0 ? 0 : context.Display.Offset + 1;
+        long last = context.Display.Offset + context.Display.Rows.Count;
         string totalLabel = context.CountState.Status switch
         {
             TableRowCountStatus.Available => $"{context.CountState.Value:N0}",
@@ -828,17 +855,19 @@ public sealed partial class MainWindow : Window, IDisposable
             TableRowCountStatus.Failed => "count unavailable",
             _ => "count unknown",
         };
-        ViewModel.TableSummary = context.Page.Rows.Count == 0
+        ViewModel.TableSummary = context.Display.Rows.Count == 0
             ? $"{context.Schema.Name} · 0 visible rows · {totalLabel}"
             : $"{context.Schema.Name} · {first:N0}–{last:N0} of {totalLabel} rows";
-        bool canNavigatePages = _operationLease is null;
-        PreviousPageButton.IsEnabled = canNavigatePages && context.Page.Request.Offset > 0;
-        NextPageButton.IsEnabled = canNavigatePages && context.Page.HasMore;
+        bool canNavigatePages = _operationLease is null &&
+            context.PendingRowDisplay is null &&
+            !context.Display.RowDisplay.IsAllRows;
+        PreviousPageButton.IsEnabled = canNavigatePages && context.Display.Offset > 0;
+        NextPageButton.IsEnabled = canNavigatePages && context.Display.HasMore;
         if (context.CountState.Status == TableRowCountStatus.Available &&
             context.CountState.Value.HasValue)
         {
             NextPageButton.IsEnabled = canNavigatePages &&
-                context.Page.Request.Offset + context.Page.Rows.Count <
+                context.Display.Offset + context.Display.Rows.Count <
                 context.CountState.Value.Value;
         }
     }
@@ -975,7 +1004,7 @@ public sealed partial class MainWindow : Window, IDisposable
             context,
             context.SearchText,
             context.Filter,
-            context.Page.Request.Limit,
+            GetRequestedRowDisplay(context),
             offset: 0,
             sorts);
     }
@@ -995,9 +1024,9 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
-        TypedRow? row = context.Page.Rows.FirstOrDefault(candidate =>
+        TypedRow? row = context.Display.Rows.FirstOrDefault(candidate =>
             candidate.Identity is not null && candidate.Identity.Equals(selection.CurrentRow));
-        TypedRow[] selectedRows = context.Page.Rows
+        TypedRow[] selectedRows = context.Display.Rows
             .Where(candidate => candidate.Identity is not null &&
                 selection.SelectedRows.Any(identity => candidate.Identity.Equals(identity)))
             .ToArray();
@@ -1055,12 +1084,19 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
-        TypedRow? visibleRow = context.Page.Rows.FirstOrDefault(row =>
+        TypedRow? visibleRow = context.Display.Rows.FirstOrDefault(row =>
             row.Identity is not null && row.Identity.Equals(update.Identity));
         if (visibleRow is null || visibleRow.Revision != update.ExpectedRevision)
         {
             PresentWarning("Row changed", "The visible row is stale. Reload it before editing.");
-            await RefreshSelectedTableAsync();
+            await LoadTableQueryAsync(
+                context,
+                context.SearchText,
+                context.Filter,
+                GetRequestedRowDisplay(context),
+                GetRequestedOffset(context),
+                context.Sorts,
+                context.FilterDefinition);
             return;
         }
 
@@ -1555,7 +1591,8 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             if (mutationCommitted)
             {
-                await HandlePostCommitFailureAsync("The row changed, but the app could not update the session's recovery information.");
+                PresentCommittedRefreshCancellation(
+                    "The row change completed in the working copy.");
             }
             else if (_operationMutationPrepared)
             {
@@ -1741,8 +1778,8 @@ public sealed partial class MainWindow : Window, IDisposable
                 _editHistory.CompleteRedo(pending, result.OppositeGuards);
             }
 
-            await RefreshSelectedTableAsync();
             await ReconcileSessionWithHistoryBaselineAsync();
+            await RefreshSelectedTableAsync();
             string affectedRowLabel = result.AffectedRows == 1 ? "row" : "rows";
             PresentSuccess(
                 isUndo ? "Change undone" : "Change redone",
@@ -1752,7 +1789,10 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             if (replayCommitted)
             {
-                await HandlePostCommitFailureAsync("The undo or redo finished, but the app could not save its recovery information.");
+                PresentCommittedRefreshCancellation(
+                    isUndo
+                        ? "The undo completed in the working copy."
+                        : "The redo completed in the working copy.");
             }
             else if (_operationMutationPrepared)
             {
@@ -1933,17 +1973,20 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             if (tab.Tag is TableTabContext context)
             {
+                TableRowCountState countState = context.Display.RowDisplay.IsAllRows
+                    ? TableRowCountState.Available(context.Display.Rows.Count)
+                    : TableRowCountState.Unknown;
                 tab.Tag = context with
                 {
-                    CountState = TableRowCountState.Unknown,
+                    CountState = countState,
                     IsInvalidated = true,
                 };
+                UpdateTabCountLabel(
+                    context.Schema.Name,
+                    context.Display.RowDisplay.IsAllRows
+                        ? FormatCount(context.Display.Rows.Count)
+                        : "Count pending");
             }
-        }
-
-        for (var index = 0; index < ViewModel.Tabs.Count; index++)
-        {
-            ViewModel.Tabs[index] = ViewModel.Tabs[index] with { CountLabel = "Count pending" };
         }
     }
 
@@ -1954,6 +1997,12 @@ public sealed partial class MainWindow : Window, IDisposable
         try
         {
             await RefreshSelectedTableAsync();
+        }
+        catch (OperationCanceledException) when (
+            _operationLease?.Token.IsCancellationRequested == true ||
+            _lifetimeCancellation.IsCancellationRequested)
+        {
+            // Keep the recovery message below; a cancelled refresh must not replace it.
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
@@ -1973,6 +2022,12 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             await RefreshSelectedTableAsync();
         }
+        catch (OperationCanceledException) when (
+            _operationLease?.Token.IsCancellationRequested == true ||
+            _lifetimeCancellation.IsCancellationRequested)
+        {
+            // Keep the uncertainty warning below; the previous completed rows remain visible.
+        }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
             // The uncertainty warning is more important than a secondary refresh failure.
@@ -1989,12 +2044,25 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             await RefreshSelectedTableAsync();
         }
+        catch (OperationCanceledException) when (
+            _operationLease?.Token.IsCancellationRequested == true ||
+            _lifetimeCancellation.IsCancellationRequested)
+        {
+            // Keep the mutation warning below; the previous completed rows remain visible.
+        }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
             // Preserve the mutation/recovery warning when a secondary refresh also fails.
         }
 
         PresentError(title, message);
+    }
+
+    private void PresentCommittedRefreshCancellation(string completedChange)
+    {
+        PresentWarning(
+            "Table refresh cancelled",
+            $"{completedChange} The previous completed rows remain visible and may now be stale. Change the table query or switch tabs to reload them.");
     }
 
     private async void CurrentTableSearchBox_TextChanged(
@@ -2014,13 +2082,25 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             await Task.Delay(SearchDelayMilliseconds, request.Token);
             request.Lease.ThrowIfSuperseded(request.Token);
+            if (!ReferenceEquals(TableTabs.SelectedItem, tab))
+            {
+                request.Cancellation.Cancel();
+                throw new OperationCanceledException(request.Token);
+            }
+            if (tab.Tag is not TableTabContext currentContext)
+            {
+                request.Cancellation.Cancel();
+                throw new OperationCanceledException(request.Token);
+            }
+
+            context = currentContext;
             ShowTableLoading(request, context.Schema.Name);
             await OpenTableAsync(
                 context.Schema.Name,
                 sender.Text,
                 request.Token,
                 context.Filter,
-                context.Page.Request.Limit,
+                GetRequestedRowDisplay(context),
                 offset: 0,
                 sorts: context.Sorts,
                 filterDefinition: context.FilterDefinition,
@@ -2056,45 +2136,116 @@ public sealed partial class MainWindow : Window, IDisposable
     private async void PageSizeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_suppressPageSizeSelection ||
+            _operationLease is not null ||
+            _activeTableLoad is not null ||
             TableTabs.SelectedItem is not TabViewItem tab ||
             tab.Tag is not TableTabContext context)
         {
             return;
         }
 
-        int pageSize = PageSizeBox.SelectedIndex == 1 ? 250 : DefaultPageSize;
-        _preferences = new EditorPreferences(
-            _preferences.Theme,
-            _preferences.Density,
-            pageSize,
-            _preferences.ForeignKeyDisplayMode,
-            _preferences.RecentFiles);
-        try
+        TableRowDisplayChoice rowDisplay = TableRowDisplayOptions.FromToolbarIndex(
+            PageSizeBox.SelectedIndex);
+        context = context with
         {
-            await _settingsStore.SavePreferencesAsync(_preferences, _lifetimeCancellation.Token);
-        }
-        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+            PendingRowDisplay = rowDisplay,
+            IsInvalidated = true,
+        };
+        tab.Tag = context;
+        UpdateCountAndPagingChrome(tab, context);
+        if (!rowDisplay.IsAllRows)
         {
-            PresentWarning(
-                "Page-size preference was not saved",
-                SafeFailureMessage(exception, "The current table can still be reloaded."));
-        }
-        await LoadTableQueryAsync(context, context.SearchText, context.Filter, pageSize);
-    }
+            int pageSize = rowDisplay.PageSize!.Value;
+            var preferencesToSave = new EditorPreferences(
+                _preferences.Theme,
+                _preferences.Density,
+                pageSize,
+                _preferences.ForeignKeyDisplayMode,
+                _preferences.RecentFiles);
+            _preferences = preferencesToSave;
+            var saveGateEntered = false;
+            try
+            {
+                await _pageSizePreferenceSaveGate.WaitAsync(_lifetimeCancellation.Token);
+                saveGateEntered = true;
+                await _settingsStore.SavePreferencesAsync(
+                    preferencesToSave,
+                    _lifetimeCancellation.Token);
+            }
+            catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception exception) when (IsExpectedOperationFailure(exception))
+            {
+                PresentWarning(
+                    "Page-size preference was not saved",
+                    SafeFailureMessage(exception, "The current table can still be reloaded."));
+            }
+            finally
+            {
+                if (saveGateEntered)
+                {
+                    _pageSizePreferenceSaveGate.Release();
+                }
+            }
 
-    private async void PreviousPage_Click(object sender, RoutedEventArgs e)
-    {
-        if (TableTabs.SelectedItem is not TabViewItem tab || tab.Tag is not TableTabContext context)
+            if (_operationLease is not null ||
+                _activeTableLoad is not null ||
+                !ReferenceEquals(TableTabs.SelectedItem, tab) ||
+                tab.Tag is not TableTabContext currentContext ||
+                !ReferenceEquals(currentContext.Display, context.Display) ||
+                !ReferenceEquals(currentContext.Coordinator, context.Coordinator) ||
+                PageSizeBox.SelectedIndex != TableRowDisplayOptions.GetToolbarIndex(rowDisplay))
+            {
+                return;
+            }
+
+            context = currentContext;
+        }
+
+        TableQueryOutcome queryOutcome = await LoadTableQueryAsync(
+            context,
+            context.SearchText,
+            context.Filter,
+            rowDisplay);
+        if (queryOutcome == TableQueryOutcome.Succeeded ||
+            tab.Tag is not TableTabContext pendingContext ||
+            !ReferenceEquals(pendingContext.Display, context.Display) ||
+            !ReferenceEquals(pendingContext.Coordinator, context.Coordinator))
         {
             return;
         }
 
-        long offset = Math.Max(0, context.Page.Request.Offset - context.Page.Request.Limit);
+        pendingContext = pendingContext with
+        {
+            PendingRowDisplay = rowDisplay,
+            IsInvalidated = true,
+        };
+        tab.Tag = pendingContext;
+        if (ReferenceEquals(TableTabs.SelectedItem, tab) && _activeTableLoad is null)
+        {
+            UpdateTabChrome(tab, pendingContext);
+        }
+    }
+
+    private async void PreviousPage_Click(object sender, RoutedEventArgs e)
+    {
+        if (TableTabs.SelectedItem is not TabViewItem tab ||
+            tab.Tag is not TableTabContext context ||
+            context.PendingRowDisplay is not null ||
+            context.Display.RowDisplay.IsAllRows)
+        {
+            return;
+        }
+
+        int pageSize = context.Display.RowDisplay.PageSize!.Value;
+        long offset = Math.Max(0, context.Display.Offset - pageSize);
         await LoadTableQueryAsync(
             context,
             context.SearchText,
             context.Filter,
-            context.Page.Request.Limit,
+            context.Display.RowDisplay,
             offset);
     }
 
@@ -2102,7 +2253,9 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         if (TableTabs.SelectedItem is not TabViewItem tab ||
             tab.Tag is not TableTabContext context ||
-            (!context.Page.HasMore &&
+            context.PendingRowDisplay is not null ||
+            context.Display.RowDisplay.IsAllRows ||
+            (!context.Display.HasMore &&
              context.CountState.Status != TableRowCountStatus.Available))
         {
             return;
@@ -2110,17 +2263,17 @@ public sealed partial class MainWindow : Window, IDisposable
 
         if (context.CountState.Status == TableRowCountStatus.Available &&
             context.CountState.Value.HasValue &&
-            context.Page.Request.Offset + context.Page.Rows.Count >= context.CountState.Value.Value)
+            context.Display.Offset + context.Display.Rows.Count >= context.CountState.Value.Value)
         {
             return;
         }
 
-        long offset = context.Page.Request.Offset + context.Page.Rows.Count;
+        long offset = context.Display.Offset + context.Display.Rows.Count;
         await LoadTableQueryAsync(
             context,
             context.SearchText,
             context.Filter,
-            context.Page.Request.Limit,
+            context.Display.RowDisplay,
             offset);
     }
 
@@ -2149,11 +2302,19 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
+        if (!ReferenceEquals(TableTabs.SelectedItem, tab) ||
+            tab.Tag is not TableTabContext currentContext)
+        {
+            return;
+        }
+
+        context = currentContext;
+
         await LoadTableQueryAsync(
             context,
             context.SearchText,
             outcome.Filter,
-            context.Page.Request.Limit,
+            GetRequestedRowDisplay(context),
             filterDefinition: outcome.Definition);
     }
 
@@ -2630,11 +2791,19 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
+        if (!ReferenceEquals(TableTabs.SelectedItem, tab) ||
+            tab.Tag is not TableTabContext currentContext)
+        {
+            return;
+        }
+
+        context = currentContext;
+
         await LoadTableQueryAsync(
             context,
             context.SearchText,
             context.Filter,
-            context.Page.Request.Limit,
+            GetRequestedRowDisplay(context),
             offset: 0,
             sorts);
     }
@@ -2896,16 +3065,17 @@ public sealed partial class MainWindow : Window, IDisposable
             removeButton);
     }
 
-    private async Task LoadTableQueryAsync(
+    private async Task<TableQueryOutcome> LoadTableQueryAsync(
         TableTabContext context,
         string searchText,
         FilterExpression? filter,
-        int pageSize,
+        TableRowDisplayChoice rowDisplay,
         long offset = 0,
         IReadOnlyList<SortDescriptor>? sorts = null,
         TableFilterDefinition? filterDefinition = null)
     {
         TableLoadRequest request = BeginQuery(context.Schema.Name, showLoadingSurface: true);
+        TableQueryOutcome outcome;
         try
         {
             await OpenTableAsync(
@@ -2913,17 +3083,20 @@ public sealed partial class MainWindow : Window, IDisposable
                 searchText,
                 request.Token,
                 filter,
-                pageSize,
+                rowDisplay,
                 offset,
                 sorts ?? context.Sorts,
                 filterDefinition ?? context.FilterDefinition,
                 loadRequest: request);
+            request.Lease.ThrowIfSuperseded(request.Token);
+            outcome = TableQueryOutcome.Succeeded;
         }
         catch (OperationCanceledException) when (
             request.Token.IsCancellationRequested || !request.Lease.IsCurrent)
         {
             // A newer table query replaced this request.
             RestorePreviousTable(request, "Table query cancelled.");
+            outcome = TableQueryOutcome.Cancelled;
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
@@ -2934,11 +3107,13 @@ public sealed partial class MainWindow : Window, IDisposable
                     "Could not update the table query",
                     SafeFailureMessage(exception, "The working database was not changed."));
             }
+            outcome = TableQueryOutcome.Failed;
         }
         finally
         {
             EndQuery(request);
         }
+        return outcome;
     }
 
     private static bool TryParseFilterValue(
@@ -3049,8 +3224,8 @@ public sealed partial class MainWindow : Window, IDisposable
                     context,
                     context.SearchText,
                     context.Filter,
-                    context.Page.Request.Limit,
-                    context.Page.Request.Offset,
+                    GetRequestedRowDisplay(context),
+                    GetRequestedOffset(context),
                     context.Sorts,
                     context.FilterDefinition);
             }
@@ -3489,8 +3664,8 @@ public sealed partial class MainWindow : Window, IDisposable
         var pageSizePicker = new ComboBox
         {
             Header = "Rows per page",
-            ItemsSource = new[] { 100, 250 },
-            SelectedItem = _preferences.PageSize is 250 ? 250 : 100,
+            ItemsSource = TableRowDisplayOptions.FinitePageSizes,
+            SelectedItem = _preferences.PageSize,
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
         var foreignKeyPicker = new ComboBox
@@ -3598,36 +3773,88 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
-        var updatedPreferences = new EditorPreferences(
-            (EditorApplicationTheme)themePicker.SelectedItem,
-            (GridDensity)densityPicker.SelectedItem,
-            (int)pageSizePicker.SelectedItem,
-            (ForeignKeyDisplayMode)foreignKeyPicker.SelectedItem,
-            recentFiles.ItemsSource is IEnumerable<string> currentRecentFiles
-                ? currentRecentFiles
-                : []);
-        bool foreignKeyModeChanged =
-            updatedPreferences.ForeignKeyDisplayMode != _preferences.ForeignKeyDisplayMode;
-        await _settingsStore.SavePreferencesAsync(updatedPreferences, _lifetimeCancellation.Token);
-        _preferences = updatedPreferences;
-        ApplyPreferences();
-        if (foreignKeyModeChanged)
+        if (!TryBeginOperation("Save preferences", out CancellationToken cancellationToken))
         {
-            InvalidateOpenTableQueriesForForeignKeyMode();
+            return;
         }
 
-        if (TableTabs.SelectedItem is TabViewItem selectedTab &&
-            selectedTab.Tag is TableTabContext context)
+        var tableRefreshPending = false;
+        try
         {
-            await LoadTableQueryAsync(
-                context,
-                context.SearchText,
-                context.Filter,
-                _preferences.PageSize,
-                offset: 0,
-                context.Sorts);
+            int previousPageSize = _preferences.PageSize;
+            var updatedPreferences = new EditorPreferences(
+                (EditorApplicationTheme)themePicker.SelectedItem,
+                (GridDensity)densityPicker.SelectedItem,
+                (int)pageSizePicker.SelectedItem,
+                (ForeignKeyDisplayMode)foreignKeyPicker.SelectedItem,
+                recentFiles.ItemsSource is IEnumerable<string> currentRecentFiles
+                    ? currentRecentFiles
+                    : []);
+            bool foreignKeyModeChanged =
+                updatedPreferences.ForeignKeyDisplayMode != _preferences.ForeignKeyDisplayMode;
+            bool pageSizeChanged = updatedPreferences.PageSize != previousPageSize;
+            await _settingsStore.SavePreferencesAsync(updatedPreferences, cancellationToken);
+            _preferences = updatedPreferences;
+            ApplyPreferences();
+            if (foreignKeyModeChanged)
+            {
+                InvalidateOpenTableQueriesForForeignKeyMode();
+            }
+
+            bool tableQueryChanged = pageSizeChanged || foreignKeyModeChanged;
+            TableQueryOutcome queryOutcome = TableQueryOutcome.Succeeded;
+            TableRowDisplayChoice? pendingRowDisplay = null;
+            TabViewItem? selectedTab = TableTabs.SelectedItem as TabViewItem;
+            if (tableQueryChanged &&
+                selectedTab?.Tag is TableTabContext context)
+            {
+                TableRowDisplayChoice rowDisplay = pageSizeChanged
+                    ? TableRowDisplayChoice.FromPageSize(_preferences.PageSize)
+                    : GetRequestedRowDisplay(context);
+                if (pageSizeChanged)
+                {
+                    pendingRowDisplay = rowDisplay;
+                }
+
+                queryOutcome = await LoadTableQueryAsync(
+                    context,
+                    context.SearchText,
+                    context.Filter,
+                    rowDisplay,
+                    offset: 0,
+                    context.Sorts);
+            }
+            if (queryOutcome != TableQueryOutcome.Succeeded)
+            {
+                tableRefreshPending = true;
+                if (selectedTab?.Tag is TableTabContext pendingContext)
+                {
+                    selectedTab.Tag = pendingContext with
+                    {
+                        PendingRowDisplay = pendingRowDisplay ?? pendingContext.PendingRowDisplay,
+                        IsInvalidated = true,
+                    };
+                }
+
+                ViewModel.Status = "Preferences saved; table refresh pending.";
+                if (queryOutcome == TableQueryOutcome.Cancelled)
+                {
+                    PresentWarning(
+                        "Preferences saved; table refresh cancelled",
+                        "The previous rows remain visible. Refresh the query or switch tabs to apply the new table preferences.");
+                }
+                return;
+            }
+            PresentSuccess("Preferences saved", "Theme, density, paging, and foreign-key display were updated.");
         }
-        PresentSuccess("Preferences saved", "Theme, density, paging, and foreign-key display were updated.");
+        finally
+        {
+            EndOperation();
+            if (tableRefreshPending && !_disposed)
+            {
+                ViewModel.Status = "Preferences saved; table refresh pending.";
+            }
+        }
     }
 
     private void InvalidateOpenTableQueriesForForeignKeyMode()
@@ -3643,7 +3870,9 @@ public sealed partial class MainWindow : Window, IDisposable
             context.Coordinator.Invalidate();
             tab.Tag = context with
             {
-                CountState = TableRowCountState.Unknown,
+                CountState = context.Display.RowDisplay.IsAllRows
+                    ? TableRowCountState.Available(context.Display.Rows.Count)
+                    : TableRowCountState.Unknown,
                 IsInvalidated = true,
             };
         }
@@ -5747,7 +5976,18 @@ public sealed partial class MainWindow : Window, IDisposable
             PresentSuccess("No changes needed", "The working database already matches the previewed maintenance state.");
         }
 
-        await RefreshSelectedTableAsync();
+        try
+        {
+            await RefreshSelectedTableAsync();
+        }
+        catch (OperationCanceledException) when (
+            _operationLease?.Token.IsCancellationRequested == true)
+        {
+            PresentCommittedRefreshCancellation(
+                result.AffectedRows > 0
+                    ? "The maintenance change completed in the working copy."
+                    : "The maintenance check completed without changing the working copy.");
+        }
     }
 
     private bool TryGetMaintenanceSession(out EditorSessionState session)
@@ -5861,7 +6101,7 @@ public sealed partial class MainWindow : Window, IDisposable
             SetTableGridPresented(isPresented: false);
             ShowEmptyState(
                 "Choose a table",
-                "Select a table or view from the list to load its first 100 rows.",
+                "Select a table or view from the list to load its rows.",
                 allowOpen: false);
             ViewModel.TableSummary = "No table selected";
         }
@@ -5982,7 +6222,9 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.DatabaseName = "No database open";
         ViewModel.Status = "Open a CDB file to begin.";
         ViewModel.TableSummary = "No table selected";
-        ViewModel.PageSizeLabel = "100 rows/page";
+        ViewModel.PageSizeLabel = TableRowDisplayChoice
+            .FromPageSize(_preferences.PageSize)
+            .StatusLabel;
         TableSearchBox.Text = string.Empty;
         TableTabs.TabItems.Clear();
         TableGrid.Clear();
@@ -6278,7 +6520,7 @@ public sealed partial class MainWindow : Window, IDisposable
             Selection = TableGrid.CaptureSelection(),
             Viewport = TableGrid.CaptureViewport(),
         };
-        _gridBindingSession.UpdateBoundViewState(tab, context.Page.Rows, viewState);
+        _gridBindingSession.UpdateBoundViewState(tab, context.Display.Rows, viewState);
     }
 
     private async Task PersistActiveTableStateAsync(CancellationToken cancellationToken)
@@ -6464,6 +6706,12 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private static string FormatCount(long count) => $"{count:N0} rows";
 
+    private static TableRowDisplayChoice GetRequestedRowDisplay(TableTabContext context) =>
+        context.PendingRowDisplay ?? context.Display.RowDisplay;
+
+    private static long GetRequestedOffset(TableTabContext context) =>
+        context.PendingRowDisplay is null ? context.Display.Offset : 0;
+
     private async Task RefreshSelectedTableAsync()
     {
         if (TableTabs.SelectedItem is not TabViewItem tab ||
@@ -6472,13 +6720,23 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
+        CancellationToken cancellationToken = _operationLease?.Token ??
+            _lifetimeCancellation.Token;
+        TableRowDisplayChoice rowDisplay = GetRequestedRowDisplay(context);
+        if (rowDisplay.IsAllRows && _operationLease is not null)
+        {
+            ViewModel.Status = $"Reloading all rows for {context.Schema.Name}…";
+            CancelOperationButton.Visibility = Visibility.Visible;
+            CancelOperationButton.IsEnabled = true;
+        }
+
         await OpenTableAsync(
             context.Schema.Name,
             context.SearchText,
-            _lifetimeCancellation.Token,
+            cancellationToken,
             context.Filter,
-            context.Page.Request.Limit,
-            context.Page.Request.Offset,
+            rowDisplay,
+            GetRequestedOffset(context),
             context.Sorts,
             context.FilterDefinition);
     }
@@ -6648,9 +6906,23 @@ public sealed partial class MainWindow : Window, IDisposable
         public CancellationToken Token { get; } = Cancellation.Token;
     }
 
+    private sealed record TableDisplayWindow(
+        TableRowDisplayChoice RowDisplay,
+        long Offset,
+        IReadOnlyList<TypedRow> Rows,
+        bool HasMore);
+
+    private enum TableQueryOutcome
+    {
+        Succeeded,
+        Cancelled,
+        Failed,
+    }
+
     private sealed record TableTabContext(
         TableSchema Schema,
-        TablePage Page,
+        TableDisplayWindow Display,
+        TableRowDisplayChoice? PendingRowDisplay,
         string SearchText,
         FilterExpression? Filter,
         TableFilterDefinition FilterDefinition,

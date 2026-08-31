@@ -60,6 +60,16 @@ public sealed class PerformancePagingTests
             .ConfigureAwait(false);
         Assert.HasCount(VirtualTableQueryCoordinator.ChunkSize, recovered.Items);
         Assert.AreEqual(1L, recovered.Items[0].Values["IDrow"].IntegerValue);
+
+        using var allRowsCancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(10));
+        var allRowsStopwatch = Stopwatch.StartNew();
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            coordinator.LoadAllRowsAsync(allRowsCancellation.Token)).ConfigureAwait(false);
+        allRowsStopwatch.Stop();
+        Assert.IsLessThan(TimeSpan.FromSeconds(10), allRowsStopwatch.Elapsed);
+        Assert.IsLessThanOrEqualTo(
+            BoundedVirtualWindow<TypedRow>.MaximumChunks * VirtualTableQueryCoordinator.ChunkSize,
+            coordinator.ActiveRows.Count);
     }
 
     private static async Task<SqliteTestDatabase> CreatePerformanceFixtureAsync()

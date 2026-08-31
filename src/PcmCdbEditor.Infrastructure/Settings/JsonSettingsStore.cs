@@ -25,10 +25,11 @@ public sealed class JsonSettingsStore : ISettingsStore
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(preferences);
-        var document = await LoadAsync(cancellationToken).ConfigureAwait(false);
-        await AtomicJsonFile.WriteAsync(
+        var preferencesDocument = PreferencesDocument.From(Normalize(preferences));
+        await AtomicJsonFile.UpdateAsync(
                 _settingsPath,
-                document with { Preferences = PreferencesDocument.From(Normalize(preferences)) },
+                CreateDefaultDocument,
+                document => NormalizeDocument(document) with { Preferences = preferencesDocument },
                 cancellationToken)
             .ConfigureAwait(false);
     }
@@ -47,16 +48,20 @@ public sealed class JsonSettingsStore : ISettingsStore
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(state);
-        var document = await LoadAsync(cancellationToken).ConfigureAwait(false);
-        var states = new Dictionary<string, TableViewStateDocument>(
-            document.TableViewStates,
-            StringComparer.OrdinalIgnoreCase)
-        {
-            [BuildKey(state.SchemaSignature, state.TableName)] = TableViewStateDocument.From(state)
-        };
-        await AtomicJsonFile.WriteAsync(
+        await AtomicJsonFile.UpdateAsync(
                 _settingsPath,
-                document with { TableViewStates = states },
+                CreateDefaultDocument,
+                document =>
+                {
+                    document = NormalizeDocument(document);
+                    var states = new Dictionary<string, TableViewStateDocument>(
+                        document.TableViewStates,
+                        StringComparer.OrdinalIgnoreCase)
+                    {
+                        [BuildKey(state.SchemaSignature, state.TableName)] = TableViewStateDocument.From(state)
+                    };
+                    return document with { TableViewStates = states };
+                },
                 cancellationToken)
             .ConfigureAwait(false);
     }
@@ -66,6 +71,11 @@ public sealed class JsonSettingsStore : ISettingsStore
         var document = await AtomicJsonFile
             .ReadOrCreateAsync(_settingsPath, CreateDefaultDocument, cancellationToken)
             .ConfigureAwait(false);
+        return NormalizeDocument(document);
+    }
+
+    private static SettingsDocument NormalizeDocument(SettingsDocument document)
+    {
         return document with
         {
             TableViewStates = new Dictionary<string, TableViewStateDocument>(
@@ -94,7 +104,7 @@ public sealed class JsonSettingsStore : ISettingsStore
         var displayMode = Enum.IsDefined(preferences.ForeignKeyDisplayMode)
             ? preferences.ForeignKeyDisplayMode
             : ForeignKeyDisplayMode.RawAndName;
-        var pageSize = preferences.PageSize is 100 or 250 ? preferences.PageSize : 100;
+        var pageSize = preferences.PageSize is 100 or 250 or 500 ? preferences.PageSize : 100;
         var recentFiles = preferences.RecentFiles
             .Where(static path => !string.IsNullOrWhiteSpace(path))
             .Distinct(StringComparer.OrdinalIgnoreCase)

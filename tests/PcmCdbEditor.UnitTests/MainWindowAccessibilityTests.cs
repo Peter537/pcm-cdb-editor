@@ -6,6 +6,9 @@ namespace PcmCdbEditor.UnitTests;
 [TestClass]
 public sealed class MainWindowAccessibilityTests
 {
+    private static readonly string[] ExpectedTableRowDisplayLabels =
+        ["100 rows", "250 rows", "500 rows", "All rows"];
+
     private static readonly IReadOnlyDictionary<string, string> CriticalAutomationIds =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -448,6 +451,323 @@ public sealed class MainWindowAccessibilityTests
             resetToNoFile,
             "WorkingCopyStatus.Visibility = Visibility.Collapsed;",
             StringComparison.Ordinal);
+    }
+
+    [TestMethod]
+    public void TableRowDisplayOptionsAreOrderedAndDescribeTheUnboundedChoice()
+    {
+        const string helpText =
+            "Choose 100, 250, or 500 rows per page, or load all matching rows for the current table. " +
+            "Loading all rows may require substantial time and memory.";
+        XDocument document = XDocument.Load(GetMainWindowXamlPath());
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        XElement pageSizeBox = document
+            .Descendants()
+            .Single(element => (string?)element.Attribute(xaml + "Name") == "PageSizeBox");
+        string[] optionLabels = pageSizeBox
+            .Elements()
+            .Where(static element => element.Name.LocalName == "ComboBoxItem")
+            .Select(static element => (string?)element.Attribute("Content"))
+            .OfType<string>()
+            .ToArray();
+
+        CollectionAssert.AreEqual(
+            ExpectedTableRowDisplayLabels,
+            optionLabels);
+        Assert.AreEqual("TablePageSize", (string?)pageSizeBox.Attribute("AutomationProperties.AutomationId"));
+        Assert.AreEqual("Rows to show", (string?)pageSizeBox.Attribute("AutomationProperties.Name"));
+        Assert.AreEqual(helpText, (string?)pageSizeBox.Attribute("AutomationProperties.HelpText"));
+
+        string source = File.ReadAllText(GetMainWindowCodePath());
+        string updateChrome = GetMethodSource(source, "private void UpdateTabChrome(");
+        string selectionChanged = GetMethodSource(
+            source,
+            "private async void PageSizeBox_SelectionChanged(");
+        string settings = GetMethodSource(source, "private async Task ShowSettingsAsync()");
+
+        StringAssert.Contains(
+            updateChrome,
+            "TableRowDisplayOptions.GetToolbarIndex(context.Display.RowDisplay)",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            selectionChanged,
+            "TableRowDisplayOptions.FromToolbarIndex(",
+            StringComparison.Ordinal);
+        Assert.IsFalse(
+            selectionChanged.Contains("SelectedIndex ==", StringComparison.Ordinal),
+            "Page-size values must come from the canonical option map rather than fragile item positions.");
+        StringAssert.Contains(
+            settings,
+            "ItemsSource = TableRowDisplayOptions.FinitePageSizes",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            settings,
+            "SelectedItem = _preferences.PageSize",
+            StringComparison.Ordinal);
+        Assert.IsFalse(
+            settings.Contains("ToolbarChoices", StringComparison.Ordinal),
+            "The session-only All rows choice must not be offered as a persisted setting.");
+    }
+
+    [TestMethod]
+    public void AllRowsRemainsAnExplicitTabOnlyDisplayMode()
+    {
+        string source = File.ReadAllText(GetMainWindowCodePath());
+        string normalizedSource = source.ReplaceLineEndings("\n");
+        string activateSession = GetMethodSource(source, "private async Task ActivateSessionAsync(");
+        string loadSelectedTable = GetMethodSource(source, "private async Task LoadSelectedTableAsync(");
+        string openTable = GetMethodSource(source, "private async Task OpenTableAsync(");
+        string ensureTabBound = GetMethodSource(source, "private void EnsureTabBound(");
+        string updatePaging = GetMethodSource(source, "private void UpdateCountAndPagingChrome(");
+        string previousPage = GetMethodSource(source, "private async void PreviousPage_Click(");
+        string nextPage = GetMethodSource(source, "private async void NextPage_Click(");
+        string refreshSelectedTable = GetMethodSource(
+            source,
+            "private async Task RefreshSelectedTableAsync()");
+        string tabSelectionChanged = GetMethodSource(
+            source,
+            "private async void TableTabs_SelectionChanged(");
+        string invalidateTableCaches = GetMethodSource(
+            source,
+            "private void InvalidateTableCaches()");
+        string invalidateForeignKeyQueries = GetMethodSource(
+            source,
+            "private void InvalidateOpenTableQueriesForForeignKeyMode()");
+        string selectionChanged = GetMethodSource(
+            source,
+            "private async void PageSizeBox_SelectionChanged(");
+        string searchChanged = GetMethodSource(
+            source,
+            "private async void CurrentTableSearchBox_TextChanged(");
+        string filtersClick = GetMethodSource(source, "private async void Filters_Click(");
+        string sortClick = GetMethodSource(source, "private async void Sort_Click(");
+        string settings = GetMethodSource(source, "private async Task ShowSettingsAsync()");
+
+        const string persistedFiniteChoice =
+            "TableRowDisplayChoice.FromPageSize(_preferences.PageSize)";
+        StringAssert.Contains(activateSession, persistedFiniteChoice, StringComparison.Ordinal);
+        StringAssert.Contains(loadSelectedTable, persistedFiniteChoice, StringComparison.Ordinal);
+
+        StringAssert.Contains(
+            normalizedSource,
+            "private sealed record TableDisplayWindow(\n        TableRowDisplayChoice RowDisplay,",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            normalizedSource,
+            "private sealed record TableTabContext(\n        TableSchema Schema,\n        TableDisplayWindow Display,",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            normalizedSource,
+            "TableDisplayWindow Display,\n        TableRowDisplayChoice? PendingRowDisplay,",
+            StringComparison.Ordinal);
+
+        StringAssert.Contains(openTable, "if (effectiveRowDisplay.IsAllRows)", StringComparison.Ordinal);
+        StringAssert.Contains(openTable, "offset = 0;", StringComparison.Ordinal);
+        StringAssert.Contains(openTable, "coordinator.LoadAllRowsAsync(cancellationToken)", StringComparison.Ordinal);
+        StringAssert.Contains(openTable, "Offset: 0", StringComparison.Ordinal);
+        StringAssert.Contains(openTable, "HasMore: false", StringComparison.Ordinal);
+        StringAssert.Contains(
+            openTable,
+            "countState = TableRowCountState.Available(rows.Count);",
+            StringComparison.Ordinal);
+        StringAssert.Contains(openTable, "PendingRowDisplay: null", StringComparison.Ordinal);
+        StringAssert.Contains(
+            ensureTabBound,
+            "!context.Display.RowDisplay.IsAllRows",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            ensureTabBound,
+            "context.CountState.Status != TableRowCountStatus.Available",
+            StringComparison.Ordinal);
+        StringAssert.Contains(ensureTabBound, "StartVirtualCount(tab, context);", StringComparison.Ordinal);
+        StringAssert.Contains(
+            invalidateTableCaches,
+            "TableRowCountState.Available(context.Display.Rows.Count)",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            invalidateTableCaches,
+            "context.Display.RowDisplay.IsAllRows",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            invalidateForeignKeyQueries,
+            "TableRowCountState.Available(context.Display.Rows.Count)",
+            StringComparison.Ordinal);
+
+        StringAssert.Contains(
+            updatePaging,
+            "context.PendingRowDisplay is null",
+            StringComparison.Ordinal);
+        StringAssert.Contains(updatePaging, "!context.Display.RowDisplay.IsAllRows", StringComparison.Ordinal);
+        StringAssert.Contains(
+            updatePaging,
+            "PreviousPageButton.IsEnabled = canNavigatePages",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            updatePaging,
+            "NextPageButton.IsEnabled = canNavigatePages",
+            StringComparison.Ordinal);
+        StringAssert.Contains(previousPage, "context.Display.RowDisplay.IsAllRows", StringComparison.Ordinal);
+        StringAssert.Contains(nextPage, "context.Display.RowDisplay.IsAllRows", StringComparison.Ordinal);
+        StringAssert.Contains(previousPage, "context.PendingRowDisplay is not null", StringComparison.Ordinal);
+        StringAssert.Contains(nextPage, "context.PendingRowDisplay is not null", StringComparison.Ordinal);
+        StringAssert.Contains(
+            refreshSelectedTable,
+            "_operationLease?.Token ??",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            refreshSelectedTable,
+            "TableRowDisplayChoice rowDisplay = GetRequestedRowDisplay(context);",
+            StringComparison.Ordinal);
+        StringAssert.Contains(refreshSelectedTable, "GetRequestedOffset(context)", StringComparison.Ordinal);
+        StringAssert.Contains(tabSelectionChanged, "GetRequestedRowDisplay(context)", StringComparison.Ordinal);
+        StringAssert.Contains(tabSelectionChanged, "GetRequestedOffset(context)", StringComparison.Ordinal);
+
+        StringAssert.Contains(selectionChanged, "if (!rowDisplay.IsAllRows)", StringComparison.Ordinal);
+        int publishIntentIndex = selectionChanged.IndexOf("tab.Tag = context;", StringComparison.Ordinal);
+        int preferenceSaveIndex = selectionChanged.IndexOf(
+            "await _pageSizePreferenceSaveGate.WaitAsync",
+            StringComparison.Ordinal);
+        int queryIndex = selectionChanged.IndexOf(
+            "TableQueryOutcome queryOutcome = await LoadTableQueryAsync(",
+            StringComparison.Ordinal);
+        Assert.IsTrue(
+            publishIntentIndex >= 0 &&
+            preferenceSaveIndex > publishIntentIndex &&
+            queryIndex > publishIntentIndex,
+            "The tab must publish its requested row display before saving or dispatching a query.");
+        StringAssert.Contains(
+            selectionChanged,
+            "await _pageSizePreferenceSaveGate.WaitAsync(_lifetimeCancellation.Token);",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            selectionChanged,
+            "preferencesToSave,",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            selectionChanged,
+            "!ReferenceEquals(TableTabs.SelectedItem, tab)",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            selectionChanged,
+            "!ReferenceEquals(currentContext.Display, context.Display)",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            selectionChanged,
+            "!ReferenceEquals(currentContext.Coordinator, context.Coordinator)",
+            StringComparison.Ordinal);
+        StringAssert.Contains(selectionChanged, "_operationLease is not null", StringComparison.Ordinal);
+        StringAssert.Contains(selectionChanged, "_activeTableLoad is not null", StringComparison.Ordinal);
+        StringAssert.Contains(
+            selectionChanged,
+            "PageSizeBox.SelectedIndex != TableRowDisplayOptions.GetToolbarIndex(rowDisplay)",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            selectionChanged,
+            "TableQueryOutcome queryOutcome = await LoadTableQueryAsync(",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            selectionChanged,
+            "PendingRowDisplay = rowDisplay",
+            StringComparison.Ordinal);
+        StringAssert.Contains(selectionChanged, "IsInvalidated = true", StringComparison.Ordinal);
+        StringAssert.Contains(
+            searchChanged,
+            "tab.Tag is not TableTabContext currentContext",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            searchChanged,
+            "!ReferenceEquals(TableTabs.SelectedItem, tab)",
+            StringComparison.Ordinal);
+        int searchDelayIndex = searchChanged.IndexOf(
+            "await Task.Delay(SearchDelayMilliseconds",
+            StringComparison.Ordinal);
+        int searchResolveIndex = searchChanged.IndexOf(
+            "context = currentContext;",
+            StringComparison.Ordinal);
+        int searchDispatchIndex = searchChanged.IndexOf(
+            "await OpenTableAsync(",
+            StringComparison.Ordinal);
+        Assert.IsTrue(
+            searchDelayIndex >= 0 &&
+            searchResolveIndex > searchDelayIndex &&
+            searchDispatchIndex > searchResolveIndex,
+            "A debounced search must resolve the latest row-display intent before dispatch.");
+        AssertLatestDialogContextIsResolvedBeforeQuery(
+            filtersClick,
+            "TableFilterDialogOutcome? outcome = await ShowTableFilterDialogAsync(");
+        AssertLatestDialogContextIsResolvedBeforeQuery(
+            sortClick,
+            "IReadOnlyList<SortDescriptor>? sorts = await ShowTableSortDialogAsync(");
+        StringAssert.Contains(settings, "TableRowDisplayChoice rowDisplay = pageSizeChanged", StringComparison.Ordinal);
+        StringAssert.Contains(settings, "TableRowDisplayChoice? pendingRowDisplay = null;", StringComparison.Ordinal);
+        StringAssert.Contains(settings, "pendingRowDisplay = rowDisplay;", StringComparison.Ordinal);
+        StringAssert.Contains(
+            settings,
+            "bool tableQueryChanged = pageSizeChanged || foreignKeyModeChanged;",
+            StringComparison.Ordinal);
+        StringAssert.Contains(settings, "if (tableQueryChanged &&", StringComparison.Ordinal);
+        StringAssert.Contains(
+            settings,
+            "TryBeginOperation(\"Save preferences\", out CancellationToken cancellationToken)",
+            StringComparison.Ordinal);
+        StringAssert.Contains(settings, "SavePreferencesAsync(updatedPreferences, cancellationToken)", StringComparison.Ordinal);
+        StringAssert.Contains(
+            settings,
+            "queryOutcome = await LoadTableQueryAsync(",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            settings,
+            "queryOutcome != TableQueryOutcome.Succeeded",
+            StringComparison.Ordinal);
+        StringAssert.Contains(settings, "IsInvalidated = true", StringComparison.Ordinal);
+        StringAssert.Contains(
+            settings,
+            "PendingRowDisplay = pendingRowDisplay ?? pendingContext.PendingRowDisplay",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            settings,
+            "Preferences saved; table refresh cancelled",
+            StringComparison.Ordinal);
+        StringAssert.Contains(settings, "finally", StringComparison.Ordinal);
+        StringAssert.Contains(settings, "EndOperation();", StringComparison.Ordinal);
+        StringAssert.Contains(settings, "if (tableRefreshPending && !_disposed)", StringComparison.Ordinal);
+        StringAssert.Contains(settings, persistedFiniteChoice, StringComparison.Ordinal);
+        StringAssert.Contains(settings, ": GetRequestedRowDisplay(context);", StringComparison.Ordinal);
+        StringAssert.Contains(
+            normalizedSource,
+            "context.PendingRowDisplay ?? context.Display.RowDisplay",
+            StringComparison.Ordinal);
+        StringAssert.Contains(
+            normalizedSource,
+            "context.PendingRowDisplay is null ? context.Display.Offset : 0",
+            StringComparison.Ordinal);
+        Assert.IsFalse(
+            settings.Contains("TableRowDisplayChoice.AllRows", StringComparison.Ordinal) ||
+            settings.Contains("ToolbarChoices", StringComparison.Ordinal),
+            "Settings must never offer or persist the tab-only All rows choice.");
+    }
+
+    private static void AssertLatestDialogContextIsResolvedBeforeQuery(
+        string methodSource,
+        string dialogAwait)
+    {
+        int dialogIndex = methodSource.IndexOf(dialogAwait, StringComparison.Ordinal);
+        int guardIndex = methodSource.IndexOf(
+            "!ReferenceEquals(TableTabs.SelectedItem, tab)",
+            StringComparison.Ordinal);
+        int tagIndex = methodSource.IndexOf(
+            "tab.Tag is not TableTabContext currentContext",
+            StringComparison.Ordinal);
+        int resolveIndex = methodSource.IndexOf("context = currentContext;", StringComparison.Ordinal);
+        int queryIndex = methodSource.IndexOf("await LoadTableQueryAsync(", StringComparison.Ordinal);
+
+        Assert.IsTrue(
+            dialogIndex >= 0 &&
+            guardIndex > dialogIndex &&
+            tagIndex > dialogIndex &&
+            resolveIndex > Math.Max(guardIndex, tagIndex) &&
+            queryIndex > resolveIndex,
+            "A dialog query must resolve the selected tab's latest row-display intent after the dialog and before dispatch.");
     }
 
     private static string GetMainWindowXamlPath()

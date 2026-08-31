@@ -104,7 +104,7 @@ public sealed class NavigationSelectionSourceTests
     {
         string source = File.ReadAllText(GetMainWindowCodePath());
         int reloadStart = source.IndexOf(
-            "private async Task LoadTableQueryAsync(",
+            "private async Task<TableQueryOutcome> LoadTableQueryAsync(",
             StringComparison.Ordinal);
         int parseFilterStart = source.IndexOf(
             "private static bool TryParseFilterValue(",

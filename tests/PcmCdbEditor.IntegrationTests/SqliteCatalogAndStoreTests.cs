@@ -92,17 +92,28 @@ public sealed class SqliteCatalogAndStoreTests
             database.Path, catalog, "DYN_rider", filter, CancellationToken.None).ConfigureAwait(false));
 
         var search = new GlobalSearchRequest("100%_", ["gene_sz_name", "payload"]);
+        var rawQuery = new TableQuery(
+            "DYN_rider",
+            new PageRequest(0, 1),
+            search: search,
+            foreignKeyDisplayMode: ForeignKeyDisplayMode.RawValue);
         var raw = await store.QueryAsync(
             database.Path,
             catalog,
-            new TableQuery("DYN_rider", new PageRequest(0, 1), search: search,
-                foreignKeyDisplayMode: ForeignKeyDisplayMode.RawValue),
+            rawQuery,
             CancellationToken.None).ConfigureAwait(false);
         Assert.AreEqual(1, raw.Rows.Count);
         Assert.AreEqual(1L, raw.TotalRows);
         Assert.IsFalse(raw.Rows[0].Values.ContainsKey("fkIDcountry__display"));
         Assert.AreEqual(SqliteValueKind.Blob, raw.Rows[0].Values["payload"].Kind);
         Assert.AreEqual(SqliteValueKind.Null, raw.Rows[0].Values["optional"].Kind);
+        IReadOnlyList<TypedRow> allRaw = await store.QueryAllRowsAsync(
+            database.Path,
+            catalog,
+            rawQuery.Definition,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.HasCount(1, allRaw);
+        Assert.IsFalse(allRaw[0].Values.ContainsKey("fkIDcountry__display"));
         await database.ExecuteAsync("UPDATE DYN_rider SET gene_sz_name='back\\slash' WHERE IDrider=3")
             .ConfigureAwait(false);
         var slashSearch = await store.QueryAsync(
@@ -113,24 +124,45 @@ public sealed class SqliteCatalogAndStoreTests
             CancellationToken.None).ConfigureAwait(false);
         Assert.AreEqual(1L, slashSearch.TotalRows);
 
+        var resolvedQuery = new TableQuery(
+            "DYN_rider",
+            new PageRequest(0, 3),
+            [new SortDescriptor("fkIDcountry__display", SortDirection.Ascending)],
+            foreignKeyDisplayMode: ForeignKeyDisplayMode.ResolvedName);
         var resolved = await store.QueryAsync(
             database.Path,
             catalog,
-            new TableQuery("DYN_rider", new PageRequest(0, 3),
-                [new SortDescriptor("fkIDcountry__display", SortDirection.Ascending)],
-                foreignKeyDisplayMode: ForeignKeyDisplayMode.ResolvedName),
+            resolvedQuery,
             CancellationToken.None).ConfigureAwait(false);
         CollectionAssert.AreEqual(
             ResolvedCountryOrder,
             resolved.Rows.Select(row => row.Values["fkIDcountry__display"].TextValue).ToArray());
+        IReadOnlyList<TypedRow> allResolved = await store.QueryAllRowsAsync(
+            database.Path,
+            catalog,
+            resolvedQuery.Definition,
+            CancellationToken.None).ConfigureAwait(false);
+        CollectionAssert.AreEqual(
+            ResolvedCountryOrder,
+            allResolved.Select(row => row.Values["fkIDcountry__display"].TextValue).ToArray());
+        var rawAndNameQuery = new TableQuery(
+            "DYN_rider",
+            new PageRequest(0, 3),
+            foreignKeyDisplayMode: ForeignKeyDisplayMode.RawAndName);
         var rawAndName = await store.QueryAsync(
             database.Path,
             catalog,
-            new TableQuery("DYN_rider", new PageRequest(0, 3),
-                foreignKeyDisplayMode: ForeignKeyDisplayMode.RawAndName),
+            rawAndNameQuery,
             CancellationToken.None).ConfigureAwait(false);
         Assert.AreEqual("1 | Denmark", rawAndName.Rows[0].Values["fkIDcountry__display"].TextValue);
         Assert.AreEqual("999", rawAndName.Rows[1].Values["fkIDcountry__display"].TextValue);
+        IReadOnlyList<TypedRow> allRawAndName = await store.QueryAllRowsAsync(
+            database.Path,
+            catalog,
+            rawAndNameQuery.Definition,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual("1 | Denmark", allRawAndName[0].Values["fkIDcountry__display"].TextValue);
+        Assert.AreEqual("999", allRawAndName[1].Values["fkIDcountry__display"].TextValue);
     }
 
     [TestMethod]
@@ -201,6 +233,108 @@ SELECT value, 0, 'row-' || value FROM sequence;")
             new TableQuery("DYN_item", new PageRequest(0, 10)),
             CancellationToken.None).ConfigureAwait(false);
         Assert.HasCount(10, recovered.Rows);
+    }
+
+    [TestMethod]
+    public async Task AllRowsUseOnePageIndependentQueryBeyondTheBoundedPageLimit()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE DYN_item(IDitem INTEGER PRIMARY KEY, label TEXT)")
+            .ConfigureAwait(false);
+        await database.ExecuteAsync(@"
+WITH RECURSIVE sequence(value) AS (
+  VALUES(1)
+  UNION ALL
+  SELECT value + 1 FROM sequence WHERE value < 10025
+)
+INSERT INTO DYN_item(IDitem, label)
+SELECT value, 'row-' || value FROM sequence;")
+            .ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        var definition = new TableQueryDefinition(
+            "DYN_item",
+            [new SortDescriptor("IDitem", SortDirection.Descending)],
+            new FilterCondition("IDitem", FilterOperator.GreaterThanOrEqual, SqliteValue.Integer(1)),
+            new GlobalSearchRequest("row-", ["label"]),
+            ForeignKeyDisplayMode.RawValue);
+        var commands = new List<SqliteTableDataStore.CommandKind>();
+        var store = new SqliteTableDataStore(commands.Add);
+        string commandText = SqliteTableDataStore.BuildAllRowsCommandTextForDiagnostics(
+            catalog,
+            definition);
+
+        IReadOnlyList<TypedRow> rows = await store.QueryAllRowsAsync(
+            database.Path,
+            catalog,
+            definition,
+            CancellationToken.None).ConfigureAwait(false);
+
+        Assert.HasCount(10_025, rows);
+        Assert.AreEqual(10_025L, rows[0].Values["IDitem"].IntegerValue);
+        Assert.AreEqual(1L, rows[^1].Values["IDitem"].IntegerValue);
+        Assert.IsFalse(commandText.Contains(" LIMIT ", StringComparison.OrdinalIgnoreCase));
+        Assert.IsFalse(commandText.Contains("$offset", StringComparison.Ordinal));
+        CollectionAssert.AreEqual(
+            new[] { SqliteTableDataStore.CommandKind.Page },
+            commands.ToArray());
+
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => store.QueryAllRowsAsync(
+            database.Path,
+            catalog,
+            definition,
+            cancelled.Token)).ConfigureAwait(false);
+    }
+
+    [TestMethod]
+    [DataRow(0)]
+    [DataRow(499)]
+    [DataRow(500)]
+    [DataRow(501)]
+    [DataRow(1_201)]
+    public async Task AllRowsReturnExactCountsAcrossBoundariesForReadOnlyViews(int rowCount)
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE DYN_item(IDitem INTEGER PRIMARY KEY, label TEXT)",
+            "CREATE VIEW item_view AS SELECT IDitem, label FROM DYN_item")
+            .ConfigureAwait(false);
+        if (rowCount > 0)
+        {
+            await database.ExecuteAsync($@"
+WITH RECURSIVE sequence(value) AS (
+  VALUES(1)
+  UNION ALL
+  SELECT value + 1 FROM sequence WHERE value < {rowCount}
+)
+INSERT INTO DYN_item(IDitem, label)
+SELECT value, 'row-' || value FROM sequence;")
+                .ConfigureAwait(false);
+        }
+
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        var definition = new TableQueryDefinition(
+            "item_view",
+            [new SortDescriptor("IDitem", SortDirection.Ascending)],
+            new FilterCondition("IDitem", FilterOperator.GreaterThanOrEqual, SqliteValue.Integer(1)),
+            search: null,
+            foreignKeyDisplayMode: ForeignKeyDisplayMode.RawValue);
+
+        IReadOnlyList<TypedRow> rows = await new SqliteTableDataStore().QueryAllRowsAsync(
+            database.Path,
+            catalog,
+            definition,
+            CancellationToken.None).ConfigureAwait(false);
+
+        Assert.HasCount(rowCount, rows);
+        Assert.IsTrue(rows.All(static row => row.Identity is null));
+        if (rowCount > 0)
+        {
+            Assert.AreEqual(1L, rows[0].Values["IDitem"].IntegerValue);
+            Assert.AreEqual((long)rowCount, rows[^1].Values["IDitem"].IntegerValue);
+        }
     }
 
     [TestMethod]

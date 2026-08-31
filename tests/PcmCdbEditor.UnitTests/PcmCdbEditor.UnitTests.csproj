@@ -10,6 +10,8 @@
   <ItemGroup>
     <Compile Include="..\..\src\PcmCdbEditor.App\TabCloseSelectionReconciler.cs"
              Link="App\TabCloseSelectionReconciler.cs" />
+    <Compile Include="..\..\src\PcmCdbEditor.App\TableRowDisplayOptions.cs"
+             Link="App\TableRowDisplayOptions.cs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />

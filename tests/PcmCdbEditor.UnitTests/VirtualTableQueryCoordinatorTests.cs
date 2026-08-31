@@ -163,6 +163,141 @@ public sealed class VirtualTableQueryCoordinatorTests
     }
 
     [TestMethod]
+    public async Task AllRowsUseThePageIndependentDefinitionWithoutGrowingTheBoundedWindow()
+    {
+        var store = new RecordingTableDataStore { AllRowsResultCount = 750 };
+        var query = new TableQuery(
+            "items",
+            new PageRequest(73, 12),
+            [new SortDescriptor("ID", SortDirection.Descending)],
+            new FilterCondition("ID", FilterOperator.GreaterThan, SqliteValue.Integer(10)),
+            new GlobalSearchRequest("needle", ["label"]),
+            ForeignKeyDisplayMode.RawValue);
+        using var coordinator = CreateCoordinator(store, query);
+
+        IReadOnlyList<TypedRow> rows = await coordinator.LoadAllRowsAsync(CancellationToken.None)
+            .ConfigureAwait(false);
+
+        Assert.HasCount(750, rows);
+        Assert.AreEqual(1, store.AllRowQueryCalls);
+        Assert.AreEqual(0, store.RowQueryCalls);
+        Assert.IsEmpty(coordinator.Chunks);
+        Assert.IsEmpty(coordinator.ActiveRows);
+        TableQueryDefinition captured = store.AllQueries.Single();
+        Assert.AreSame(query.Definition, captured);
+        Assert.AreEqual(query.Sorts[0], captured.Sorts[0]);
+        Assert.AreSame(query.Filter, captured.Filter);
+        Assert.AreSame(query.Search, captured.Search);
+        Assert.AreEqual(query.ForeignKeyDisplayMode, captured.ForeignKeyDisplayMode);
+    }
+
+    [TestMethod]
+    public async Task InvalidateRejectsLateAllRowsFromANonCooperativeStore()
+    {
+        var store = new RecordingTableDataStore
+        {
+            BlockAllRows = true,
+            IgnoreAllRowsCancellation = true,
+        };
+        using var coordinator = CreateCoordinator(store);
+
+        Task<IReadOnlyList<TypedRow>> pending = coordinator.LoadAllRowsAsync(CancellationToken.None);
+        await store.AllRowsStarted.Task.ConfigureAwait(false);
+        coordinator.Invalidate();
+        store.ReleaseAllRows.TrySetResult();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        Assert.IsEmpty(coordinator.Chunks);
+        Assert.AreEqual(TableRowCountStatus.Unknown, coordinator.CountState.Status);
+    }
+
+    [TestMethod]
+    public async Task CallerCancellationRejectsLateAllRowsFromANonCooperativeStore()
+    {
+        var store = new RecordingTableDataStore
+        {
+            BlockAllRows = true,
+            IgnoreAllRowsCancellation = true,
+        };
+        using var coordinator = CreateCoordinator(store);
+        using var cancellation = new CancellationTokenSource();
+
+        Task<IReadOnlyList<TypedRow>> pending = coordinator.LoadAllRowsAsync(cancellation.Token);
+        await store.AllRowsStarted.Task.ConfigureAwait(false);
+        cancellation.Cancel();
+        store.ReleaseAllRows.TrySetResult();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        Assert.IsEmpty(coordinator.Chunks);
+        Assert.IsEmpty(coordinator.ActiveRows);
+    }
+
+    [TestMethod]
+    public async Task ResetRejectsLateAllRowsFromThePreviousQueryLifetime()
+    {
+        var store = new RecordingTableDataStore
+        {
+            BlockAllRows = true,
+            IgnoreAllRowsCancellation = true,
+        };
+        var original = new TableQuery("items", new PageRequest(0, 100));
+        using var coordinator = CreateCoordinator(store, original);
+
+        Task<IReadOnlyList<TypedRow>> pending = coordinator.LoadAllRowsAsync(CancellationToken.None);
+        await store.AllRowsStarted.Task.ConfigureAwait(false);
+        coordinator.Reset(new TableQuery(
+            "items",
+            new PageRequest(0, 250),
+            [new SortDescriptor("ID", SortDirection.Descending)]));
+        store.ReleaseAllRows.TrySetResult();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        Assert.IsEmpty(coordinator.Chunks);
+        Assert.AreEqual(TableRowCountStatus.Unknown, coordinator.CountState.Status);
+    }
+
+    [TestMethod]
+    public async Task DisposeRejectsLateAllRowsFromANonCooperativeStore()
+    {
+        var store = new RecordingTableDataStore
+        {
+            BlockAllRows = true,
+            IgnoreAllRowsCancellation = true,
+        };
+        VirtualTableQueryCoordinator coordinator = CreateCoordinator(store);
+
+        Task<IReadOnlyList<TypedRow>> pending = coordinator.LoadAllRowsAsync(CancellationToken.None);
+        await store.AllRowsStarted.Task.ConfigureAwait(false);
+        coordinator.Dispose();
+        store.ReleaseAllRows.TrySetResult();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        Assert.IsEmpty(coordinator.Chunks);
+        Assert.IsEmpty(coordinator.ActiveRows);
+    }
+
+    [TestMethod]
+    public async Task FailedAllRowsQueryDoesNotMutateTheBoundedWindow()
+    {
+        var store = new RecordingTableDataStore();
+        using var coordinator = CreateCoordinator(store);
+        VirtualChunk<TypedRow> existing = await coordinator.LoadChunkContainingAsync(
+                0,
+                CancellationToken.None)
+            .ConfigureAwait(false);
+        store.AllRowsException = new InvalidDataException("Rejected test result.");
+
+        await Assert.ThrowsExactlyAsync<InvalidDataException>(() =>
+            coordinator.LoadAllRowsAsync(CancellationToken.None)).ConfigureAwait(false);
+
+        Assert.AreEqual(1, store.AllRowQueryCalls);
+        Assert.HasCount(1, coordinator.Chunks);
+        Assert.AreSame(existing, coordinator.Chunks[0]);
+        Assert.HasCount(VirtualTableQueryCoordinator.ChunkSize, coordinator.ActiveRows);
+        Assert.AreEqual(TableRowCountStatus.Unknown, coordinator.CountState.Status);
+    }
+
+    [TestMethod]
     public async Task CountsRemainIndependentAcrossTabsAndRejectLateCancellation()
     {
         var firstStore = new RecordingTableDataStore
@@ -225,10 +360,15 @@ public sealed class VirtualTableQueryCoordinatorTests
     {
         public List<TableQuery> Queries { get; } = [];
 
+        public List<TableQueryDefinition> AllQueries { get; } = [];
+
         public TaskCompletionSource CountStarted { get; } = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         public TaskCompletionSource RowsStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource AllRowsStarted { get; } = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         public TaskCompletionSource ReleaseCount { get; } = new(
@@ -237,19 +377,32 @@ public sealed class VirtualTableQueryCoordinatorTests
         public TaskCompletionSource ReleaseRows { get; } = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
+        public TaskCompletionSource ReleaseAllRows { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
         public bool BlockCount { get; set; }
 
         public bool BlockRows { get; set; }
 
+        public bool BlockAllRows { get; set; }
+
         public bool IgnoreCountCancellation { get; set; }
 
         public bool IgnoreRowCancellation { get; set; }
+
+        public bool IgnoreAllRowsCancellation { get; set; }
+
+        public int AllRowsResultCount { get; set; } = 1_250;
+
+        public Exception? AllRowsException { get; set; }
 
         public long CountResult { get; set; } = 10_000;
 
         public int CountCalls { get; private set; }
 
         public int RowQueryCalls { get; private set; }
+
+        public int AllRowQueryCalls { get; private set; }
 
         public Task<TablePage> QueryAsync(
             string sqlitePath,
@@ -282,6 +435,37 @@ public sealed class VirtualTableQueryCoordinatorTests
                 .Select(index => CreateRow(query.Page.Offset + index))
                 .ToArray();
             return new TableSlice(query.TableName, query.Page, rows, hasMore: true);
+        }
+
+        public async Task<IReadOnlyList<TypedRow>> QueryAllRowsAsync(
+            string sqlitePath,
+            DatabaseSchemaCatalog catalog,
+            TableQueryDefinition query,
+            CancellationToken cancellationToken)
+        {
+            AllQueries.Add(query);
+            AllRowQueryCalls++;
+            AllRowsStarted.TrySetResult();
+            if (BlockAllRows)
+            {
+                if (IgnoreAllRowsCancellation)
+                {
+                    await ReleaseAllRows.Task.ConfigureAwait(false);
+                }
+                else
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            if (AllRowsException is not null)
+            {
+                throw AllRowsException;
+            }
+
+            return Enumerable.Range(0, AllRowsResultCount)
+                .Select(index => CreateRow(index))
+                .ToArray();
         }
 
         public Task<long> CountAsync(

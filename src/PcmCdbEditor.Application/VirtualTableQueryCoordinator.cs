@@ -162,6 +162,51 @@ public sealed class VirtualTableQueryCoordinator : IDisposable
         }
     }
 
+    public async Task<IReadOnlyList<TypedRow>> LoadAllRowsAsync(
+        CancellationToken cancellationToken)
+    {
+        TableQueryDefinition definition;
+        CancellationToken lifetimeToken;
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            definition = _query.Definition;
+            lifetimeToken = _queryLifetime.Token;
+        }
+
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            lifetimeToken);
+        IReadOnlyList<TypedRow> rows = await _dataStore.QueryAllRowsAsync(
+                _sqlitePath,
+                _catalog,
+                definition,
+                linkedCancellation.Token)
+            .ConfigureAwait(false);
+        var snapshot = new TypedRow[rows.Count];
+        for (var index = 0; index < snapshot.Length; index++)
+        {
+            linkedCancellation.Token.ThrowIfCancellationRequested();
+            snapshot[index] = rows[index];
+        }
+
+        linkedCancellation.Token.ThrowIfCancellationRequested();
+        var loaded = Array.AsReadOnly(snapshot);
+
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            linkedCancellation.Token.ThrowIfCancellationRequested();
+            if (lifetimeToken != _queryLifetime.Token ||
+                !ReferenceEquals(definition, _query.Definition))
+            {
+                throw new OperationCanceledException(lifetimeToken);
+            }
+
+            return loaded;
+        }
+    }
+
     public async Task<TableRowCountState> LoadCountAsync(CancellationToken cancellationToken)
     {
         TableQuery query;
@@ -244,12 +289,8 @@ public sealed class VirtualTableQueryCoordinator : IDisposable
     }
 
     private static TableQuery CopyWithPage(TableQuery query, long offset) => new(
-        query.TableName,
-        new PageRequest(offset, ChunkSize),
-        query.Sorts,
-        query.Filter,
-        query.Search,
-        query.ForeignKeyDisplayMode);
+        query.Definition,
+        new PageRequest(offset, ChunkSize));
 
     private void RequireCatalogTable(string tableName)
     {

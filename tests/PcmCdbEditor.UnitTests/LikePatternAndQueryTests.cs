@@ -51,4 +51,49 @@ public sealed class LikePatternAndQueryTests
         Assert.HasCount(1, search.EligibleColumns);
         Assert.AreEqual("name", search.EligibleColumns[0]);
     }
+
+    [TestMethod]
+    public void TableQueryDefinitionOwnsPageIndependentShapeAndLegacyConstructorProjectsIt()
+    {
+        var sorts = new List<SortDescriptor>
+        {
+            new("score", SortDirection.Descending),
+        };
+        var filter = new FilterCondition(
+            "score",
+            FilterOperator.GreaterThan,
+            SqliteValue.Integer(10));
+        var search = new GlobalSearchRequest("needle", ["name"]);
+        var definition = new TableQueryDefinition(
+            "items",
+            sorts,
+            filter,
+            search,
+            ForeignKeyDisplayMode.ResolvedName);
+        sorts.Add(new SortDescriptor("name", SortDirection.Ascending));
+
+        var query = new TableQuery(definition, new PageRequest(250, 500));
+        var legacy = new TableQuery(
+            "items",
+            new PageRequest(0, 100),
+            definition.Sorts,
+            filter,
+            search,
+            ForeignKeyDisplayMode.ResolvedName);
+
+        Assert.AreSame(definition, query.Definition);
+        Assert.AreEqual("items", query.TableName);
+        Assert.HasCount(1, query.Sorts);
+        Assert.AreSame(filter, query.Filter);
+        Assert.AreSame(search, query.Search);
+        Assert.AreEqual(ForeignKeyDisplayMode.ResolvedName, query.ForeignKeyDisplayMode);
+        Assert.AreEqual(250L, query.Page.Offset);
+        Assert.AreEqual(500, query.Page.Limit);
+        Assert.AreEqual(definition.TableName, legacy.Definition.TableName);
+        CollectionAssert.AreEqual(
+            definition.Sorts.ToArray(),
+            legacy.Definition.Sorts.ToArray());
+        Assert.AreSame(filter, legacy.Definition.Filter);
+        Assert.AreSame(search, legacy.Definition.Search);
+    }
 }

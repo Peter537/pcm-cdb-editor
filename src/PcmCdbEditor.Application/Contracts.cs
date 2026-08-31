@@ -81,6 +81,12 @@ public interface ITableDataStore
 
     Task<TableSlice> QueryRowsAsync(string sqlitePath, DatabaseSchemaCatalog catalog, TableQuery query, CancellationToken cancellationToken);
 
+    Task<IReadOnlyList<TypedRow>> QueryAllRowsAsync(
+        string sqlitePath,
+        DatabaseSchemaCatalog catalog,
+        TableQueryDefinition query,
+        CancellationToken cancellationToken);
+
     Task<long> CountAsync(string sqlitePath, DatabaseSchemaCatalog catalog, string tableName, FilterExpression? filter, CancellationToken cancellationToken);
 
     Task<long> CountAsync(string sqlitePath, DatabaseSchemaCatalog catalog, TableQuery query, CancellationToken cancellationToken);

@@ -90,6 +90,33 @@ public sealed record PageRequest
     public int Limit { get; }
 }
 
+public sealed record TableQueryDefinition
+{
+    public TableQueryDefinition(
+        string tableName,
+        IEnumerable<SortDescriptor>? sorts = null,
+        FilterExpression? filter = null,
+        GlobalSearchRequest? search = null,
+        ForeignKeyDisplayMode foreignKeyDisplayMode = ForeignKeyDisplayMode.RawAndName)
+    {
+        TableName = tableName;
+        Sorts = ModelCollections.Freeze(sorts);
+        Filter = filter;
+        Search = search;
+        ForeignKeyDisplayMode = foreignKeyDisplayMode;
+    }
+
+    public string TableName { get; }
+
+    public IReadOnlyList<SortDescriptor> Sorts { get; }
+
+    public FilterExpression? Filter { get; }
+
+    public GlobalSearchRequest? Search { get; }
+
+    public ForeignKeyDisplayMode ForeignKeyDisplayMode { get; }
+}
+
 public sealed record TableQuery
 {
     public TableQuery(
@@ -99,26 +126,36 @@ public sealed record TableQuery
         FilterExpression? filter = null,
         GlobalSearchRequest? search = null,
         ForeignKeyDisplayMode foreignKeyDisplayMode = ForeignKeyDisplayMode.RawAndName)
+        : this(
+            new TableQueryDefinition(
+                tableName,
+                sorts,
+                filter,
+                search,
+                foreignKeyDisplayMode),
+            page)
     {
-        TableName = tableName;
-        Page = page;
-        Sorts = ModelCollections.Freeze(sorts);
-        Filter = filter;
-        Search = search;
-        ForeignKeyDisplayMode = foreignKeyDisplayMode;
     }
 
-    public string TableName { get; }
+    public TableQuery(TableQueryDefinition definition, PageRequest page)
+    {
+        Definition = definition ?? throw new ArgumentNullException(nameof(definition));
+        Page = page ?? throw new ArgumentNullException(nameof(page));
+    }
+
+    public TableQueryDefinition Definition { get; }
+
+    public string TableName => Definition.TableName;
 
     public PageRequest Page { get; }
 
-    public IReadOnlyList<SortDescriptor> Sorts { get; }
+    public IReadOnlyList<SortDescriptor> Sorts => Definition.Sorts;
 
-    public FilterExpression? Filter { get; }
+    public FilterExpression? Filter => Definition.Filter;
 
-    public GlobalSearchRequest? Search { get; }
+    public GlobalSearchRequest? Search => Definition.Search;
 
-    public ForeignKeyDisplayMode ForeignKeyDisplayMode { get; }
+    public ForeignKeyDisplayMode ForeignKeyDisplayMode => Definition.ForeignKeyDisplayMode;
 }
 
 public sealed record TablePage

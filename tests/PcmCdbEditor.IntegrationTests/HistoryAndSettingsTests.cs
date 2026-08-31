@@ -1,6 +1,7 @@
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using PcmCdbEditor.Domain;
 using PcmCdbEditor.Infrastructure.History;
+using PcmCdbEditor.Infrastructure.Internal;
 using PcmCdbEditor.Infrastructure.Settings;
 using PcmCdbEditor.Infrastructure.Sqlite;
 
@@ -83,6 +84,71 @@ public sealed class HistoryAndSettingsTests
             var json = await File.ReadAllTextAsync(path).ConfigureAwait(false);
             Assert.IsFalse(json.Contains("database-row-secret", StringComparison.Ordinal));
             Assert.IsFalse(Directory.EnumerateFiles(directory).Any(file => file.EndsWith(".tmp", StringComparison.Ordinal)));
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task ConcurrentPreferenceAndTableViewStateSavesPreserveBothUpdates()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "PcmCdbEditorTests", Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "settings.json");
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var preferences = new EditorPreferences(
+                ApplicationTheme.Dark,
+                GridDensity.Comfortable,
+                pageSize: 250,
+                ForeignKeyDisplayMode.ResolvedName,
+                ["C:\\databases\\recent.cdb"]);
+            var viewState = new TableViewState(
+                "signature",
+                "DYN_table",
+                [new ColumnDisplayState("value", 147.5, 0, true, false)],
+                GridDensity.Comfortable,
+                frozenColumnCount: 1);
+            var serializationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var continueSerialization = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task initialWrite = Task.Run(() => AtomicJsonFile.WriteAsync(
+                path,
+                new GateBlockingSettingsDocument(serializationStarted, continueSerialization),
+                CancellationToken.None));
+
+            await serializationStarted.Task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            Task preferenceSave = new JsonSettingsStore(path)
+                .SavePreferencesAsync(preferences, CancellationToken.None);
+            Task viewStateSave = new JsonSettingsStore(path)
+                .SaveTableViewStateAsync(viewState, CancellationToken.None);
+            continueSerialization.SetResult();
+
+            await Task.WhenAll(initialWrite, preferenceSave, viewStateSave).ConfigureAwait(false);
+
+            var reloaded = new JsonSettingsStore(path);
+            EditorPreferences actualPreferences = await reloaded
+                .LoadPreferencesAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+            TableViewState? actualViewState = await reloaded
+                .LoadTableViewStateAsync("SIGNATURE", "dyn_TABLE", CancellationToken.None)
+                .ConfigureAwait(false);
+
+            Assert.AreEqual(preferences.Theme, actualPreferences.Theme);
+            Assert.AreEqual(preferences.Density, actualPreferences.Density);
+            Assert.AreEqual(preferences.PageSize, actualPreferences.PageSize);
+            Assert.AreEqual(preferences.ForeignKeyDisplayMode, actualPreferences.ForeignKeyDisplayMode);
+            CollectionAssert.AreEqual(preferences.RecentFiles.ToArray(), actualPreferences.RecentFiles.ToArray());
+            Assert.IsNotNull(actualViewState);
+            Assert.AreEqual(viewState.SchemaSignature, actualViewState.SchemaSignature);
+            Assert.AreEqual(viewState.TableName, actualViewState.TableName);
+            Assert.AreEqual(viewState.Density, actualViewState.Density);
+            Assert.AreEqual(viewState.FrozenColumnCount, actualViewState.FrozenColumnCount);
+            CollectionAssert.AreEqual(viewState.Columns.ToArray(), actualViewState.Columns.ToArray());
         }
         finally
         {
@@ -268,9 +334,13 @@ public sealed class HistoryAndSettingsTests
     }
 
     [TestMethod]
+    [DataRow(-1, 100)]
+    [DataRow(0, 100)]
     [DataRow(42, 100)]
     [DataRow(100, 100)]
     [DataRow(250, 250)]
+    [DataRow(500, 500)]
+    [DataRow(501, 100)]
     public async Task PersistedPageSizeIsRestrictedToSupportedUiChoices(int persistedPageSize, int expectedPageSize)
     {
         var directory = Path.Combine(Path.GetTempPath(), "PcmCdbEditorTests", Guid.NewGuid().ToString("N"));
@@ -289,6 +359,41 @@ public sealed class HistoryAndSettingsTests
                 .ConfigureAwait(false);
 
             Assert.AreEqual(expectedPageSize, preferences.PageSize);
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task FiveHundredRowPreferenceRoundTripsWithoutAnAllRowsSentinel()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "PcmCdbEditorTests", Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "settings.json");
+        try
+        {
+            var store = new JsonSettingsStore(path);
+            await store.SavePreferencesAsync(
+                    new EditorPreferences(
+                        ApplicationTheme.Dark,
+                        GridDensity.Comfortable,
+                        pageSize: 500,
+                        ForeignKeyDisplayMode.RawAndName),
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+
+            EditorPreferences reloaded = await store
+                .LoadPreferencesAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+            string json = await File.ReadAllTextAsync(path).ConfigureAwait(false);
+
+            Assert.AreEqual(500, reloaded.PageSize);
+            StringAssert.Contains(json, "\"PageSize\": 500", StringComparison.Ordinal);
+            Assert.IsFalse(json.Contains("All rows", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
@@ -419,5 +524,32 @@ public sealed class HistoryAndSettingsTests
         var reloaded = new EditHistory(Path.Combine(database.Directory, "edit-history.json"));
         Assert.IsTrue(reloaded.State.CanRedo);
         Assert.IsFalse(reloaded.State.IsDirty);
+    }
+
+    private sealed class GateBlockingSettingsDocument(
+        TaskCompletionSource serializationStarted,
+        TaskCompletionSource continueSerialization)
+    {
+        [System.Text.Json.Serialization.JsonPropertyOrder(-1)]
+        public string SerializationMarker
+        {
+            get
+            {
+                serializationStarted.TrySetResult();
+                continueSerialization.Task.GetAwaiter().GetResult();
+                return "ready";
+            }
+        }
+
+        public Dictionary<string, object> Preferences { get; } = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Theme"] = ApplicationTheme.System,
+            ["Density"] = GridDensity.Compact,
+            ["PageSize"] = 100,
+            ["ForeignKeyDisplayMode"] = ForeignKeyDisplayMode.RawAndName,
+            ["RecentFiles"] = Array.Empty<string>()
+        };
+
+        public Dictionary<string, object> TableViewStates { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 }
