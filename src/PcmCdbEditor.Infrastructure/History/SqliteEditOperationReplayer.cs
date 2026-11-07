@@ -53,6 +53,8 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
                 await deferCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            await PreflightAsync(connection, sqliteTransaction, catalog, targets, cancellationToken)
+                .ConfigureAwait(false);
             foreach (RowReplayGuard guard in replay.Guards)
             {
                 await ValidateGuardAsync(connection, sqliteTransaction, catalog, guard, cancellationToken)
@@ -92,6 +94,42 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
             await SqliteOperationRunner.RollbackAfterFailureAsync(connection, sqliteTransaction)
                 .ConfigureAwait(false);
             throw;
+        }
+    }
+
+    private static async Task PreflightAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        DatabaseSchemaCatalog catalog,
+        IReadOnlyList<RowTarget> targets,
+        CancellationToken cancellationToken)
+    {
+        foreach (var group in targets.GroupBy(target => target.TableName, StringComparer.OrdinalIgnoreCase))
+        {
+            TableSchema table = RequireEditableTable(catalog, group.Key);
+            if (group.Any(target => target.UpdatedColumns is null))
+            {
+                await SqliteMutationSafety.EnsureInsertDeleteAreReversibleAsync(
+                        connection, transaction, table.Name, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            var updatedColumns = group.SelectMany(target => target.UpdatedColumns ?? [])
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (ColumnSchema column in table.Columns)
+            {
+                if (column.IsGenerated || column.IsHidden || column.IsPrimaryKey)
+                {
+                    updatedColumns.Remove(column.Name);
+                }
+            }
+
+            if (updatedColumns.Count > 0)
+            {
+                await SqliteMutationSafety.EnsureUpdateIsReversibleAsync(
+                        connection, transaction, table.Name, updatedColumns, cancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
     }
 
@@ -331,7 +369,7 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
             return 0;
         }
 
-        command.CommandText = $"UPDATE {SqliteSupport.QuoteIdentifier(table.Name)} SET {string.Join(", ", assignments)} WHERE {BuildIdentityPredicate(identity, command)}";
+        command.CommandText = $"UPDATE OR ABORT {SqliteSupport.QuoteIdentifier(table.Name)} SET {string.Join(", ", assignments)} WHERE {BuildIdentityPredicate(identity, command)}";
         int affected = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         if (affected != 1)
         {
@@ -350,12 +388,6 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         CancellationToken cancellationToken)
     {
         ValidateIdentity(table, identity);
-        await SqliteDeleteSafety.EnsureInsertIsReversibleAsync(
-                connection,
-                transaction,
-                table.Name,
-                cancellationToken)
-            .ConfigureAwait(false);
         var insertValues = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
         foreach (KeyValuePair<string, SqliteValue> pair in values)
         {
@@ -395,8 +427,8 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         }
 
         command.CommandText = names.Count == 0
-            ? $"INSERT INTO {SqliteSupport.QuoteIdentifier(table.Name)} DEFAULT VALUES"
-            : $"INSERT INTO {SqliteSupport.QuoteIdentifier(table.Name)} ({string.Join(", ", names)}) VALUES ({string.Join(", ", parameters)})";
+            ? $"INSERT OR ABORT INTO {SqliteSupport.QuoteIdentifier(table.Name)} DEFAULT VALUES"
+            : $"INSERT OR ABORT INTO {SqliteSupport.QuoteIdentifier(table.Name)} ({string.Join(", ", names)}) VALUES ({string.Join(", ", parameters)})";
         int affected = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         if (affected != 1)
         {
@@ -414,12 +446,6 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         CancellationToken cancellationToken)
     {
         ValidateIdentity(table, identity);
-        await SqliteDeleteSafety.EnsureDeleteIsReversibleAsync(
-                connection,
-                transaction,
-                table.Name,
-                cancellationToken)
-            .ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = $"DELETE FROM {SqliteSupport.QuoteIdentifier(table.Name)} WHERE {BuildIdentityPredicate(identity, command)}";
@@ -479,8 +505,8 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
     {
         IEnumerable<RowTarget> targets = operation switch
         {
-            CellUpdateOperation cell => [new RowTarget(cell.TableName, cell.Identity)],
-            RowUpdateOperation row => [new RowTarget(row.TableName, row.Identity)],
+            CellUpdateOperation cell => [new RowTarget(cell.TableName, cell.Identity, [cell.ColumnName])],
+            RowUpdateOperation row => [new RowTarget(row.TableName, row.Identity, row.OldValues.Keys.Concat(row.NewValues.Keys))],
             RowInsertionOperation insertion =>
             [
                 new RowTarget(
@@ -498,7 +524,10 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
                         ?? throw new InvalidOperationException("A deleted row has no stable identity."))
             ],
             MaintenanceEditOperation maintenance => maintenance.Changes.Select(static change =>
-                new RowTarget(change.TableName, change.Identity)),
+                new RowTarget(change.TableName, change.Identity,
+                    change.BeforeValues is not null && change.AfterValues is not null
+                        ? change.BeforeValues.Keys.Concat(change.AfterValues.Keys)
+                        : null)),
             _ => throw new NotSupportedException(
                 $"History replay does not support operation type '{operation.GetType().Name}'.")
         };
@@ -609,5 +638,5 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
 
     private static string TargetKey(RowTarget target) => $"{target.TableName}\u001f{target.Identity}";
 
-    private sealed record RowTarget(string TableName, RowIdentity Identity);
+    private sealed record RowTarget(string TableName, RowIdentity Identity, IEnumerable<string>? UpdatedColumns = null);
 }

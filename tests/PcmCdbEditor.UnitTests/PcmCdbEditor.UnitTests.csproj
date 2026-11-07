@@ -8,6 +8,8 @@
     <ProjectReference Include="..\..\src\PcmCdbEditor.Application\PcmCdbEditor.Application.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="..\..\src\PcmCdbEditor.App\ViewModels\ShellState.cs"
+             Link="App\ViewModels\ShellState.cs" />
     <Compile Include="..\..\src\PcmCdbEditor.App\TabCloseSelectionReconciler.cs"
              Link="App\TabCloseSelectionReconciler.cs" />
     <Compile Include="..\..\src\PcmCdbEditor.App\TableRowDisplayOptions.cs"

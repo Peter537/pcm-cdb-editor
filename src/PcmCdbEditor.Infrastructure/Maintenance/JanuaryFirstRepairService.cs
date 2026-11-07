@@ -92,7 +92,13 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
                 throw new DBConcurrencyException("Season-stage data changed after the preview was generated.");
             }
 
-            await SqliteDeleteSafety.EnsureDeleteIsReversibleAsync(
+            if (state.Count == 0)
+            {
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return new MaintenanceApplyResult(0, $"{TargetTable} is empty. There were no rows to delete.");
+            }
+
+            await SqliteMutationSafety.EnsureInsertDeleteAreReversibleAsync(
                     connection,
                     sqliteTransaction,
                     TargetTable,
@@ -114,12 +120,6 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
                 throw new DBConcurrencyException("Season-stage rows changed while deletion history was captured.");
             }
 
-            if (affected == 0)
-            {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                return new MaintenanceApplyResult(0, $"Cleared 0 row(s) from {TargetTable}.");
-            }
-
             var historyOperation = new MaintenanceEditOperation(
                 Guid.NewGuid(),
                 TargetTable,
@@ -133,7 +133,7 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return new MaintenanceApplyResult(
                 affected,
-                $"Cleared {affected} row(s) from {TargetTable}.",
+                $"Deleted {affected:N0} {(affected == 1 ? "row" : "rows")} from {TargetTable} in the working copy.",
                 historyOperation,
                 undoGuards);
         }
@@ -194,7 +194,7 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
         if (date.Month != 1 || date.Day != 1)
         {
             throw new InvalidOperationException(
-                $"The season-stage repair is available only on January 1; the in-game date is {date:yyyy-MM-dd}.");
+                $"The season-stage repair is available only on January 1. The in-game date is {date:yyyy-MM-dd}.");
         }
     }
 }

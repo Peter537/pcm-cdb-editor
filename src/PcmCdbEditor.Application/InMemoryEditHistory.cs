@@ -27,6 +27,14 @@ public sealed class InMemoryEditHistory : IEditHistory
         _currentStateId != _savedStateId,
         _pending is not null);
 
+    public EditHistorySnapshot GetSnapshot() =>
+        EditHistorySnapshot.FromTimeline(
+            State,
+            _currentStateId,
+            _savedStateId,
+            _undo.Select(static entry => (entry.Operation, entry.BeforeStateId)),
+            _redo.Select(static entry => (entry.Operation, entry.AfterStateId)));
+
     public void Record(EditOperation operation) => Record(operation, []);
 
     public void Record(EditOperation operation, IEnumerable<RowReplayGuard> undoGuards)

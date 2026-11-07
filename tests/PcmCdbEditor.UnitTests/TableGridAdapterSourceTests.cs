@@ -298,7 +298,7 @@ public sealed class TableGridAdapterSourceTests
     {
         string source = File.ReadAllText(GetAdapterSourcePath());
         int bindStart = source.IndexOf(
-            "public void Bind(TableSchema schema, IReadOnlyList<TypedRow> rows, TableViewState? state)",
+            "public void Bind(",
             StringComparison.Ordinal);
         int clearStart = source.IndexOf(
             "public void Clear()",

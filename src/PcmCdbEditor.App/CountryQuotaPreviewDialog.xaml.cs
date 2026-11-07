@@ -40,15 +40,13 @@ public sealed partial class CountryQuotaPreviewDialog : ContentDialog
 
     private void ConfigureSummary()
     {
-        SummaryText.Text = string.Format(
-            CultureInfo.CurrentCulture,
-            "Database date {0:yyyy-MM-dd}. {1:N0} of {2:N0} country rows will change. " +
-            "The calculation contains {3:N0} World qualifiers and {4:N0} European qualifiers.",
-            _projection.CurrentDate,
-            _projection.ChangeCount,
-            _projection.TotalCountryCount,
-            _projection.WorldQualifierCount,
-            _projection.EuropeanQualifierCount);
+        int worldCount = _projection.WorldQualifierCount;
+        int europeanCount = _projection.EuropeanQualifierCount;
+        SummaryText.Text =
+            $"Game date {_projection.CurrentDate:yyyy-MM-dd}. {_projection.ChangeCount:N0} of {_projection.TotalCountryCount:N0} " +
+            $"country {(_projection.TotalCountryCount == 1 ? "row" : "rows")} will change. " +
+            $"The calculation found {worldCount:N0} World {(worldCount == 1 ? "qualifier" : "qualifiers")} " +
+            $"and {europeanCount:N0} European {(europeanCount == 1 ? "qualifier" : "qualifiers")}.";
         AutomationProperties.SetName(SummaryText, SummaryText.Text);
     }
 
@@ -92,7 +90,9 @@ public sealed partial class CountryQuotaPreviewDialog : ContentDialog
             return;
         }
 
-        PrimaryButtonText = $"Apply all {_projection.ChangeCount:N0} changes";
+        PrimaryButtonText = _projection.ChangeCount == 1
+            ? "Apply 1 change"
+            : $"Apply all {_projection.ChangeCount:N0} changes";
         IsPrimaryButtonEnabled = true;
         CloseButtonText = "Cancel";
     }
@@ -254,9 +254,9 @@ public sealed partial class CountryQuotaPreviewDialog : ContentDialog
 
         string scopeName = _scope switch
         {
-            CountryQuotaReviewScope.Changes => "changes",
-            CountryQuotaReviewScope.WorldQualifiers => "World qualifiers",
-            CountryQuotaReviewScope.EuropeanQualifiers => "European qualifiers",
+            CountryQuotaReviewScope.Changes => rows.Length == 1 ? "change" : "changes",
+            CountryQuotaReviewScope.WorldQualifiers => rows.Length == 1 ? "World qualifier" : "World qualifiers",
+            CountryQuotaReviewScope.EuropeanQualifiers => rows.Length == 1 ? "European qualifier" : "European qualifiers",
             _ => throw new ArgumentOutOfRangeException()
         };
         string sortDescription = DescribeSort(CurrentSort);
@@ -330,6 +330,7 @@ internal sealed class CountryQuotaReviewDisplayRow
     public CountryQuotaReviewDisplayRow(CountryQuotaReviewRow row)
     {
         CanonicalCode = row.CanonicalCode;
+        CountryIdentityText = row.CountryIdentityText;
         StoredCodeLabel = row.StoredCodeLabel ?? string.Empty;
         StoredCodeVisibility = row.HasStoredCodeAlias ? Visibility.Visible : Visibility.Collapsed;
         UciPointsText = row.UciPoints.ToString("N2", CultureInfo.CurrentCulture);
@@ -343,6 +344,8 @@ internal sealed class CountryQuotaReviewDisplayRow
     }
 
     public string CanonicalCode { get; }
+
+    public string CountryIdentityText { get; }
 
     public string StoredCodeLabel { get; }
 

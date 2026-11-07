@@ -9,6 +9,13 @@ namespace PcmCdbEditor.Infrastructure.Maintenance;
 
 public sealed class CountryQuotaMaintenanceService : ICountryQuotaMaintenanceService
 {
+    private static readonly string[] QuotaColumns =
+    [
+        "gene_i_num_cyclist_WC", "gene_i_num_cyclist_WC_ITT",
+        "gene_i_num_cyclist_EC", "gene_i_num_cyclist_EC_ITT"
+    ];
+    private static readonly string[] CountryDisplayColumns =
+        ["gene_sz_name", "gene_sz_full_name", "value_sz_name", "name"];
     private static readonly IReadOnlyDictionary<string, IReadOnlyCollection<string>> Requirements =
         new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
         {
@@ -21,11 +28,7 @@ public sealed class CountryQuotaMaintenanceService : ICountryQuotaMaintenanceSer
             ["DYN_result_season_stage"] = new[] { "IDresult_season_stage", "gene_b_isFinalStage", "gene_b_isTTT" },
             ["DYN_cyclist"] = new[] { "IDcyclist", "fkIDregion" },
             ["STA_region"] = new[] { "IDregion", "fkIDcountry" },
-            ["STA_country"] = new[]
-            {
-                "IDcountry", "CONSTANT", "fkIDcontinent", "gene_i_num_cyclist_WC",
-                "gene_i_num_cyclist_WC_ITT", "gene_i_num_cyclist_EC", "gene_i_num_cyclist_EC_ITT"
-            },
+            ["STA_country"] = new[] { "IDcountry", "CONSTANT", "fkIDcontinent" }.Concat(QuotaColumns).ToArray(),
             ["STA_continent"] = new[] { "IDcontinent", "CONSTANT" },
             ["STA_stage"] = new[] { "IDstage", "fkIDrace", "gene_i_stage_number" },
             ["STA_race"] = new[] { "IDrace", "fkIDrace_class" },
@@ -119,6 +122,9 @@ public sealed class CountryQuotaMaintenanceService : ICountryQuotaMaintenanceSer
                 return new MaintenanceApplyResult(0, "Country quotas already match the calculated allocation.");
             }
 
+            await SqliteMutationSafety.EnsureUpdateIsReversibleAsync(
+                    connection, sqliteTransaction, "STA_country", QuotaColumns, cancellationToken)
+                .ConfigureAwait(false);
             IReadOnlyList<TypedRow> beforeRows = await MaintenanceHistoryCapture.ReadByIntegerIdsAsync(
                     connection,
                     sqliteTransaction,
@@ -133,7 +139,7 @@ public sealed class CountryQuotaMaintenanceService : ICountryQuotaMaintenanceSer
                 await using var command = connection.CreateCommand();
                 command.Transaction = sqliteTransaction;
                 command.CommandText = @"
-UPDATE STA_country
+UPDATE OR ABORT STA_country
 SET gene_i_num_cyclist_WC = $worldRoad,
     gene_i_num_cyclist_WC_ITT = $worldTimeTrial,
     gene_i_num_cyclist_EC = $europeanRoad,
@@ -172,7 +178,7 @@ WHERE IDcountry = $countryId";
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return new MaintenanceApplyResult(
                 affected,
-                $"Updated {affected} country quota row(s).",
+                $"Updated {affected:N0} country quota {(affected == 1 ? "row" : "rows")} in the working copy.",
                 historyOperation,
                 undoGuards);
         }
@@ -200,7 +206,7 @@ WHERE IDcountry = $countryId";
         var points = CalculateCountryPoints(resultRows, bonuses);
         if (!points.Values.Any(static value => value > 0))
         {
-            throw new InvalidDataException("No positive current-season UCI points could be calculated; no quotas were changed.");
+            throw new InvalidDataException("No positive current-season UCI points could be calculated. No quotas were changed.");
         }
 
         var countries = await LoadCountriesAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
@@ -230,7 +236,10 @@ WHERE IDcountry = $countryId";
                 worldRank,
                 europeRank,
                 country.Current,
-                next));
+                next)
+            {
+                CountryName = country.Name,
+            });
         }
 
         var tokenValues = new List<string>
@@ -393,10 +402,15 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
         SqliteTransaction? transaction,
         CancellationToken cancellationToken)
     {
-        const string countryProjection = """
+        HashSet<string> columns = await SqliteSupport.ReadColumnNamesAsync(connection, "STA_country", cancellationToken)
+            .ConfigureAwait(false);
+        string? nameColumn = CountryDisplayColumns.FirstOrDefault(columns.Contains);
+        string nameExpression = SqliteRelationshipSql.BuildLabelExpression(nameColumn, null, "c.");
+        string countryProjection = $"""
             SELECT c.IDcountry AS country_id,
                    COALESCE(c.CONSTANT, '') AS raw_code,
                    COALESCE(ct.CONSTANT, '') AS continent_code,
+                   {nameExpression} AS country_name,
                    COALESCE(c.gene_i_num_cyclist_WC, 0) AS world_road,
                    COALESCE(c.gene_i_num_cyclist_WC_ITT, 0) AS world_time_trial,
                    COALESCE(c.gene_i_num_cyclist_EC, 0) AS european_road,
@@ -425,6 +439,7 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
             reader.GetInt64(reader.GetOrdinal("country_id")),
             reader.GetString(reader.GetOrdinal("raw_code")),
             reader.GetString(reader.GetOrdinal("continent_code")).Trim(),
+            reader.IsDBNull(reader.GetOrdinal("country_name")) ? null : reader.GetString(reader.GetOrdinal("country_name")),
             new CountryQuotaValues(
                 reader.GetInt64(reader.GetOrdinal("world_road")),
                 reader.GetInt64(reader.GetOrdinal("world_time_trial")),
@@ -526,13 +541,6 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
             static row => row.Identity?.ToString()
                 ?? throw new InvalidDataException("A country history row has no identity."),
             StringComparer.Ordinal);
-        string[] columns =
-        [
-            "gene_i_num_cyclist_WC",
-            "gene_i_num_cyclist_WC_ITT",
-            "gene_i_num_cyclist_EC",
-            "gene_i_num_cyclist_EC_ITT"
-        ];
         var changes = new List<MaintenanceRowChange>(beforeRows.Count);
         foreach (TypedRow before in beforeRows)
         {
@@ -546,8 +554,8 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
             changes.Add(new MaintenanceRowChange(
                 "STA_country",
                 before.Identity!,
-                columns.Select(column => KeyValuePair.Create(column, before.Values[column])),
-                columns.Select(column => KeyValuePair.Create(column, after.Values[column]))));
+                QuotaColumns.Select(column => KeyValuePair.Create(column, before.Values[column])),
+                QuotaColumns.Select(column => KeyValuePair.Create(column, after.Values[column]))));
         }
 
         return new MaintenanceEditOperation(
@@ -597,7 +605,7 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
         if (date.Month != 11)
         {
             throw new InvalidOperationException(
-                $"Country quotas can be maintained only during November; the in-game date is {date:yyyy-MM-dd}.");
+                $"Country quotas can be maintained only during November. The in-game date is {date:yyyy-MM-dd}.");
         }
     }
 
@@ -614,5 +622,5 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
         string RaceClass,
         long CountryId);
 
-    private sealed record CountryRow(long Id, string RawCode, string Continent, CountryQuotaValues Current);
+    private sealed record CountryRow(long Id, string RawCode, string Continent, string? Name, CountryQuotaValues Current);
 }

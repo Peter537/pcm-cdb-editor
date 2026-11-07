@@ -81,12 +81,12 @@ SELECT value, {projectedValues}, {payloadValues} FROM sequence;");
 
         Assert.HasCount(500, slice.Rows);
         Assert.AreEqual(92, catalog.Tables.Single(table => table.Name == "DYN_cyclist").Columns.Count);
-        Assert.AreEqual(SqliteValueKind.Null, slice.Rows[0].Values["fkIDlookup00__display"].Kind);
-        Assert.AreEqual("999999", slice.Rows[1].Values["fkIDlookup00__display"].TextValue);
-        Assert.AreEqual("499", slice.Rows[2].Values["fkIDlookup00__display"].TextValue);
+        Assert.IsFalse(slice.Rows[0].RelatedValues.ContainsKey("fkIDlookup00"));
+        Assert.AreEqual(RelationshipResolution.MissingTarget, slice.Rows[1].RelatedValues["fkIDlookup00"].Resolution);
+        Assert.AreEqual(RelationshipResolution.AmbiguousKey, slice.Rows[2].RelatedValues["fkIDlookup00"].Resolution);
         Assert.AreEqual(
-            "4 | lookup00-4",
-            slice.Rows[3].Values["fkIDlookup00__display"].TextValue);
+            "lookup00-4",
+            slice.Rows[3].RelatedValues["fkIDlookup00"].Label);
         Assert.IsLessThan(TimeSpan.FromSeconds(5), stopwatch.Elapsed);
 
         var store = new SqliteTableDataStore();
@@ -107,7 +107,7 @@ SELECT value, {projectedValues}, {payloadValues} FROM sequence;");
                 new PageRequest(0, 4),
                 foreignKeyDisplayMode: ForeignKeyDisplayMode.ResolvedName),
             CancellationToken.None).ConfigureAwait(false);
-        Assert.AreEqual("lookup00-4", names.Rows[3].Values["fkIDlookup00__display"].TextValue);
+        Assert.AreEqual("lookup00-4", names.Rows[3].RelatedValues["fkIDlookup00"].Label);
     }
 
     [TestMethod]
@@ -125,15 +125,15 @@ SELECT value, {projectedValues}, {payloadValues} FROM sequence;");
         var baseQuery = new TableQuery(
             "DYN_rider",
             new PageRequest(0, 1),
-            [new SortDescriptor("fkIDcountry__display", SortDirection.Ascending)],
+            [new SortDescriptor("fkIDcountry", SortDirection.Ascending, QueryValueTarget.RelatedLabel)],
             foreignKeyDisplayMode: ForeignKeyDisplayMode.ResolvedName);
 
         string commandText = SqliteTableDataStore.BuildPageCommandTextForDiagnostics(catalog, baseQuery);
-        StringAssert.Contains(commandText, "LEFT JOIN", StringComparison.OrdinalIgnoreCase);
+        StringAssert.Contains(commandText, "AS MATERIALIZED", StringComparison.OrdinalIgnoreCase);
         IReadOnlyList<string> planDetails = await ReadQueryPlanAsync(database.Path, commandText)
             .ConfigureAwait(false);
-        Assert.IsFalse(
-            planDetails.Any(static detail => detail.Contains("CORRELATED", StringComparison.OrdinalIgnoreCase)),
+        Assert.IsTrue(
+            planDetails.Any(static detail => detail.Contains("AUTOMATIC COVERING INDEX", StringComparison.OrdinalIgnoreCase)),
             string.Join(Environment.NewLine, planDetails));
 
         var store = new SqliteTableDataStore();
@@ -245,11 +245,90 @@ SELECT value, value, 501 - value FROM sequence;",
                 SqliteTableDataStore.CommandKind.ForeignKeyLookup
             },
             commands);
-        Assert.AreEqual("1 | Lookup 1", slice.Rows[0].Values["fkIDprimary__display"].TextValue);
+        Assert.AreEqual("Lookup 1", slice.Rows[0].RelatedValues["fkIDprimary"].Label);
         Assert.AreEqual(SqliteValueKind.Real, slice.Rows[0].Values["fkIDsecondary"].Kind);
-        Assert.AreEqual("777.25", slice.Rows[0].Values["fkIDsecondary__display"].TextValue);
-        Assert.AreEqual("7", slice.Rows[6].Values["fkIDprimary__display"].TextValue);
-        Assert.AreEqual("7", slice.Rows[493].Values["fkIDsecondary__display"].TextValue);
+        Assert.AreEqual(RelationshipResolution.MissingTarget, slice.Rows[0].RelatedValues["fkIDsecondary"].Resolution);
+        Assert.AreEqual(RelationshipResolution.AmbiguousKey, slice.Rows[6].RelatedValues["fkIDprimary"].Resolution);
+        Assert.AreEqual(RelationshipResolution.AmbiguousKey, slice.Rows[493].RelatedValues["fkIDsecondary"].Resolution);
+    }
+
+    [TestMethod]
+    [Timeout(15_000)]
+    public async Task RelatedSearchGroupsUnindexedTargetsOnceAndSharesTheCountPredicate()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE STA_lookup(IDlookup INTEGER, gene_sz_name TEXT)",
+            """
+            WITH RECURSIVE numbers(value) AS (VALUES(1) UNION ALL SELECT value+1 FROM numbers WHERE value<500)
+            INSERT INTO STA_lookup SELECT value, 'Target ' || value FROM numbers;
+            """,
+            "CREATE TABLE data(ID INTEGER PRIMARY KEY, fkIDlookup INTEGER)",
+            """
+            WITH RECURSIVE numbers(value) AS (VALUES(1) UNION ALL SELECT value+1 FROM numbers WHERE value<10000)
+            INSERT INTO data SELECT value, ((value-1) % 500)+1 FROM numbers;
+            """).ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        var query = new TableQuery("data", new PageRequest(0, 5),
+            search: new GlobalSearchRequest("Target 421", ["fkIDlookup"]), foreignKeyDisplayMode: ForeignKeyDisplayMode.RawValue);
+        var details = await ReadQueryPlanAsync(database.Path,
+            SqliteTableDataStore.BuildPageCommandTextForDiagnostics(catalog, query), "%Target 421%").ConfigureAwait(false);
+        Assert.AreEqual(1, details.Count(detail => detail.Contains("SCAN main.STA_lookup", StringComparison.OrdinalIgnoreCase)),
+            string.Join(Environment.NewLine, details));
+        Assert.IsTrue(details.Any(detail => detail.Contains("AUTOMATIC COVERING INDEX", StringComparison.OrdinalIgnoreCase)),
+            string.Join(Environment.NewLine, details));
+        var store = new SqliteTableDataStore();
+        var stopwatch = Stopwatch.StartNew();
+        var page = await store.QueryRowsAsync(database.Path, catalog, query, CancellationToken.None).ConfigureAwait(false);
+        Assert.HasCount(5, page.Rows);
+        Assert.AreEqual(421L, page.Rows[0].Values["ID"].IntegerValue);
+        Assert.AreEqual(20L, await store.CountAsync(database.Path, catalog, query, CancellationToken.None).ConfigureAwait(false));
+        var all = await store.QueryAllRowsAsync(database.Path, catalog, query.Definition, CancellationToken.None).ConfigureAwait(false);
+        Assert.HasCount(20, all);
+        Assert.IsLessThan(TimeSpan.FromSeconds(5), stopwatch.Elapsed);
+    }
+
+    [TestMethod]
+    [Timeout(15_000)]
+    public async Task AllRowsStagesDistinctKeysAndReadsEachUnindexedTargetOnce()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE STA_lookup(IDlookup INTEGER, gene_sz_name TEXT)",
+            """
+            WITH RECURSIVE numbers(value) AS (VALUES(1) UNION ALL SELECT value+1 FROM numbers WHERE value<20000)
+            INSERT INTO STA_lookup SELECT value, 'Target ' || value FROM numbers;
+            """,
+            "CREATE TABLE data(ID INTEGER PRIMARY KEY, fkIDlookup INTEGER)",
+            "INSERT INTO data SELECT IDlookup, IDlookup FROM STA_lookup",
+            "INSERT INTO STA_lookup VALUES(7, 'Duplicate')",
+            "CREATE TABLE __pcm_lookup_keys(note TEXT); INSERT INTO __pcm_lookup_keys VALUES('preserved')")
+            .ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        var commands = new List<SqliteTableDataStore.CommandKind>();
+        var stopwatch = Stopwatch.StartNew();
+        var rows = await new SqliteTableDataStore(commands.Add).QueryAllRowsAsync(database.Path, catalog,
+            new TableQueryDefinition("data"), CancellationToken.None).ConfigureAwait(false);
+        Assert.HasCount(20000, rows);
+        Assert.AreEqual("Target 20000", rows[^1].RelatedValues["fkIDlookup"].Label);
+        Assert.AreEqual(RelationshipResolution.AmbiguousKey, rows[6].RelatedValues["fkIDlookup"].Resolution);
+        CollectionAssert.AreEqual(new[]
+        {
+            SqliteTableDataStore.CommandKind.Page,
+            SqliteTableDataStore.CommandKind.ForeignKeyLookup
+        }, commands);
+        Assert.IsLessThan(TimeSpan.FromSeconds(5), stopwatch.Elapsed);
+
+        using var cancellation = new CancellationTokenSource();
+        var cancelledStore = new SqliteTableDataStore(kind =>
+        {
+            if (kind == SqliteTableDataStore.CommandKind.ForeignKeyLookup)
+            {
+                cancellation.Cancel();
+            }
+        });
+        await Assert.ThrowsAsync<OperationCanceledException>(() => cancelledStore.QueryAllRowsAsync(
+            database.Path, catalog, new TableQueryDefinition("data"), cancellation.Token)).ConfigureAwait(false);
+        Assert.AreEqual("preserved", await database.ScalarAsync<string>(
+            "SELECT note FROM __pcm_lookup_keys").ConfigureAwait(false));
     }
 
     [TestMethod]
@@ -413,7 +492,8 @@ WHERE IDneutral = 1";
 
     private static async Task<IReadOnlyList<string>> ReadQueryPlanAsync(
         string sqlitePath,
-        string commandText)
+        string commandText,
+        string? searchPattern = null)
     {
         await using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
         {
@@ -426,6 +506,10 @@ WHERE IDneutral = 1";
         command.CommandText = $"EXPLAIN QUERY PLAN {commandText}";
         command.Parameters.AddWithValue("$limit", 501);
         command.Parameters.AddWithValue("$offset", 0);
+        if (searchPattern is not null)
+        {
+            command.Parameters.AddWithValue("$p0", searchPattern);
+        }
         var details = new List<string>();
         await using var reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
         while (await reader.ReadAsync().ConfigureAwait(false))

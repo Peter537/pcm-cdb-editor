@@ -101,10 +101,16 @@ internal sealed class GridContentBindingSession
             rowsByIdentity.TryGetValue(selection.CurrentRow, out T? resolvedCurrent)
                 ? resolvedCurrent
                 : null;
-        string? currentColumn = currentRow is null || selection.CurrentColumn is null
-            ? null
-            : visibleColumns.FirstOrDefault(column =>
-                column.Equals(selection.CurrentColumn, StringComparison.OrdinalIgnoreCase));
+        T? currentCellRow = null;
+        string? currentColumn = null;
+        if (selection.CurrentColumn is { } savedColumn &&
+            (selection.CurrentCellRow ?? selection.CurrentRow) is { } cellIdentity &&
+            rowsByIdentity.TryGetValue(cellIdentity, out T? cellRow))
+        {
+            currentColumn = visibleColumns.FirstOrDefault(column =>
+                column.Equals(savedColumn, StringComparison.OrdinalIgnoreCase));
+            currentCellRow = currentColumn is null ? null : cellRow;
+        }
 
         var seen = new HashSet<RowIdentity>();
         T[] selectedRows = selection.SelectedRows
@@ -113,7 +119,7 @@ internal sealed class GridContentBindingSession
             .OfType<T>()
             .ToArray();
 
-        return new GridSelectionResolution<T>(currentRow, currentColumn, selectedRows);
+        return new GridSelectionResolution<T>(currentRow, currentColumn, selectedRows, currentCellRow);
     }
 }
 
@@ -139,5 +145,6 @@ internal sealed class BulkRowSource<T>
 internal sealed record GridSelectionResolution<T>(
     T? CurrentRow,
     string? CurrentColumn,
-    IReadOnlyList<T> SelectedRows)
+    IReadOnlyList<T> SelectedRows,
+    T? CurrentCellRow)
     where T : class;

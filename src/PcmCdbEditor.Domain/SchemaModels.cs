@@ -75,7 +75,9 @@ public sealed record ForeignKeyRelation(
     string TargetColumn,
     string? DisplayColumn,
     bool IsDeclared,
-    string Confidence);
+    string Confidence,
+    string? AdditionalDisplayColumn = null,
+    bool IsComposite = false);
 
 public sealed class TableSchema
 {

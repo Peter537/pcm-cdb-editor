@@ -1,6 +1,8 @@
 using System.Data;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
+using PcmCdbEditor.Infrastructure.History;
 using PcmCdbEditor.Infrastructure.Sqlite;
 
 namespace PcmCdbEditor.IntegrationTests;
@@ -9,14 +11,15 @@ namespace PcmCdbEditor.IntegrationTests;
 public sealed class SqliteCatalogAndStoreTests
 {
     private static readonly string[] CompositeIdentityColumns = ["IDteam", "IDrider"];
-    private static readonly string?[] ResolvedCountryOrder = ["999", "Belgium", "Denmark"];
+    private static readonly string[] NullableKeyNotes = ["first", "second", "third"];
+    private static readonly string?[] ResolvedCountryOrder = [null, "Belgium", "Denmark"];
 
     [TestMethod]
     public async Task CatalogDiscoversCompositeRowIdViewAndConservativeRelationships()
     {
         await using var database = await SqliteTestDatabase.CreateAsync(
             "CREATE TABLE STA_country(IDcountry INTEGER PRIMARY KEY, gene_sz_name TEXT)",
-            "CREATE TABLE DYN_rider(IDteam INTEGER NOT NULL, IDrider INTEGER NOT NULL, fkIDcountry INTEGER, PRIMARY KEY(IDteam, IDrider), FOREIGN KEY(fkIDcountry) REFERENCES STA_country(IDcountry)) WITHOUT ROWID",
+            "CREATE TABLE DYN_rider(IDteam INTEGER NOT NULL, IDrider INTEGER NOT NULL, fkIDcountry INTEGER, PRIMARY KEY(IDteam, IDrider), FOREIGN KEY(fkIDcountry) REFERENCES STA_country(IDcountry)) WITHOUT /* comment */ ROWID",
             "INSERT INTO STA_country VALUES(1,'Neutral'); INSERT INTO DYN_rider VALUES(1,1,1)",
             "CREATE TABLE notes(value TEXT)",
             "CREATE VIEW rider_names AS SELECT IDrider FROM DYN_rider",
@@ -26,6 +29,7 @@ public sealed class SqliteCatalogAndStoreTests
             .ConfigureAwait(false);
 
         Assert.IsTrue(catalog.TryGetTable("DYN_rider", out var rider));
+        Assert.IsTrue(rider.IsWithoutRowId);
         Assert.AreEqual(StableIdentityKind.DeclaredPrimaryKey, rider.StableIdentity.Kind);
         CollectionAssert.AreEqual(CompositeIdentityColumns, rider.StableIdentity.Columns.ToArray());
         Assert.HasCount(1, rider.Relationships);
@@ -38,7 +42,16 @@ public sealed class SqliteCatalogAndStoreTests
         Assert.IsTrue(catalog.TryGetTable("rider_search", out var virtualTable));
         Assert.AreEqual(TableEditCapability.UnsupportedSchema, virtualTable.EditCapability);
         Assert.AreEqual(StableIdentityKind.None, virtualTable.StableIdentity.Kind);
+        Assert.IsTrue(catalog.TryGetTable("rider_search_content", out var shadowTable));
+        Assert.AreEqual(TableEditCapability.UnsupportedSchema, shadowTable.EditCapability);
+        Assert.AreEqual(StableIdentityKind.None, shadowTable.StableIdentity.Kind);
         var store = new SqliteTableDataStore();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.InsertRowAsync(
+            database.Path,
+            catalog,
+            new RowInsertionOperation(Guid.NewGuid(), shadowTable.Name, DateTimeOffset.UtcNow,
+                [KeyValuePair.Create("c0", SqliteValue.Text("do not bypass FTS"))]),
+            CancellationToken.None)).ConfigureAwait(false);
         var viewRows = await store.QueryAsync(
             database.Path,
             catalog,
@@ -46,6 +59,32 @@ public sealed class SqliteCatalogAndStoreTests
             CancellationToken.None).ConfigureAwait(false);
         Assert.HasCount(1, viewRows.Rows);
         Assert.IsNull(viewRows.Rows[0].Identity);
+    }
+
+    [TestMethod]
+    public async Task LegalNullPrimaryKeysRemainBrowsableWithStablePaging()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE data(id TEXT PRIMARY KEY, rowid TEXT, note TEXT DEFAULT 'WITHOUT ROWID')",
+            "INSERT INTO data VALUES(NULL, 'shadow', 'first'), (NULL, 'shadow', 'second'), ('key', 'shadow', 'third')")
+            .ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        var store = new SqliteTableDataStore();
+        var definition = new TableQueryDefinition("data", [new SortDescriptor("id", SortDirection.Ascending)]);
+
+        var all = await store.QueryAllRowsAsync(database.Path, catalog, definition, CancellationToken.None)
+            .ConfigureAwait(false);
+        var secondPage = await store.QueryAsync(database.Path, catalog,
+                new TableQuery(definition, new PageRequest(1, 1)), CancellationToken.None)
+            .ConfigureAwait(false);
+
+        CollectionAssert.AreEqual(NullableKeyNotes,
+            all.Select(row => row.Values["note"].TextValue).ToArray());
+        Assert.IsNull(all[0].Identity);
+        Assert.IsNull(all[1].Identity);
+        Assert.IsNotNull(all[2].Identity);
+        Assert.AreEqual("second", secondPage.Rows.Single().Values["note"].TextValue);
     }
 
     [TestMethod]
@@ -127,7 +166,7 @@ public sealed class SqliteCatalogAndStoreTests
         var resolvedQuery = new TableQuery(
             "DYN_rider",
             new PageRequest(0, 3),
-            [new SortDescriptor("fkIDcountry__display", SortDirection.Ascending)],
+            [new SortDescriptor("fkIDcountry", SortDirection.Ascending, QueryValueTarget.RelatedLabel)],
             foreignKeyDisplayMode: ForeignKeyDisplayMode.ResolvedName);
         var resolved = await store.QueryAsync(
             database.Path,
@@ -136,7 +175,7 @@ public sealed class SqliteCatalogAndStoreTests
             CancellationToken.None).ConfigureAwait(false);
         CollectionAssert.AreEqual(
             ResolvedCountryOrder,
-            resolved.Rows.Select(row => row.Values["fkIDcountry__display"].TextValue).ToArray());
+            resolved.Rows.Select(row => row.RelatedValues["fkIDcountry"].Label).ToArray());
         IReadOnlyList<TypedRow> allResolved = await store.QueryAllRowsAsync(
             database.Path,
             catalog,
@@ -144,7 +183,7 @@ public sealed class SqliteCatalogAndStoreTests
             CancellationToken.None).ConfigureAwait(false);
         CollectionAssert.AreEqual(
             ResolvedCountryOrder,
-            allResolved.Select(row => row.Values["fkIDcountry__display"].TextValue).ToArray());
+            allResolved.Select(row => row.RelatedValues["fkIDcountry"].Label).ToArray());
         var rawAndNameQuery = new TableQuery(
             "DYN_rider",
             new PageRequest(0, 3),
@@ -154,15 +193,15 @@ public sealed class SqliteCatalogAndStoreTests
             catalog,
             rawAndNameQuery,
             CancellationToken.None).ConfigureAwait(false);
-        Assert.AreEqual("1 | Denmark", rawAndName.Rows[0].Values["fkIDcountry__display"].TextValue);
-        Assert.AreEqual("999", rawAndName.Rows[1].Values["fkIDcountry__display"].TextValue);
+        Assert.AreEqual("Denmark", rawAndName.Rows[0].RelatedValues["fkIDcountry"].Label);
+        Assert.AreEqual(RelationshipResolution.MissingTarget, rawAndName.Rows[1].RelatedValues["fkIDcountry"].Resolution);
         IReadOnlyList<TypedRow> allRawAndName = await store.QueryAllRowsAsync(
             database.Path,
             catalog,
             rawAndNameQuery.Definition,
             CancellationToken.None).ConfigureAwait(false);
-        Assert.AreEqual("1 | Denmark", allRawAndName[0].Values["fkIDcountry__display"].TextValue);
-        Assert.AreEqual("999", allRawAndName[1].Values["fkIDcountry__display"].TextValue);
+        Assert.AreEqual("Denmark", allRawAndName[0].RelatedValues["fkIDcountry"].Label);
+        Assert.AreEqual(RelationshipResolution.MissingTarget, allRawAndName[1].RelatedValues["fkIDcountry"].Resolution);
     }
 
     [TestMethod]
@@ -338,10 +377,38 @@ SELECT value, 'row-' || value FROM sequence;")
     }
 
     [TestMethod]
+    public async Task UpdateReturnsStoredAffinityAndRecognizesAnEffectiveNoOp()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE DYN_item(IDitem INTEGER PRIMARY KEY, quantity INTEGER NOT NULL)",
+            "INSERT INTO DYN_item VALUES(1, 5)").ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        var store = new SqliteTableDataStore();
+        TypedRow before = (await store.QueryAsync(
+            database.Path, catalog, new TableQuery("DYN_item", new PageRequest(0, 10)), CancellationToken.None)
+            .ConfigureAwait(false)).Rows.Single();
+        var update = new CellUpdateOperation(Guid.NewGuid(), "DYN_item", DateTimeOffset.UtcNow,
+            before.Identity!, "quantity", SqliteValue.Integer(5), SqliteValue.Text("0007"), before.Revision);
+
+        EditResult changed = await store.UpdateCellAsync(database.Path, catalog, update, CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.AreEqual(1, changed.AffectedRows);
+        TypedRow after = changed.CurrentRow!;
+        Assert.AreEqual(SqliteValue.Integer(7), after.Values["quantity"]);
+
+        EditResult unchanged = await store.UpdateCellAsync(database.Path, catalog,
+            update with { OldValue = after.Values["quantity"], ExpectedRevision = after.Revision }, CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.AreEqual(0, unchanged.AffectedRows);
+        Assert.AreEqual(after.Revision, unchanged.CurrentRow?.Revision);
+    }
+
+    [TestMethod]
     public async Task CrudUsesGeneratedIdentityAndRejectsStaleRevisionWithoutPartialUpdate()
     {
         await using var database = await SqliteTestDatabase.CreateAsync(
-            "CREATE TABLE DYN_item(IDitem INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, quantity INTEGER NOT NULL)",
+            "CREATE TABLE DYN_item(IDitem INTEGER PRIMARY KEY, name TEXT NOT NULL, quantity INTEGER NOT NULL)",
             "INSERT INTO DYN_item(name, quantity) VALUES('old', 1)").ConfigureAwait(false);
         var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None)
             .ConfigureAwait(false);
@@ -388,5 +455,68 @@ SELECT value, 'row-' || value FROM sequence;")
             Guid.NewGuid(), "DYN_item", DateTimeOffset.UtcNow, inserted.CurrentRow);
         Assert.AreEqual(1, (await store.DeleteRowAsync(
             database.Path, catalog, deletion, CancellationToken.None).ConfigureAwait(false)).AffectedRows);
+    }
+
+    [TestMethod]
+    [DataRow("CREATE TABLE data (id INT PRIMARY KEY DEFAULT 7, note TEXT)")]
+    [DataRow("CREATE TABLE data (id INTEGER PRIMARY KEY DESC DEFAULT 7, note TEXT)")]
+    [DataRow("CREATE TABLE data (id INT DEFAULT 7, scope TEXT DEFAULT 'x', note TEXT, PRIMARY KEY(scope, id)) WITHOUT ROWID")]
+    [DataRow("CREATE TABLE data (id INTEGER DEFAULT 7, note TEXT)")]
+    public async Task InsertUndoRedoUsesReturnedIdentityAndPreservesOriginalRow(string createTable)
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            createTable, "INSERT INTO data (id, note) VALUES (2, 'original')").ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        var insertion = new RowInsertionOperation(Guid.NewGuid(), "data", DateTimeOffset.UtcNow,
+            [KeyValuePair.Create("note", SqliteValue.Text("inserted"))]);
+        var inserted = await new SqliteTableDataStore().InsertRowAsync(
+            database.Path, catalog, insertion, CancellationToken.None).ConfigureAwait(false);
+        TypedRow row = inserted.CurrentRow!;
+        Assert.AreEqual(SqliteValue.Integer(7), row.Values["id"]);
+        Assert.AreEqual(SqliteValue.Text("inserted"), row.Values["note"]);
+        var recorded = new RowInsertionOperation(insertion.OperationId, "data", insertion.CreatedAtUtc,
+            insertion.Values, insertedRow: row);
+        var replayer = new SqliteEditOperationReplayer();
+        var undo = await replayer.ReplayAsync(database.Path, catalog,
+            new EditHistoryReplay(recorded, EditReplayDirection.Undo, [RowReplayGuard.Present("data", row)]),
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(1L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM data").ConfigureAwait(false));
+        Assert.AreEqual("original", await database.ScalarAsync<string>(
+            "SELECT note FROM data WHERE id = 2").ConfigureAwait(false));
+
+        await replayer.ReplayAsync(database.Path, catalog,
+            new EditHistoryReplay(recorded, EditReplayDirection.Redo, undo.OppositeGuards), CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.AreEqual(2L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM data").ConfigureAwait(false));
+        Assert.AreEqual("original", await database.ScalarAsync<string>(
+            "SELECT note FROM data WHERE id = 2").ConfigureAwait(false));
+        Assert.AreEqual("inserted", await database.ScalarAsync<string>(
+            "SELECT note FROM data WHERE id = 7").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    public async Task InsertRollsBackWhenReturnedKeyIsNullOrDiffersFromAssignedIdentity()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE data (id INTEGER PRIMARY KEY DESC, note TEXT)",
+            "INSERT INTO data VALUES (2, 'original')").ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        var store = new SqliteTableDataStore();
+        var noKey = new RowInsertionOperation(Guid.NewGuid(), "data", DateTimeOffset.UtcNow, []);
+        var nullError = await Assert.ThrowsExactlyAsync<UnsafeRowMutationException>(
+            () => store.InsertRowAsync(database.Path, catalog, noKey, CancellationToken.None)).ConfigureAwait(false);
+        StringAssert.Contains(nullError.Message, "NULL", StringComparison.Ordinal);
+        Assert.AreEqual("id", nullError.ColumnName);
+        var wrongKey = new RowInsertionOperation(Guid.NewGuid(), "data", DateTimeOffset.UtcNow,
+            [KeyValuePair.Create("id", SqliteValue.Integer(7))],
+            RowIdentity.FromPrimaryKey([new RowIdentityComponent("id", SqliteValue.Integer(2))]));
+        var mismatch = await Assert.ThrowsExactlyAsync<UnsafeRowMutationException>(
+            () => store.InsertRowAsync(database.Path, catalog, wrongKey, CancellationToken.None)).ConfigureAwait(false);
+        StringAssert.Contains(mismatch.Message, "different row identity", StringComparison.Ordinal);
+        Assert.AreEqual(1L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM data").ConfigureAwait(false));
+        Assert.AreEqual("original", await database.ScalarAsync<string>(
+            "SELECT note FROM data WHERE id = 2").ConfigureAwait(false));
     }
 }

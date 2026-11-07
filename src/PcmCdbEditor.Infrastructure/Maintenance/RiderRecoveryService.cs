@@ -14,20 +14,18 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
     private const string TeamTable = "DYN_team";
     private static readonly string[] TeamDisplayColumns =
         ["gene_sz_name", "gene_sz_shortname", "gene_sz_abbreviation", "CONSTANT", "name"];
+    private static readonly string[] RiderDisplayColumns =
+        ["gene_sz_firstlastname", "gene_sz_name", "gene_sz_full_name", "gene_sz_firstname", "gene_sz_lastname", "name"];
+    private static readonly string[] PresetColumns =
+    [
+        "value_f_FIT", "value_f_injury", "value_i_injury_num_days",
+        "value_f_fat_phy", "value_f_freshness", "value_f_prepa"
+    ];
 
     private static readonly IReadOnlyDictionary<string, IReadOnlyCollection<string>> Requirements =
         new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
         {
-            [Table] = new[]
-            {
-                "IDcyclist",
-                "value_f_FIT",
-                "value_f_injury",
-                "value_i_injury_num_days",
-                "value_f_fat_phy",
-                "value_f_freshness",
-                "value_f_prepa"
-            }
+            [Table] = new[] { "IDcyclist" }.Concat(PresetColumns).ToArray()
         };
 
     public Task<MaintenanceCapability> CheckCapabilityAsync(
@@ -62,19 +60,21 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
                 TeamTable,
                 cancellationToken)
             .ConfigureAwait(false);
-        string? displayColumn = TeamDisplayColumns.FirstOrDefault(teamColumns.Contains);
-        string displayExpression = displayColumn is null
+        string[] displayColumns = TeamDisplayColumns.Where(teamColumns.Contains)
+            .Select(column => SqliteRelationshipSql.BuildLabelExpression(column, null, "team."))
+            .ToArray();
+        string displayExpression = displayColumns.Length == 0
             ? "''"
-            : $"COALESCE(CAST(team.{SqliteSupport.QuoteIdentifier(displayColumn)} AS TEXT), '')";
+            : $"COALESCE({string.Join(", ", displayColumns)}, '')";
 
         await using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT team.IDteam,
                    {displayExpression},
-                   COUNT(cyclist.IDcyclist)
+                   COUNT(DISTINCT cyclist.IDcyclist)
             FROM {SqliteSupport.QuoteIdentifier(TeamTable)} team
             LEFT JOIN {SqliteSupport.QuoteIdentifier(CyclistTable)} cyclist
-              ON cyclist.fkIDteam = team.IDteam
+              ON cyclist.fkIDteam = team.IDteam AND cyclist.IDcyclist > 0
             WHERE team.IDteam > 0
             GROUP BY team.IDteam, {displayExpression}
             ORDER BY {displayExpression} COLLATE NOCASE, team.IDteam
@@ -87,7 +87,7 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
             string name = reader.GetString(1).Trim();
             options.Add(new RiderTeamOption(
                 teamId,
-                string.IsNullOrWhiteSpace(name) ? $"Team {teamId}" : name,
+                name,
                 reader.GetInt64(2)));
         }
 
@@ -124,19 +124,19 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
                 connection,
                 cancellationToken)
             .ConfigureAwait(false);
-        long[] ids = await ResolveTargetIdsAsync(
+        long[]? resolved = await ResolveTargetIdsAsync(
                 connection,
                 transaction: null,
                 target,
                 cancellationToken)
             .ConfigureAwait(false);
-        if (ids.Length == 0)
-        {
-            return new RiderRecoveryPreview(ComputeToken(target, ids, []), target, ids, []);
-        }
-
-        var changes = await ReadChangesAsync(connection, transaction: null, ids, cancellationToken).ConfigureAwait(false);
-        return new RiderRecoveryPreview(ComputeToken(target, ids, changes), target, ids, changes);
+        long[] ids = resolved ?? [];
+        List<RiderRecoveryChange> changes = ids.Length == 0
+            ? []
+            : await ReadChangesAsync(connection, transaction: null, ids, cancellationToken).ConfigureAwait(false);
+        var names = await ReadRiderNamesAsync(connection, ids, cancellationToken).ConfigureAwait(false);
+        return new RiderRecoveryPreview(ComputeToken(target, ids, changes), target, ids, changes,
+            targetTeamMissing: resolved is null, riderNames: names);
     }
 
     public Task<MaintenanceApplyResult> ApplyAsync(
@@ -157,7 +157,7 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
         MaintenanceSupport.RequireEnabled(capability);
         if (preview.CyclistIds.Count == 0)
         {
-            return new MaintenanceApplyResult(0, "No rider recovery changes were required.");
+            return new MaintenanceApplyResult(0, preview.NoChangeSummary ?? "No rider IDs were supplied.");
         }
 
         DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
@@ -173,15 +173,17 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
         var sqliteTransaction = (SqliteTransaction)transaction;
         try
         {
-            long[] resolvedIds = await ResolveTargetIdsAsync(
+            long[]? resolvedIds = await ResolveTargetIdsAsync(
                     connection,
                     sqliteTransaction,
                     preview.Target,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (!resolvedIds.SequenceEqual(preview.CyclistIds))
+            if (resolvedIds is null || !resolvedIds.SequenceEqual(preview.CyclistIds))
             {
-                throw new DBConcurrencyException("The selected team roster changed after the preview was generated.");
+                throw new DBConcurrencyException(resolvedIds is null
+                    ? "The selected team was removed after the preview was generated."
+                    : "The selected team roster changed after the preview was generated.");
             }
 
             var current = await ReadChangesAsync(
@@ -200,6 +202,15 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
                 .Where(static change => change.OldValues != change.NewValues)
                 .Select(static change => change.CyclistId)
                 .ToArray();
+            if (changedIds.Length == 0)
+            {
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return new MaintenanceApplyResult(0, preview.NoChangeSummary!);
+            }
+
+            await SqliteMutationSafety.EnsureUpdateIsReversibleAsync(
+                    connection, sqliteTransaction, Table, PresetColumns, cancellationToken)
+                .ConfigureAwait(false);
             IReadOnlyList<TypedRow> beforeRows = await MaintenanceHistoryCapture.ReadByIntegerIdsAsync(
                     connection,
                     sqliteTransaction,
@@ -214,7 +225,7 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
                 await using var command = connection.CreateCommand();
                 command.Transaction = sqliteTransaction;
                 command.CommandText = @"
-UPDATE DYN_cyclist_fitness
+UPDATE OR ABORT DYN_cyclist_fitness
 SET value_f_FIT = $fit,
     value_f_injury = $injury,
     value_i_injury_num_days = $injuryDays,
@@ -226,10 +237,9 @@ WHERE IDcyclist = $cyclistId";
                 affected += await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            if (affected == 0)
+            if (affected != changedIds.Length)
             {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                return new MaintenanceApplyResult(0, "No rider recovery changes were required.");
+                throw new DBConcurrencyException("The preset did not update every reviewed fitness row exactly once.");
             }
 
             IReadOnlyList<TypedRow> afterRows = await MaintenanceHistoryCapture.ReadByIntegerIdsAsync(
@@ -252,7 +262,7 @@ WHERE IDcyclist = $cyclistId";
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return new MaintenanceApplyResult(
                 affected,
-                $"Applied the recovery preset to {affected} rider row(s).",
+                $"Applied the recovery preset to {affected:N0} rider {(affected == 1 ? "row" : "rows")}.",
                 historyOperation,
                 undoGuards);
         }
@@ -272,17 +282,13 @@ WHERE IDcyclist = $cyclistId";
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        var parameters = ids.Select((id, index) => (id, Name: $"$id{index}")).ToArray();
+        string parameters = AddIdParameters(command, ids);
         command.CommandText = $@"
 SELECT IDcyclist, value_f_FIT, value_f_injury, value_i_injury_num_days,
        value_f_fat_phy, value_f_freshness, value_f_prepa
 FROM DYN_cyclist_fitness
-WHERE IDcyclist IN ({string.Join(", ", parameters.Select(static parameter => parameter.Name))})
+WHERE IDcyclist IN ({parameters})
 ORDER BY IDcyclist";
-        foreach (var parameter in parameters)
-        {
-            command.Parameters.AddWithValue(parameter.Name, parameter.id);
-        }
 
         var changes = new List<RiderRecoveryChange>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -301,6 +307,65 @@ ORDER BY IDcyclist";
         }
 
         return changes;
+    }
+
+    private static async Task<Dictionary<long, string>> ReadRiderNamesAsync(
+        SqliteConnection connection,
+        long[] ids,
+        CancellationToken cancellationToken)
+    {
+        var names = new Dictionary<long, string>();
+        if (ids.Length == 0)
+        {
+            return names;
+        }
+
+        HashSet<string> columns = await SqliteSupport.ReadColumnNamesAsync(connection, CyclistTable, cancellationToken)
+            .ConfigureAwait(false);
+        List<string> labels = RiderDisplayColumns.Where(columns.Contains)
+            .Select(column => SqliteRelationshipSql.BuildLabelExpression(column, null))
+            .ToList();
+        if (labels.Count == 0 || !columns.Contains("IDcyclist"))
+        {
+            return names;
+        }
+
+        if (columns.Contains("gene_sz_firstname") && columns.Contains("gene_sz_lastname"))
+        {
+            labels.Insert(0, SqliteRelationshipSql.BuildLabelExpression("gene_sz_firstname", "gene_sz_lastname"));
+        }
+        string label = labels.Count == 1 ? labels[0] : $"COALESCE({string.Join(", ", labels)})";
+        await using var command = connection.CreateCommand();
+        string parameters = AddIdParameters(command, ids);
+        command.CommandText = $"""
+            SELECT IDcyclist, {label}
+            FROM {SqliteSupport.QuoteIdentifier(CyclistTable)}
+            WHERE IDcyclist IN ({parameters})
+            GROUP BY IDcyclist
+            HAVING COUNT(*) = 1
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (!reader.IsDBNull(1) && long.TryParse(reader.GetString(0), CultureInfo.InvariantCulture, out long id))
+            {
+                names.TryAdd(id, reader.GetString(1));
+            }
+        }
+
+        return names;
+    }
+
+    private static string AddIdParameters(SqliteCommand command, IEnumerable<long> ids)
+    {
+        var names = new List<string>();
+        foreach (long id in ids)
+        {
+            string name = $"$id{names.Count}";
+            command.Parameters.AddWithValue(name, id);
+            names.Add(name);
+        }
+        return string.Join(", ", names);
     }
 
     private static string ComputeToken(
@@ -325,7 +390,7 @@ ORDER BY IDcyclist";
         return MaintenanceSupport.ComputeToken(values);
     }
 
-    private static async Task<long[]> ResolveTargetIdsAsync(
+    private static async Task<long[]?> ResolveTargetIdsAsync(
         SqliteConnection connection,
         SqliteTransaction? transaction,
         RiderRecoveryTarget target,
@@ -339,6 +404,18 @@ ORDER BY IDcyclist";
         await RequireTeamSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
+        command.Parameters.AddWithValue("$teamId", target.TeamId!.Value);
+        command.CommandText = $"SELECT COUNT(*) FROM {SqliteSupport.QuoteIdentifier(TeamTable)} WHERE IDteam = $teamId";
+        var teamMatches = (long)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+        if (teamMatches == 0)
+        {
+            return null;
+        }
+        if (teamMatches > 1)
+        {
+            throw new DBConcurrencyException("The selected team ID matches more than one team row.");
+        }
+
         command.CommandText = $"""
             SELECT IDcyclist
             FROM {SqliteSupport.QuoteIdentifier(CyclistTable)}
@@ -346,7 +423,6 @@ ORDER BY IDcyclist";
               AND IDcyclist > 0
             ORDER BY IDcyclist
             """;
-        command.Parameters.AddWithValue("$teamId", target.TeamId!.Value);
         var ids = new List<long>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -408,15 +484,6 @@ ORDER BY IDcyclist";
             static row => row.Identity?.ToString()
                 ?? throw new InvalidDataException("A rider history row has no identity."),
             StringComparer.Ordinal);
-        string[] columns =
-        [
-            "value_f_FIT",
-            "value_f_injury",
-            "value_i_injury_num_days",
-            "value_f_fat_phy",
-            "value_f_freshness",
-            "value_f_prepa"
-        ];
         var changes = new List<MaintenanceRowChange>(beforeRows.Count);
         foreach (TypedRow before in beforeRows)
         {
@@ -430,8 +497,8 @@ ORDER BY IDcyclist";
             changes.Add(new MaintenanceRowChange(
                 Table,
                 before.Identity!,
-                columns.Select(column => KeyValuePair.Create(column, before.Values[column])),
-                columns.Select(column => KeyValuePair.Create(column, after.Values[column]))));
+                PresetColumns.Select(column => KeyValuePair.Create(column, before.Values[column])),
+                PresetColumns.Select(column => KeyValuePair.Create(column, after.Values[column]))));
         }
 
         return new MaintenanceEditOperation(

@@ -380,6 +380,7 @@ public sealed class CdbConverterTests
         }
         finally
         {
+            service.Dispose();
             TryDeleteDirectory(root);
         }
     }

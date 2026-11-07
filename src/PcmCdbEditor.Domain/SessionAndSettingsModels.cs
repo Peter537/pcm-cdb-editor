@@ -25,7 +25,14 @@ public sealed record EditorSessionState(
     EditorSessionLifecycle Lifecycle,
     DateTimeOffset CreatedAtUtc,
     DateTimeOffset UpdatedAtUtc,
-    string? LastBackupPath);
+    string? LastBackupPath,
+    bool MutationPending = false,
+    bool? HistoryUncertain = null)
+{
+    public SaveDestinationSnapshot? SaveDestinationBaseline { get; init; }
+}
+
+public sealed record SaveDestinationSnapshot(string Path, long? Length, string? Sha256);
 
 public enum ApplicationTheme
 {

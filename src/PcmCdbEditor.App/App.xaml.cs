@@ -24,17 +24,18 @@ public partial class App : Microsoft.UI.Xaml.Application
             .Skip(1)
             .FirstOrDefault(static argument =>
                 Path.GetExtension(argument).Equals(".cdb", StringComparison.OrdinalIgnoreCase));
+        string applicationDataRoot = ResolveApplicationDataRoot();
         var converter = new CdbConverter(ResolveExporterPath());
-        var workspaceService = new WorkspaceService(converter);
+        var workspaceService = new WorkspaceService(
+            converter,
+            Path.Combine(applicationDataRoot, "Sessions"),
+            Path.Combine(applicationDataRoot, "Backups"));
         var tableCatalog = new SqliteTableCatalog();
         var tableDataStore = new SqliteTableDataStore();
         var riderRecoveryService = new RiderRecoveryService();
         var riderCreationService = new RiderCreationService();
         var januaryFirstRepairService = new JanuaryFirstRepairService();
         var countryQuotaMaintenanceService = new CountryQuotaMaintenanceService();
-        string applicationDataRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "PcmCdbEditor");
         var settingsStore = new JsonSettingsStore(Path.Combine(applicationDataRoot, "settings.json"));
         var fileAssociationService = new WindowsFileAssociationService();
 
@@ -43,13 +44,33 @@ public partial class App : Microsoft.UI.Xaml.Application
             workspaceService,
             tableCatalog,
             tableDataStore,
+            new SqliteRelationshipLookup(),
             riderRecoveryService,
             riderCreationService,
             januaryFirstRepairService,
             countryQuotaMaintenanceService,
             settingsStore,
             fileAssociationService);
+        _window.Closed += (_, _) => workspaceService.Dispose();
         _window.Activate();
+    }
+
+    private static string ResolveApplicationDataRoot()
+    {
+        string? configuredRoot = Environment.GetEnvironmentVariable("PCM_CDB_EDITOR_DATA_ROOT");
+        if (string.IsNullOrWhiteSpace(configuredRoot))
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "PcmCdbEditor");
+        }
+
+        if (!Path.IsPathFullyQualified(configuredRoot))
+        {
+            throw new ArgumentException("PCM_CDB_EDITOR_DATA_ROOT must be an absolute directory path.");
+        }
+
+        return Path.GetFullPath(configuredRoot);
     }
 
     private static void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs args)

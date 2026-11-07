@@ -73,7 +73,7 @@ public sealed class AuthorizedCdbSmokeTests
         string sessionsRoot = Path.Combine(caseRoot, "sessions");
         string backupsRoot = Path.Combine(caseRoot, "backups");
         string outputPath = Path.Combine(caseRoot, "roundtrip.cdb");
-        var workspace = new WorkspaceService(
+        using var workspace = new WorkspaceService(
             new CdbConverter(exporterPath),
             sessionsRoot,
             backupsRoot);

@@ -77,6 +77,10 @@ internal sealed class CountryQuotaReviewRow
 
     public string CanonicalCode => Source.CanonicalCode;
 
+    public string CountryIdentityText => Source.CountryName is { Length: > 0 } name
+        ? $"{name} · ID {CountryId:N0}"
+        : $"ID {CountryId:N0}";
+
     public double UciPoints => Source.UciPoints;
 
     public string UciPointsText => $"{UciPoints:N2}";
@@ -120,7 +124,7 @@ internal sealed class CountryQuotaReviewRow
             formatProvider,
             "{0}.{1} UCI points {2:N2}. World Championship: {3}; road quota {4}; " +
             "time-trial quota {5}. European Championship: {6}; road quota {7}; " +
-            "time-trial quota {8}.",
+            "time-trial quota {8}. Country ID {9:N0}.{10}",
             CanonicalCode,
             alias,
             UciPoints,
@@ -129,7 +133,9 @@ internal sealed class CountryQuotaReviewRow
             FormatAccessibleValue(WorldTimeTrialQuota, formatProvider),
             FormatAccessibleRank(EuropeanRank, formatProvider),
             FormatAccessibleValue(EuropeanRoadQuota, formatProvider),
-            FormatAccessibleValue(EuropeanTimeTrialQuota, formatProvider));
+            FormatAccessibleValue(EuropeanTimeTrialQuota, formatProvider),
+            CountryId,
+            Source.CountryName is { Length: > 0 } name ? $" {name}." : string.Empty);
     }
 
     private static string FormatRank(int? rank) => rank is null ? "Not ranked" : $"{rank.Value:N0}";

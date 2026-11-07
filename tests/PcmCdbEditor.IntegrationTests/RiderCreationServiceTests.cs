@@ -1,6 +1,7 @@
 using System.Data;
 using Microsoft.Data.Sqlite;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
 using PcmCdbEditor.Infrastructure.History;
 using PcmCdbEditor.Infrastructure.Maintenance;
@@ -54,17 +55,17 @@ public sealed class RiderCreationServiceTests
         RiderLookupTarget teamTarget = Lookup(draft, "DYN_cyclist", "fkIDteam");
         RiderLookupOption team = Assert.ContainsSingle(await service.SearchLookupAsync(
             database.Path, teamTarget, "destination", 10, CancellationToken.None).ConfigureAwait(false));
-        Assert.AreEqual("Destination team · 11", team.ToString());
+        Assert.AreEqual("Destination Team · 11", team.ToString());
         Assert.AreEqual(team, Assert.ContainsSingle(await service.SearchLookupAsync(
             database.Path, teamTarget, "11", 10, CancellationToken.None).ConfigureAwait(false)));
 
         RiderLookupTarget regionTarget = Lookup(draft, "DYN_cyclist", "fkIDregion");
         RiderLookupOption region = Assert.ContainsSingle(await service.SearchLookupAsync(
             database.Path, regionTarget, "capital", 10, CancellationToken.None).ConfigureAwait(false));
-        Assert.AreEqual("Capital region · Denmark · 2801", region.ToString());
+        Assert.AreEqual("CAPITAL_REGION · DENMARK · 2801", region.ToString());
 
         RiderLookupTarget typeTarget = Lookup(draft, "DYN_cyclist", "fkIDtype_rider");
-        Assert.AreEqual("Climber · 3", Assert.ContainsSingle(await service.SearchLookupAsync(
+        Assert.AreEqual("CLIMBER · 3", Assert.ContainsSingle(await service.SearchLookupAsync(
             database.Path, typeTarget, "climber", 10, CancellationToken.None).ConfigureAwait(false)).ToString());
 
         RiderLookupOption race = Assert.ContainsSingle(await service.SearchLookupAsync(
@@ -73,7 +74,7 @@ public sealed class RiderCreationServiceTests
             "rvv",
             10,
             CancellationToken.None).ConfigureAwait(false));
-        Assert.AreEqual("Ronde van vlaanderen · Belgium · cwt majeures · 11", race.ToString());
+        Assert.AreEqual("Ronde van Vlaanderen · BELGIUM · CWT_MAJEURES · 11", race.ToString());
         Assert.AreEqual(race, Assert.ContainsSingle(await service.SearchLookupAsync(
             database.Path,
             draft.FavoriteRaceLookupTarget,
@@ -106,6 +107,12 @@ public sealed class RiderCreationServiceTests
 
         Assert.AreEqual(8L, preview.NewCyclistId);
         Assert.AreEqual(21L, preview.NewContractId);
+        Assert.AreEqual(new RiderLookupOption(11, "Destination Team"), preview.Team);
+        Assert.AreEqual(new RiderLookupOption(2801, "CAPITAL_REGION"), preview.Region);
+        Assert.AreEqual(new RiderLookupOption(3, "CLIMBER"), preview.RiderType);
+        CollectionAssert.AreEqual(
+            AbilityKeys,
+            preview.AbilityDefinitions.Select(static ability => ability.Key).ToArray());
         AssertSqliteInteger(preview.RiderValues, "IDcyclist", 8);
         AssertSqliteInteger(preview.RiderValues, "fkIDcontract", 21);
         AssertSqliteInteger(preview.RiderValues, "fkIDteam", 11);
@@ -128,7 +135,8 @@ public sealed class RiderCreationServiceTests
         Assert.AreEqual("(11,43,25)", preview.RiderValues["gene_ilist_fkIDfavorite_races"].TextValue);
         Assert.AreEqual(3d, preview.RiderValues["value_f_potentiel"].RealValue);
         CollectionAssert.AreEqual(new long[] { 11, 43, 25 }, preview.FavoriteRaces.Select(static race => race.Id).ToArray());
-        Assert.AreEqual(990d / 14d, preview.RiderValues["value_f_current_ability"].RealValue, 0.000001);
+        Assert.IsTrue(preview.UsesAutomaticCurrentAbility);
+        Assert.AreEqual(990d / 14d, preview.RiderValues[RiderCurrentAbility.ColumnName].RealValue, 0.000001);
         AssertSqliteInteger(preview.RiderValues, "charac_i_mountain", 80);
         AssertSqliteInteger(preview.RiderValues, "limit_i_mountain", 75);
         Assert.AreEqual(SqliteValueKind.Null, preview.RiderValues["limit_i_plain"].Kind);
@@ -137,7 +145,9 @@ public sealed class RiderCreationServiceTests
         Assert.IsFalse(preview.RiderValues.ContainsKey("database_default"));
         CollectionAssert.AreEqual(PlainOnly, preview.MissingLimitKeys.ToArray());
         Assert.IsTrue(preview.Warnings.Any(static warning => warning.Contains("Mountain", StringComparison.Ordinal)));
-        Assert.IsTrue(preview.Warnings.Any(static warning => warning.Contains("database NULL", StringComparison.Ordinal)));
+        Assert.IsTrue(preview.Warnings.Any(static warning =>
+            warning.Contains("NULL in the working copy", StringComparison.Ordinal) &&
+            warning.Contains("may reopen as zero", StringComparison.Ordinal)));
         Assert.IsFalse(preview.Warnings.Any(static warning => warning.Contains("No favorite races", StringComparison.Ordinal)));
 
         RiderCreationPreview emptyFavorites = await service.PreviewAsync(
@@ -173,18 +183,43 @@ public sealed class RiderCreationServiceTests
     }
 
     [TestMethod]
+    public async Task PreviewUsesTheLookupIdWhenNoFriendlyLabelIsAvailable()
+    {
+        await using var database = await CreateDatabaseAsync().ConfigureAwait(false);
+        await database.ExecuteAsync("""
+            UPDATE DYN_team SET gene_sz_name = '  ' WHERE IDteam = 11;
+            ALTER TABLE STA_type_rider DROP COLUMN CONSTANT;
+            """).ConfigureAwait(false);
+        var service = new RiderCreationService();
+
+        RiderCreationPreview preview = await service.PreviewAsync(
+            database.Path,
+            CreateInput(acknowledgeMissingLimits: false),
+            CancellationToken.None).ConfigureAwait(false);
+
+        Assert.AreEqual(new RiderLookupOption(11, "Team"), preview.Team);
+        Assert.AreEqual(new RiderLookupOption(3, "Rider type"), preview.RiderType);
+    }
+
+    [TestMethod]
     public async Task ApplyCreatesBothRowsAndHistoryUndoesThenRedoesAtomically()
     {
         await using var database = await CreateDatabaseAsync().ConfigureAwait(false);
         var service = new RiderCreationService();
         RiderCreationPreview preview = await service.PreviewAsync(
             database.Path,
-            CreateInput(acknowledgeMissingLimits: true),
+            CreateInput(acknowledgeMissingLimits: false),
             CancellationToken.None).ConfigureAwait(false);
+        RiderCreationPreview acknowledged = preview.AcknowledgeMissingLimits();
+        Assert.IsFalse(preview.Input.MissingLimitsAcknowledged);
+        Assert.IsTrue(acknowledged.Input.MissingLimitsAcknowledged);
+        Assert.AreEqual(preview.SnapshotToken, acknowledged.SnapshotToken);
+        Assert.AreSame(preview.RiderValues, acknowledged.RiderValues);
+        Assert.AreSame(preview.ContractValues, acknowledged.ContractValues);
 
         MaintenanceApplyResult applied = await service.ApplyAsync(
             database.Path,
-            preview,
+            acknowledged,
             CancellationToken.None).ConfigureAwait(false);
         Assert.AreEqual(2, applied.AffectedRows);
         Assert.AreEqual("Lovelace A.", await database.ScalarAsync<string>(
@@ -229,18 +264,372 @@ public sealed class RiderCreationServiceTests
     }
 
     [TestMethod]
+    public async Task CreationOmitsAbsentOptionalPreferenceAndDoesNotRequireItsLookupTable()
+    {
+        await using var database = await CreateDatabaseAsync(preferenceColumnDefinition: null).ConfigureAwait(false);
+        await database.ExecuteAsync("DROP TABLE INF_contract_preference_preset").ConfigureAwait(false);
+        var service = new RiderCreationService();
+
+        MaintenanceCapability capability = await service.CheckCapabilityAsync(
+            database.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsTrue(capability.IsEnabled, string.Join(" ", capability.Reasons));
+        RiderCreationDraft draft = await service.PrepareAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsFalse(draft.Fields.Any(static field => field.Column.Name == "fkIDcontract_preference_preset"));
+        RiderCreationPreview preview = await service.PreviewAsync(
+            database.Path, CreateInput(true), CancellationToken.None).ConfigureAwait(false);
+        Assert.IsFalse(preview.RiderValues.ContainsKey("fkIDcontract_preference_preset"));
+
+        MaintenanceApplyResult result = await service.ApplyAsync(
+            database.Path, preview, CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(2, result.AffectedRows);
+        Assert.AreEqual(2L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
+        await Assert.ThrowsExactlyAsync<ArgumentException>(() => service.PreviewAsync(
+            database.Path,
+            CreateInput(true, riderAdvanced: [KeyValuePair.Create("fkIDcontract_preference_preset", SqliteValue.Integer(4))]),
+            CancellationToken.None)).ConfigureAwait(false);
+    }
+
+    [TestMethod]
+    [DataRow("4", 4L, false)]
+    [DataRow("((+5))", 5L, false)]
+    [DataRow("NULL", 0L, true)]
+    public async Task CreationResolvesAndPersistsEffectivePreferenceLiteralDefault(
+        string expression,
+        long expectedId,
+        bool expectNull)
+    {
+        await using var database = await CreateDatabaseAsync(
+            includeSeedRows: false,
+            preferenceColumnDefinition: $"INTEGER DEFAULT {expression} REFERENCES INF_contract_preference_preset(IDcontract_preference_preset)")
+            .ConfigureAwait(false);
+        await database.ExecuteAsync("INSERT INTO INF_contract_preference_preset VALUES(5,20,40,40)").ConfigureAwait(false);
+        if (expectedId != 4)
+        {
+            await database.ExecuteAsync("DELETE FROM INF_contract_preference_preset WHERE IDcontract_preference_preset=4")
+                .ConfigureAwait(false);
+        }
+
+        var service = new RiderCreationService();
+        RiderCreationDraft draft = await service.PrepareAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        RiderCreationField field = draft.Fields.Single(static field => field.Column.Name == "fkIDcontract_preference_preset");
+        Assert.IsTrue(field.UsesDatabaseDefault);
+        RiderCreationPreview preview = await service.PreviewAsync(
+            database.Path, CreateInput(true), CancellationToken.None).ConfigureAwait(false);
+        SqliteValue expected = expectNull ? SqliteValue.Null : SqliteValue.Integer(expectedId);
+        Assert.AreEqual(expected, field.Value);
+        Assert.AreEqual(expected, preview.RiderValues["fkIDcontract_preference_preset"]);
+
+        if (!expectNull)
+        {
+            await database.ExecuteAsync(
+                $"UPDATE INF_contract_preference_preset SET iWeight_Salary=99 WHERE IDcontract_preference_preset={expectedId}")
+                .ConfigureAwait(false);
+            await Assert.ThrowsExactlyAsync<DBConcurrencyException>(() => service.ApplyAsync(
+                database.Path, preview, CancellationToken.None)).ConfigureAwait(false);
+            Assert.AreEqual(0L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
+            Assert.AreEqual(0L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_contract_cyclist").ConfigureAwait(false));
+            preview = await service.PreviewAsync(database.Path, CreateInput(true), CancellationToken.None).ConfigureAwait(false);
+        }
+
+        MaintenanceApplyResult applied = await service.ApplyAsync(
+            database.Path, preview, CancellationToken.None).ConfigureAwait(false);
+        MaintenanceEditOperation history = Assert.IsInstanceOfType<MaintenanceEditOperation>(applied.HistoryOperation);
+        Assert.AreEqual(expected, history.Changes.Single(static change => change.TableName == "DYN_cyclist")
+            .AfterValues!["fkIDcontract_preference_preset"]);
+        Assert.AreEqual(expectNull ? 1L : 0L, await database.ScalarAsync<long>(
+            "SELECT fkIDcontract_preference_preset IS NULL FROM DYN_cyclist").ConfigureAwait(false));
+        if (!expectNull)
+        {
+            Assert.AreEqual(expectedId, await database.ScalarAsync<long>(
+                "SELECT fkIDcontract_preference_preset FROM DYN_cyclist").ConfigureAwait(false));
+        }
+    }
+
+    [TestMethod]
+    public async Task DefaultedPreferenceUsesOverrideAndGuardsItsSelectedLookupRevision()
+    {
+        await using var database = await CreateDatabaseAsync(
+            preferenceColumnDefinition: "INTEGER DEFAULT 4 REFERENCES INF_contract_preference_preset(IDcontract_preference_preset)")
+            .ConfigureAwait(false);
+        await database.ExecuteAsync("INSERT INTO INF_contract_preference_preset VALUES(5,20,40,40)").ConfigureAwait(false);
+        var service = new RiderCreationService();
+        RiderCreationInput input = CreateInput(
+            true, riderAdvanced: [KeyValuePair.Create("fkIDcontract_preference_preset", SqliteValue.Integer(5))]);
+        RiderCreationPreview preview = await service.PreviewAsync(database.Path, input, CancellationToken.None).ConfigureAwait(false);
+        AssertSqliteInteger(preview.RiderValues, "fkIDcontract_preference_preset", 5);
+        await database.ExecuteAsync("UPDATE INF_contract_preference_preset SET iWeight_Salary=61 WHERE IDcontract_preference_preset=4")
+            .ConfigureAwait(false);
+        await service.ApplyAsync(database.Path, preview, CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(5L, await database.ScalarAsync<long>(
+            "SELECT fkIDcontract_preference_preset FROM DYN_cyclist WHERE IDcyclist=8").ConfigureAwait(false));
+
+        RiderCreationPreview stale = await service.PreviewAsync(database.Path, input, CancellationToken.None).ConfigureAwait(false);
+        await database.ExecuteAsync("UPDATE INF_contract_preference_preset SET iWeight_Salary=21 WHERE IDcontract_preference_preset=5")
+            .ConfigureAwait(false);
+        await Assert.ThrowsExactlyAsync<DBConcurrencyException>(() => service.ApplyAsync(
+            database.Path, stale, CancellationToken.None)).ConfigureAwait(false);
+        Assert.AreEqual(2L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
+        Assert.AreEqual(2L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_contract_cyclist").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task PreferenceOverrideCanReplaceMissingUnusedDefaultBeforeOrAfterPreview(bool removeAfterPreview)
+    {
+        await using var database = await CreateDatabaseAsync(
+            includeSeedRows: false,
+            preferenceColumnDefinition: "INTEGER DEFAULT 4 REFERENCES INF_contract_preference_preset(IDcontract_preference_preset)")
+            .ConfigureAwait(false);
+        await database.ExecuteAsync("INSERT INTO INF_contract_preference_preset VALUES(5,20,40,40)").ConfigureAwait(false);
+        if (!removeAfterPreview)
+        {
+            await database.ExecuteAsync("DELETE FROM INF_contract_preference_preset WHERE IDcontract_preference_preset=4")
+                .ConfigureAwait(false);
+        }
+
+        var service = new RiderCreationService();
+        MaintenanceCapability capability = await service.CheckCapabilityAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsTrue(capability.IsEnabled, string.Join(" ", capability.Reasons));
+        RiderCreationDraft draft = await service.PrepareAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(SqliteValue.Integer(4), draft.Fields.Single(static field =>
+            field.Column.Name == "fkIDcontract_preference_preset").Value);
+        RiderCreationPreview preview = await service.PreviewAsync(
+            database.Path,
+            CreateInput(true, riderAdvanced: [KeyValuePair.Create("fkIDcontract_preference_preset", SqliteValue.Integer(5))]),
+            CancellationToken.None).ConfigureAwait(false);
+        if (removeAfterPreview)
+        {
+            await database.ExecuteAsync("DELETE FROM INF_contract_preference_preset WHERE IDcontract_preference_preset=4")
+                .ConfigureAwait(false);
+        }
+
+        await service.ApplyAsync(database.Path, preview, CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(5L, await database.ScalarAsync<long>(
+            "SELECT fkIDcontract_preference_preset FROM DYN_cyclist").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MissingEffectivePreferenceOverrideIsRejectedBeforeEitherRowIsCreated(bool removeAfterPreview)
+    {
+        await using var database = await CreateDatabaseAsync(
+            includeSeedRows: false,
+            preferenceColumnDefinition: "INTEGER DEFAULT 4 REFERENCES INF_contract_preference_preset(IDcontract_preference_preset)")
+            .ConfigureAwait(false);
+        await database.ExecuteAsync("INSERT INTO INF_contract_preference_preset VALUES(5,20,40,40)").ConfigureAwait(false);
+        var service = new RiderCreationService();
+        RiderCreationInput input = CreateInput(
+            true, riderAdvanced: [KeyValuePair.Create("fkIDcontract_preference_preset", SqliteValue.Integer(5))]);
+        RiderCreationPreview? preview = removeAfterPreview
+            ? await service.PreviewAsync(database.Path, input, CancellationToken.None).ConfigureAwait(false)
+            : null;
+        await database.ExecuteAsync("DELETE FROM INF_contract_preference_preset WHERE IDcontract_preference_preset=5")
+            .ConfigureAwait(false);
+
+        if (preview is null)
+        {
+            await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.PreviewAsync(
+                database.Path, input, CancellationToken.None)).ConfigureAwait(false);
+        }
+        else
+        {
+            await Assert.ThrowsExactlyAsync<DBConcurrencyException>(() => service.ApplyAsync(
+                database.Path, preview, CancellationToken.None)).ConfigureAwait(false);
+        }
+
+        Assert.AreEqual(0L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
+        Assert.AreEqual(0L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_contract_cyclist").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task NullablePreferenceAcceptsExplicitNullWithOrWithoutDatabaseDefault(bool useDatabaseDefault)
+    {
+        string definition = "INTEGER "
+            + (useDatabaseDefault ? "DEFAULT 4 " : string.Empty)
+            + "REFERENCES INF_contract_preference_preset(IDcontract_preference_preset)";
+        await using var database = await CreateDatabaseAsync(preferenceColumnDefinition: definition).ConfigureAwait(false);
+        var service = new RiderCreationService();
+        RiderCreationPreview preview = await service.PreviewAsync(
+            database.Path,
+            CreateInput(true, riderAdvanced: [KeyValuePair.Create("fkIDcontract_preference_preset", SqliteValue.Null)]),
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(SqliteValueKind.Null, preview.RiderValues["fkIDcontract_preference_preset"].Kind);
+        await service.ApplyAsync(database.Path, preview, CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(1L, await database.ScalarAsync<long>(
+            "SELECT fkIDcontract_preference_preset IS NULL FROM DYN_cyclist WHERE IDcyclist=8").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    public async Task PreferenceOverridesRejectNullForRequiredFieldsInvalidTypesAndMissingReferencesBeforeMutation()
+    {
+        await using var database = await CreateDatabaseAsync(
+            preferenceColumnDefinition: "INTEGER NOT NULL DEFAULT 4 REFERENCES INF_contract_preference_preset(IDcontract_preference_preset)")
+            .ConfigureAwait(false);
+        var service = new RiderCreationService();
+        foreach (SqliteValue invalid in new[] { SqliteValue.Null, SqliteValue.Text("4"), SqliteValue.Real(4), SqliteValue.Integer(999) })
+        {
+            await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.PreviewAsync(
+                database.Path,
+                CreateInput(true, riderAdvanced: [KeyValuePair.Create("fkIDcontract_preference_preset", invalid)]),
+                CancellationToken.None)).ConfigureAwait(false);
+        }
+
+        Assert.AreEqual(1L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
+        Assert.AreEqual(1L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_contract_cyclist").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    [DataRow("(2 + 2)")]
+    [DataRow("(abs(-4))")]
+    [DataRow("'4'")]
+    [DataRow("CURRENT_TIMESTAMP")]
+    [DataRow("9223372036854775808")]
+    public async Task CapabilityReportsUnresolvablePreferenceDefaultBeforePrepareOrPreview(string expression)
+    {
+        await using var database = await CreateDatabaseAsync(
+            includeSeedRows: false,
+            preferenceColumnDefinition: $"INTEGER DEFAULT {expression}").ConfigureAwait(false);
+        var service = new RiderCreationService();
+        MaintenanceCapability capability = await service.CheckCapabilityAsync(
+            database.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsFalse(capability.IsEnabled);
+        Assert.IsTrue(capability.Reasons.Any(static reason =>
+            reason.Contains("cannot safely resolve the database default expression", StringComparison.Ordinal)
+            && reason.Contains("DYN_cyclist.fkIDcontract_preference_preset", StringComparison.Ordinal)));
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.PrepareAsync(
+            database.Path, CancellationToken.None)).ConfigureAwait(false);
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.PreviewAsync(
+            database.Path, CreateInput(true), CancellationToken.None)).ConfigureAwait(false);
+        Assert.AreEqual(0L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    public async Task PresentPreferenceRequiresItsLookupSchemaButChecksEffectiveDefaultsAtPreview()
+    {
+        var service = new RiderCreationService();
+        await using var missingLookup = await CreateDatabaseAsync(preferenceColumnDefinition: "INTEGER").ConfigureAwait(false);
+        await missingLookup.ExecuteAsync("DROP TABLE INF_contract_preference_preset").ConfigureAwait(false);
+        MaintenanceCapability missingCapability = await service.CheckCapabilityAsync(
+            missingLookup.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsFalse(missingCapability.IsEnabled);
+        CollectionAssert.Contains(missingCapability.MissingTables.ToArray(), "INF_contract_preference_preset");
+
+        await using var missingDefault = await CreateDatabaseAsync(
+            includeSeedRows: false,
+            preferenceColumnDefinition: "INTEGER DEFAULT 999").ConfigureAwait(false);
+        MaintenanceCapability defaultCapability = await service.CheckCapabilityAsync(
+            missingDefault.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsTrue(defaultCapability.IsEnabled, string.Join(" ", defaultCapability.Reasons));
+        await service.PrepareAsync(missingDefault.Path, CancellationToken.None).ConfigureAwait(false);
+        InvalidDataException defaultFailure = await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.PreviewAsync(
+            missingDefault.Path, CreateInput(true), CancellationToken.None)).ConfigureAwait(false);
+        StringAssert.Contains(defaultFailure.Message, "effective default", StringComparison.Ordinal);
+        StringAssert.Contains(defaultFailure.Message, "999", StringComparison.Ordinal);
+        StringAssert.Contains(defaultFailure.Message, "Choose an existing", StringComparison.Ordinal);
+        await service.PreviewAsync(
+            missingDefault.Path,
+            CreateInput(true, riderAdvanced: [KeyValuePair.Create("fkIDcontract_preference_preset", SqliteValue.Integer(4))]),
+            CancellationToken.None).ConfigureAwait(false);
+
+        await using var requiredNull = await CreateDatabaseAsync(
+            includeSeedRows: false,
+            preferenceColumnDefinition: "INTEGER NOT NULL DEFAULT NULL").ConfigureAwait(false);
+        MaintenanceCapability nullCapability = await service.CheckCapabilityAsync(
+            requiredNull.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsTrue(nullCapability.IsEnabled, string.Join(" ", nullCapability.Reasons));
+        await service.PrepareAsync(requiredNull.Path, CancellationToken.None).ConfigureAwait(false);
+        InvalidDataException nullFailure = await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.PreviewAsync(
+            requiredNull.Path, CreateInput(true), CancellationToken.None)).ConfigureAwait(false);
+        StringAssert.Contains(nullFailure.Message, "NULL is not allowed", StringComparison.Ordinal);
+        await service.PreviewAsync(
+            requiredNull.Path,
+            CreateInput(true, riderAdvanced: [KeyValuePair.Create("fkIDcontract_preference_preset", SqliteValue.Integer(4))]),
+            CancellationToken.None).ConfigureAwait(false);
+    }
+
+    [TestMethod]
+    [DataRow("INTEGER REFERENCES DYN_team(IDteam)", "", "declared foreign key")]
+    [DataRow("INTEGER REFERENCES INF_contract_preference_preset(iWeight_Salary)", "", "declared foreign key")]
+    [DataRow("INTEGER", "FOREIGN KEY(fkIDcontract_preference_preset, iContract_fidelity) REFERENCES INF_contract_preference_preset(IDcontract_preference_preset, iWeight_Role)", "composite foreign key")]
+    public async Task CapabilityRejectsPreferenceRelationshipsOutsideSupportedSingleColumnTarget(
+        string columnDefinition,
+        string constraint,
+        string expectedReason)
+    {
+        await using var database = await CreateDatabaseAsync(
+            includeSeedRows: false,
+            riderExtraColumn: constraint,
+            preferenceColumnDefinition: columnDefinition).ConfigureAwait(false);
+        await database.ExecuteAsync("""
+            CREATE UNIQUE INDEX preference_salary ON INF_contract_preference_preset(iWeight_Salary);
+            CREATE UNIQUE INDEX preference_pair ON INF_contract_preference_preset(IDcontract_preference_preset, iWeight_Role)
+            """).ConfigureAwait(false);
+        var service = new RiderCreationService();
+        MaintenanceCapability capability = await service.CheckCapabilityAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsFalse(capability.IsEnabled);
+        Assert.IsTrue(capability.Reasons.Any(reason => reason.Contains(expectedReason, StringComparison.Ordinal)
+            && reason.Contains("DYN_cyclist.fkIDcontract_preference_preset", StringComparison.Ordinal)));
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.PrepareAsync(
+            database.Path, CancellationToken.None)).ConfigureAwait(false);
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.PreviewAsync(
+            database.Path, CreateInput(true), CancellationToken.None)).ConfigureAwait(false);
+        Assert.AreEqual(0L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    public async Task PreferenceCanReferenceTheSupportedImplicitSingleColumnPrimaryKey()
+    {
+        await using var database = await CreateDatabaseAsync(
+            preferenceColumnDefinition: "INTEGER REFERENCES INF_contract_preference_preset").ConfigureAwait(false);
+        var service = new RiderCreationService();
+        RiderCreationPreview preview = await service.PreviewAsync(database.Path, CreateInput(true), CancellationToken.None).ConfigureAwait(false);
+        AssertSqliteInteger(preview.RiderValues, "fkIDcontract_preference_preset", 4);
+        await service.ApplyAsync(database.Path, preview, CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(4L, await database.ScalarAsync<long>(
+            "SELECT fkIDcontract_preference_preset FROM DYN_cyclist WHERE IDcyclist=8").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    [DataRow("FOREIGN KEY(fkIDworkplan, iContract_fidelity) REFERENCES STA_workplan(IDworkplan, variant)")]
+    [DataRow("FOREIGN KEY(fkIDworkplan) REFERENCES STA_workplan(IDworkplan), FOREIGN KEY(fkIDworkplan) REFERENCES alternate_plan(IDplan)")]
+    public async Task AdvancedRiderFieldWithCompositeOrAmbiguousRelationshipRemainsRaw(string constraint)
+    {
+        await using var database = await CreateDatabaseAsync(
+            riderExtraColumn: constraint, includeSeedRows: false).ConfigureAwait(false);
+        await database.ExecuteAsync("""
+            CREATE TABLE STA_workplan(IDworkplan INTEGER UNIQUE, variant INTEGER, name TEXT, PRIMARY KEY(IDworkplan, variant));
+            CREATE TABLE alternate_plan(IDplan INTEGER PRIMARY KEY, name TEXT)
+            """).ConfigureAwait(false);
+        var service = new RiderCreationService();
+        RiderCreationDraft draft = await service.PrepareAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        RiderCreationField workPlan = draft.Fields.Single(static field => field.Column.Name == "fkIDworkplan");
+        Assert.IsTrue(workPlan.IsEditable);
+        Assert.IsNull(workPlan.LookupTarget);
+
+        var stalePicker = new RiderLookupTarget(
+            "DYN_cyclist", "fkIDworkplan", "STA_workplan", "IDworkplan", "name", "Work plan");
+        await Assert.ThrowsExactlyAsync<ArgumentException>(() => service.SearchLookupAsync(
+            database.Path, stalePicker, string.Empty, 10, CancellationToken.None)).ConfigureAwait(false);
+    }
+
+    [TestMethod]
     public async Task CreationRejectsStaleLookupsAndMaximaWithoutPartialRows()
     {
         await using var database = await CreateDatabaseAsync().ConfigureAwait(false);
         var service = new RiderCreationService();
         RiderCreationPreview changedLookup = await service.PreviewAsync(
             database.Path,
-            CreateInput(true),
+            CreateInput(acknowledgeMissingLimits: false),
             CancellationToken.None).ConfigureAwait(false);
         await database.ExecuteAsync("UPDATE DYN_team SET gene_sz_name='Renamed' WHERE IDteam=11")
             .ConfigureAwait(false);
+        Assert.AreEqual("Destination Team", changedLookup.Team.DisplayName);
         await Assert.ThrowsExactlyAsync<DBConcurrencyException>(() => service.ApplyAsync(
-            database.Path, changedLookup, CancellationToken.None)).ConfigureAwait(false);
+            database.Path, changedLookup.AcknowledgeMissingLimits(), CancellationToken.None)).ConfigureAwait(false);
 
         RiderCreationPreview changedAdvancedLookup = await service.PreviewAsync(
             database.Path,
@@ -248,13 +637,14 @@ public sealed class RiderCreationServiceTests
                 true,
                 riderAdvanced:
                 [
-                    KeyValuePair.Create("value_f_current_ability", SqliteValue.Real(77.5)),
+                    KeyValuePair.Create(RiderCurrentAbility.ColumnName.ToUpperInvariant(), SqliteValue.Real(77.5)),
                     KeyValuePair.Create("fkIDcyclist_state", SqliteValue.Integer(1))
                 ],
                 gameDisplayName: "Custom A."),
             CancellationToken.None).ConfigureAwait(false);
         Assert.AreEqual("Custom A.", changedAdvancedLookup.RiderValues["gene_sz_firstlastname"].TextValue);
-        Assert.AreEqual(77.5, changedAdvancedLookup.RiderValues["value_f_current_ability"].RealValue);
+        Assert.IsFalse(changedAdvancedLookup.UsesAutomaticCurrentAbility);
+        Assert.AreEqual(77.5, changedAdvancedLookup.RiderValues[RiderCurrentAbility.ColumnName].RealValue);
         AssertSqliteInteger(changedAdvancedLookup.RiderValues, "fkIDcyclist_state", 1);
         await database.ExecuteAsync("UPDATE STA_cyclist_state SET CONSTANT='AVAILABLE' WHERE IDcyclist_state=1")
             .ConfigureAwait(false);
@@ -302,7 +692,7 @@ public sealed class RiderCreationServiceTests
         await triggerDatabase.ExecuteAsync(
             "CREATE TRIGGER unsafe_insert AFTER INSERT ON DYN_contract_cyclist BEGIN UPDATE DYN_team SET gene_sz_name='side effect' WHERE IDteam=11; END")
             .ConfigureAwait(false);
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.ApplyAsync(
+        await Assert.ThrowsExactlyAsync<UnsafeRowMutationException>(() => service.ApplyAsync(
             triggerDatabase.Path, triggerPreview, CancellationToken.None)).ConfigureAwait(false);
         Assert.AreEqual("Destination Team", await triggerDatabase.ScalarAsync<string>(
             "SELECT gene_sz_name FROM DYN_team WHERE IDteam=11").ConfigureAwait(false));
@@ -313,8 +703,50 @@ public sealed class RiderCreationServiceTests
             .ConfigureAwait(false);
         RiderCreationPreview cascadePreview = await service.PreviewAsync(
             cascadeDatabase.Path, CreateInput(true), CancellationToken.None).ConfigureAwait(false);
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.ApplyAsync(
+        await Assert.ThrowsExactlyAsync<UnsafeRowMutationException>(() => service.ApplyAsync(
             cascadeDatabase.Path, cascadePreview, CancellationToken.None)).ConfigureAwait(false);
+    }
+
+    [TestMethod]
+    public async Task CreationAbortsReplacementConflictAndPreservesTheExistingPair()
+    {
+        await using var database = await CreateDatabaseAsync(
+            riderExtraColumn: "UNIQUE(gene_sz_firstlastname) ON CONFLICT REPLACE",
+            contractRiderForeignKey: false).ConfigureAwait(false);
+        var service = new RiderCreationService();
+        RiderCreationPreview preview = await service.PreviewAsync(
+            database.Path, CreateInput(true, gameDisplayName: "Rider S."), CancellationToken.None).ConfigureAwait(false);
+
+        await Assert.ThrowsExactlyAsync<SqliteException>(() => service.ApplyAsync(
+            database.Path, preview, CancellationToken.None)).ConfigureAwait(false);
+
+        Assert.AreEqual(7L, await database.ScalarAsync<long>(
+            "SELECT IDcyclist FROM DYN_cyclist WHERE gene_sz_firstlastname='Rider S.' AND fkIDcontract=20").ConfigureAwait(false));
+        Assert.AreEqual(1L, await database.ScalarAsync<long>(
+            "SELECT COUNT(*) FROM DYN_contract_cyclist WHERE IDcontract_cyclist=20 AND fkIDcyclist=7").ConfigureAwait(false));
+        Assert.AreEqual(1L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
+        Assert.AreEqual(1L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_contract_cyclist").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    public async Task AmbiguousOptionalRaceContextDoesNotDuplicateOrInvalidateTheRace()
+    {
+        await using var database = await CreateDatabaseAsync().ConfigureAwait(false);
+        await database.ExecuteAsync("""
+            ALTER TABLE STA_race_class RENAME TO seed_race_class;
+            CREATE VIEW STA_race_class AS
+                SELECT * FROM seed_race_class UNION ALL SELECT * FROM seed_race_class WHERE IDrace_class=1;
+            """).ConfigureAwait(false);
+        var service = new RiderCreationService();
+        RiderCreationDraft draft = await service.PrepareAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        RiderLookupOption option = Assert.ContainsSingle(await service.SearchLookupAsync(
+            database.Path, Lookup(draft, "DYN_cyclist", "gene_ilist_fkIDfavorite_races"),
+            "11", 10, CancellationToken.None).ConfigureAwait(false));
+        Assert.AreEqual("Ronde van Vlaanderen · BELGIUM · 11", option.ToString());
+
+        RiderCreationPreview preview = await service.PreviewAsync(
+            database.Path, CreateInput(true, favoriteRaceIds: [11]), CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(option, Assert.ContainsSingle(preview.FavoriteRaces));
     }
 
     [TestMethod]
@@ -462,14 +894,21 @@ public sealed class RiderCreationServiceTests
     private static Task<SqliteTestDatabase> CreateDatabaseAsync(
         string riderIdentitySuffix = "",
         string riderExtraColumn = "",
-        bool includeSeedRows = true)
+        bool includeSeedRows = true,
+        string? preferenceColumnDefinition = "INTEGER REFERENCES INF_contract_preference_preset(IDcontract_preference_preset)",
+        bool contractRiderForeignKey = true)
     {
         string extra = string.IsNullOrWhiteSpace(riderExtraColumn)
             ? string.Empty
             : $", {riderExtraColumn}";
         string riderSchema = RiderSchema
             .Replace("__IDENTITY_SUFFIX__", riderIdentitySuffix, StringComparison.Ordinal)
-            .Replace("__EXTRA_COLUMN__", extra, StringComparison.Ordinal);
+            .Replace("__PREFERENCE_COLUMN__", preferenceColumnDefinition is null
+                ? string.Empty
+                : $"fkIDcontract_preference_preset {preferenceColumnDefinition},", StringComparison.Ordinal)
+            .Replace("__EXTRA_COLUMN__", extra, StringComparison.Ordinal)
+            .Replace("__CONTRACT_RIDER_FK__", contractRiderForeignKey ? " REFERENCES DYN_cyclist(IDcyclist)" : string.Empty,
+                StringComparison.Ordinal);
         return SqliteTestDatabase.CreateAsync(
             riderSchema,
             SupportingSchema,
@@ -512,7 +951,7 @@ public sealed class RiderCreationServiceTests
             gene_i_date_last_breakaway INTEGER,
             fkIDworkplan INTEGER,
             gene_i_ptmap INTEGER,
-            fkIDcontract_preference_preset INTEGER REFERENCES INF_contract_preference_preset(IDcontract_preference_preset),
+            __PREFERENCE_COLUMN__
             iContract_fidelity INTEGER,
             value_f_potentiel REAL,
             gene_ilist_fkIDfavorite_races TEXT,
@@ -523,7 +962,7 @@ public sealed class RiderCreationServiceTests
             __EXTRA_COLUMN__);
         CREATE TABLE DYN_contract_cyclist(
             IDcontract_cyclist INTEGER PRIMARY KEY,
-            fkIDcyclist INTEGER NOT NULL UNIQUE REFERENCES DYN_cyclist(IDcyclist),
+            fkIDcyclist INTEGER NOT NULL UNIQUE__CONTRACT_RIDER_FK__,
             fkIDteam INTEGER NOT NULL REFERENCES DYN_team(IDteam),
             fkIDprevteam INTEGER NOT NULL REFERENCES DYN_team(IDteam),
             finan_i_period_wage INTEGER NOT NULL,

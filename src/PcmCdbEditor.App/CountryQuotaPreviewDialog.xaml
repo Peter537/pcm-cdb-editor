@@ -44,6 +44,7 @@
               FontWeight="SemiBold"
               Text="{Binding CanonicalCode}"
               TextWrapping="Wrap" />
+          <TextBlock Text="{Binding CountryIdentityText}" TextWrapping="Wrap" />
           <TextBlock
               FontSize="12"
               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
@@ -97,6 +98,7 @@
           </Grid.ColumnDefinitions>
           <StackPanel Spacing="2">
             <TextBlock FontWeight="SemiBold" Text="{Binding CanonicalCode}" TextWrapping="Wrap" />
+            <TextBlock Text="{Binding CountryIdentityText}" TextWrapping="Wrap" />
             <TextBlock
                 FontSize="12"
                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"

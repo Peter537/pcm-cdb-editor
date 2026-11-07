@@ -50,7 +50,7 @@ The app scans its arguments in order and opens the first value whose name ends i
 2. Choose a table or view. The catalog exposes discovered columns, keys, foreign keys, and edit capability. Views, virtual tables, and tables without a safe primary-key or `rowid` identity remain read-only.
 3. Browse, search, filter, and sort the isolated SQLite working copy. With a finite row choice, counts begin as **Unknown** while they are calculated independently. **All rows** reports the exact count after its complete result has loaded.
 4. Edit identified table rows, then use Undo or Redo if needed. Closing a table tab does not discard database changes, but it does discard that tab's in-memory sort.
-5. Choose **Save** to replace the current CDB destination, or **Save as** to choose another destination. Saving exports to a same-directory staging file, requires a non-empty output, backs up an existing non-empty destination, and then replaces it. A new or zero-byte destination has no prior content to back up.
+5. Choose **Save** to replace the current CDB destination, or **Save as** to choose another destination. The editor checks the destination, stages a non-empty CDB in the same directory, and preserves the displaced file when it replaces an existing destination. A new file or an unchanged zero-byte picker placeholder has no prior content to back up.
 
 The staged-output check confirms only that the exporter produced a non-empty file. It does not guarantee that every Pro Cycling Manager release will accept the result.
 
@@ -61,24 +61,34 @@ A failure before destination replacement preserves the session's prior dirty sta
 - Search applies to the current table. `%`, `_`, and `\` are treated as literal substring characters rather than SQLite wildcard syntax.
 - Quick filters use the selected column's discovered type. Unsupported numeric conversions are rejected rather than silently coerced.
 - Advanced filters combine the positive rule numbers shown in the filter editor with `AND`, `OR`, and parentheses. `AND` binds more tightly than `OR`; for example, `1 AND (2 OR 3)`. Unknown rule numbers, malformed operators, and unbalanced parentheses are rejected.
-- Use **Sort** to edit or clear the ordered multi-column sort. Click or tap a visible column header to make it priority 1; a newly promoted column starts descending, and activating the same primary header again toggles between ascending and descending. Existing secondary priorities keep their relative order, while the single header arrow shows only priority 1.
+- Use **Sort** to edit or clear the ordered multi-column sort. Click or tap a visible column header to make its sort target priority 1. A newly promoted target starts descending, and repeating the same primary sort target toggles direction. Existing secondary priorities keep their relative order, and the single header arrow shows priority 1.
 - Header and dialog sorting run against the database, return finite paging to the first page, and retain the current search, filters, and row choice. The result is ordered across pages, or across the complete materialized result in **All rows**, rather than only within the rows previously loaded.
 - Sorting remains in memory for each open table tab. Switching among open tabs retains their individual sorts. Closing and reopening a table, opening or replacing the CDB, or restarting the application starts the table unsorted.
-- Foreign-key display modes use the discovered schema. When a header shows resolved foreign-key text, header sorting uses that displayed text when the projection is available; displaying a referenced name never changes the stored key.
-- **Rows to show** offers **100 rows**, **250 rows**, **500 rows**, and **All rows**, in that order. The three finite choices use bounded paging and are saved as the global preference.
+- **Preferences** offers **IDs only**, **Names only**, and **Names and IDs**. Combined cells show the name followed by the stored key. Hover over a clipped cell to see the full value. In either name mode, an unresolved relationship shows the stored value and its tooltip explains why.
+- Composite or ambiguous relationships keep the stored key and use the ordinary typed editor on editable rows. A recognized single-column relationship can still offer raw entry when a particular key lacks a matching record or readable label.
+- Search matches both stored values and supported related names. Digits are matched as text. **Filters** and **Sort** offer separate **stored value** and **related name** choices for supported relationships.
+- A relationship header uses the related name in either name mode and the stored key in **IDs only**. A display change retains any sort already applied. The **Sort** button's description identifies the active targets and directions.
+- **Rows to show** offers **100 rows**, **250 rows**, **500 rows**, and **All rows (slower)**. A successfully loaded finite choice uses bounded paging and becomes the global default when the preference is saved.
 - **All rows** runs one query without a row cap and materializes every row matching the current search and filters in the current database sort order. It can require substantial time and memory. Loading is cancellable, and rows are replaced only after the complete result succeeds; cancellation, failure, or a superseding request leaves the previous completed view intact.
 - In **All rows**, the status area shows **All rows**, the exact count comes from the completed result, and **Previous** and **Next** remain visible but disabled. Search, filters, sorting, edits, refreshes, foreign-key display changes, and tab switching retain the choice.
 - **All rows** belongs only to the currently open table tab. Closing and reopening that tab, or closing the editor, discards it; new tabs use the last finite preference. Loading, filtering, sorting, and finite-page counting remain cancellable; a superseded request cannot replace the newer result.
+- The query summary shows the completed search, applied filter, and sort. **Reset query** clears these and returns to the first page. **Refresh** reruns the current query against the working database. **Reset column layout** in the command menu restores default widths and order for that table.
+- Move to a cell to inspect the current row's stored values, SQLite storage classes, and available related names. In a narrow window, open **Row details** in the command menu. **Edit row** and **Delete row** identify the one current row they affect. Checked rows are counted separately. Rows without stable keys can be inspected, and their edit and delete actions are disabled.
 
 ## Edit safely
 
-- Inline editing preserves the cell's current Integer, Real, or Text SQLite storage class.
-- Inline values are validated before TableView commits, but the database mutation and grid refresh begin only after the control reports that editing has ended. Double-click, Enter, F2, click-away, and Escape therefore stay within the native cell-edit lifecycle.
+- Inline editing preserves the cell's current Integer, Real, or Text SQLite storage class. The app validates the value before TableView commits and begins the database operation after the control reports that editing has ended.
+- On a supported relationship cell, press **Enter**, **F2**, or double-click to search for a referenced value. Results show a name when available, the typed key, and identifying context. Choose **Apply selected key**, or use **Enter raw key** to type a value or set **NULL** where allowed. **Escape** cancels the picker.
 - **Edit row** can explicitly write Integer, Real, Text, or NULL values.
+- In **Edit row**, use **Choose referenced value** next to a supported field. **Use selected key** fills the field in the row draft. **Update** applies the draft, and the editor checks that the chosen reference still resolves before committing. Raw entries continue to follow the database's constraints.
+- Move to a relationship cell and choose **Open referenced row** in the command menu. This also works from a read-only source row when the key identifies a supported target. If the current cell has no supported reference, the editor asks which relationship to open from the current row. **Return to source** restores the original table, query, and position.
+- Edit and Insert keep all draft fields open when a typed value or database constraint is rejected. Review the message, correct the draft, and retry, or cancel without applying it.
 - All mutations use transactions. Updates, deletes, Undo, and Redo use typed row-revision or row-presence guards; maintenance uses snapshot fingerprints; inserts validate their assigned or returned identity. Stale state is rejected instead of overwriting newer data.
 - BLOB values show their type and size but cannot be edited. Session history may still contain complete typed row snapshots, including BLOB data required for Undo.
-- Inserts must provide an identity when SQLite cannot safely return one; generated composite or non-integer identities are not guessed.
-- Deletion is refused when the target has a `DELETE` trigger or an inbound foreign key using `CASCADE`, `SET NULL`, or `SET DEFAULT`. Those side effects cannot be represented safely by the row-level Undo record.
+- Inserts read the actual typed identity returned by SQLite; declared keys are never guessed from an internal row ID. NULL or conflicting identities are rejected before commit.
+- Insert and Delete require both actions to be reversible. The app refuses INSERT/DELETE triggers, `AUTOINCREMENT` counters, and inbound `ON DELETE CASCADE`, `SET NULL`, or `SET DEFAULT` actions that row history cannot restore. Updates refuse UPDATE triggers and side-effecting `ON UPDATE` actions on changed referenced keys. Undo and Redo apply the same checks.
+
+The command row keeps **Saved**, **Unsaved changes**, or **Unsaved changes · incomplete history** visible while other operations run. Open **Changes** to inspect recorded fields, before and after values, and the next Undo and Redo. Open **Save details** for the destination, the last backup path, and the backup folder. If the destination changed outside the editor, choose **Save as**, explicitly overwrite the observed version, or cancel. An uncreated rider draft has a separate **Keep editing** or **Discard rider draft** decision when closing or replacing the session.
 
 ## Preferences
 
@@ -86,7 +96,7 @@ Preferences include system, light, and dark themes; compact or comfortable densi
 
 Saving another preference does not switch a tab out of **All rows**. Explicitly changing the finite page-size preference may apply that finite choice to the selected tab.
 
-`settings.json` does not store database row contents. It can store up to 12 absolute recent-file paths, so use **Clear recent files** before sharing a settings file or screenshot when those paths are sensitive.
+`settings.json` does not store database row contents. It can store up to 12 absolute recent-file paths. To remove them from the file, choose **Clear recent files** and then **Save preferences**.
 
 ## Local data, recovery, and retention
 
@@ -94,11 +104,11 @@ The app stores per-user data under `%LOCALAPPDATA%\PcmCdbEditor`:
 
 - `settings.json` contains preferences, recent absolute paths, and saved column layouts;
 - `Sessions` contains isolated CDB and SQLite working files, metadata with source and destination paths, and `edit-history.json`;
-- `Backups` contains copies made before replacing existing non-empty destinations.
+- `Backups` normally contains CDBs displaced by an atomic replacement. **Save details** shows the actual path if a backup had to stay beside the destination.
 
-Undo history contains complete typed row snapshots and can encode BLOB values. Treat the entire directory as sensitive: do not commit it or attach it to an issue. At startup, the app offers interrupted dirty sessions with **Resume**, **Discard**, and **Not now**.
+Undo history contains complete typed row snapshots and can encode BLOB values. Keep this directory out of commits and issue attachments. **Recovery** lists available working sessions with their full paths and update times. Select the intended session and choose **Resume selected** or **Discard selected**. **Recent databases** is in command overflow and appears in the empty workspace.
 
-Normal close and discard paths clean the active session, but there is no age- or size-based retention limit for history, sessions, or backups, and uninstall preserves this directory. Backups are not removed automatically. With the application closed, you may remove backups and stale sessions only after confirming that none is needed for recovery. Deleting the whole directory also removes preferences, recents, column layouts, recovery data, and backups.
+Normal close and discard clean the active session. **Clean completed sessions** in Recovery removes eligible completed sessions after confirmation. The app keeps recoverable sessions and backups without age- or size-based expiration. Uninstall preserves the data directory.
 
 ## Maintenance tools
 
@@ -106,7 +116,7 @@ The primary navigation includes a dedicated **Create Rider** wizard. **Maintenan
 
 For rider recovery, choose **Entire team** to resolve the current `DYN_cyclist.fkIDteam` roster, or **Rider IDs** to enter positive IDs separated by commas, semicolons, or whitespace. **Use selected rows** copies suitable IDs from the table grid when convenient; ordinary row selection does not overwrite manual input. Team lookup is optional for recovery, so manual IDs remain usable when `DYN_team` is absent.
 
-Create Rider has six steps: Identity, Profile, Abilities, Contract, Advanced, and Review. Name/ID pickers resolve teams, regions with country context, rider types, favorite races, and other unambiguous relationships. The game display name updates as `Last name F.` until you edit it manually; **Reset to generated** resumes that rule. Favorite races are optional and retain their selected order. Enter all 14 Current abilities from 50 through 85; Limits use the same range but may be blank. Potential accepts half-point values from 0.5 through 6.0. A blank Limit becomes SQLite `NULL` and requires an explicit acknowledgement because in-game generation is unverified. Review shows generated IDs, warnings, the game display name, potential, favorite races, and both complete typed insert maps before the final confirmation. The wizard creates only the core `DYN_cyclist` and `DYN_contract_cyclist` rows; it does not synthesize fitness, season, result, ranking, transfer, or related records. See [Maintenance tools](specialized-tools.md) for the exact schema, defaults, role codes, and transaction rules.
+Create Rider has six steps: Identity, Profile, Abilities, Contract, Advanced, and Review. Name/ID pickers resolve teams, regions with country context, rider types, favorite races, and other unambiguous relationships. The game display name updates as `Last name F.` until you edit it manually. **Reset to generated** resumes that rule. Favorite races are optional and retain their selected order. Enter all 14 Current abilities from 50 through 85. Limits use the same range but may be blank. A blank Limit becomes SQLite `NULL` in the working copy. The bundled converter can reopen it as zero after saving to CDB, so review requires an explicit acknowledgement. Potential accepts half-point values from 0.5 through 6.0. Review shows the generated IDs, profile, ability values, favorite races, warnings, and both complete typed insert maps. The creation receipt opens the generated rider and contract and provides a **Save CDB** action. The wizard creates only the core `DYN_cyclist` and `DYN_contract_cyclist` rows. See [Maintenance tools](specialized-tools.md) for the exact schema, defaults, role codes, and transaction rules.
 
 ## Troubleshooting
 
@@ -124,7 +134,7 @@ Confirm that the input exists, is non-empty, and ends in `.cdb`. Verify the bund
 
 ### A table or operation is read-only
 
-Views, virtual tables, and tables without a safe identity are browse-only. BLOB cells cannot be edited. A delete may also be blocked by a `DELETE` trigger or a cascading or value-setting inbound foreign key. The app reports the applicable reason rather than bypassing the guard.
+Views, virtual tables, and tables without a safe identity are browse-only. BLOB cells cannot be edited. Writes may also be blocked by triggers, allocation counters, or cascading or value-setting inbound foreign keys whose effects Undo cannot restore. The app reports the applicable reason rather than bypassing the guard.
 
 ### A maintenance tool is unavailable
 

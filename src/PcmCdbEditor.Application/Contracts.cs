@@ -45,7 +45,14 @@ public interface ICdbConverter
 
 public sealed record WorkspaceOpenRequest(string SourceCdbPath);
 
-public sealed record WorkspaceSaveResult(EditorSessionState Session, string? BackupPath);
+public sealed record WorkspaceSaveResult(EditorSessionState Session, string? BackupPath)
+{
+    /// <summary>
+    /// The save committed, but the displaced destination could not be verified
+    /// as the version authorized before replacement.
+    /// </summary>
+    public bool DestinationChangedAtCommit { get; init; }
+}
 
 public sealed record RecoverableSession(EditorSessionState Session, string Description);
 
@@ -53,19 +60,31 @@ public interface IWorkspaceService
 {
     Task<EditorSessionState> OpenAsync(WorkspaceOpenRequest request, CancellationToken cancellationToken);
 
-    Task<EditorSessionState> RecoverAsync(Guid sessionId, CancellationToken cancellationToken);
+    Task<EditorSessionState> RecoverAsync(Guid sessionId, CancellationToken cancellationToken, DateTimeOffset? expectedUpdatedAtUtc = null);
 
-    Task<WorkspaceSaveResult> SaveAsync(EditorSessionState session, CancellationToken cancellationToken);
+    Task<SaveDestinationSnapshot> InspectSaveDestinationAsync(string path, CancellationToken cancellationToken);
 
-    Task<WorkspaceSaveResult> SaveAsAsync(EditorSessionState session, string destinationCdbPath, CancellationToken cancellationToken);
+    Task<WorkspaceSaveResult> SaveAsync(
+        EditorSessionState session,
+        CancellationToken cancellationToken,
+        SaveDestinationSnapshot? confirmedDestination = null);
+
+    Task<WorkspaceSaveResult> SaveAsAsync(
+        EditorSessionState session,
+        string destinationCdbPath,
+        CancellationToken cancellationToken,
+        SaveDestinationSnapshot? confirmedDestination = null);
 
     Task<EditorSessionState> MarkDirtyAsync(EditorSessionState session, CancellationToken cancellationToken);
 
     Task CloseAsync(EditorSessionState session, bool discardDirtySession, CancellationToken cancellationToken);
 
+    /// <summary>Releases this editor's ownership while keeping the working files available for recovery.</summary>
+    void ReleaseSession(Guid sessionId);
+
     Task<IReadOnlyList<RecoverableSession>> GetRecoverableSessionsAsync(CancellationToken cancellationToken);
 
-    Task DiscardRecoverableSessionAsync(Guid sessionId, CancellationToken cancellationToken);
+    Task DiscardRecoverableSessionAsync(Guid sessionId, DateTimeOffset expectedUpdatedAtUtc, CancellationToken cancellationToken);
 
     Task CleanCompletedSessionsAsync(CancellationToken cancellationToken);
 }
@@ -100,9 +119,22 @@ public interface ITableDataStore
     Task<EditResult> DeleteRowAsync(string sqlitePath, DatabaseSchemaCatalog catalog, RowDeletionOperation operation, CancellationToken cancellationToken);
 }
 
+public interface IRelationshipLookup
+{
+    Task<RelationshipLookupPage> SearchAsync(
+        string sqlitePath, DatabaseSchemaCatalog catalog, string sourceTable, string sourceColumn,
+        string? search, int limit, CancellationToken cancellationToken);
+
+    Task<RelationshipLookupResult> ResolveAsync(
+        string sqlitePath, DatabaseSchemaCatalog catalog, string sourceTable, string sourceColumn,
+        SqliteValue rawKey, CancellationToken cancellationToken);
+}
+
 public interface IEditHistory
 {
     EditHistoryState State { get; }
+
+    EditHistorySnapshot GetSnapshot();
 
     void Record(EditOperation operation);
 
@@ -173,9 +205,18 @@ public interface IFileAssociationService
     Task RemoveAsync(CancellationToken cancellationToken);
 }
 
-public sealed record GridSelection(RowIdentity? CurrentRow, string? CurrentColumn, IReadOnlyList<RowIdentity> SelectedRows);
+public sealed record GridSelection(RowIdentity? CurrentRow, string? CurrentColumn, IReadOnlyList<RowIdentity> SelectedRows)
+{
+    public RowIdentity? CurrentCellRow { get; init; }
+    public (int Index, TypedRow Row)? ReadOnlySelectedRow { get; init; }
+    public IReadOnlyList<TypedRow> ReadOnlyCheckedRows { get; init; } = [];
+    public (int Index, TypedRow Row)? ReadOnlyCell { get; init; }
+}
 
-public sealed record GridViewport(RowIdentity? FirstVisibleRow, int HorizontalOffset);
+public sealed record GridViewport(RowIdentity? FirstVisibleRow, int HorizontalOffset)
+{
+    public (int Index, TypedRow Row)? ReadOnlyFirstRow { get; init; }
+}
 
 public interface ITableGridAdapter
 {
@@ -187,7 +228,11 @@ public interface ITableGridAdapter
 
     GridViewport CaptureViewport();
 
-    void Bind(TableSchema schema, IReadOnlyList<TypedRow> rows, TableViewState? state);
+    void Bind(
+        TableSchema schema,
+        IReadOnlyList<TypedRow> rows,
+        TableViewState? state,
+        ForeignKeyDisplayMode displayMode);
 
     void RestoreSelection(GridSelection selection);
 

@@ -52,6 +52,24 @@ public sealed class MutationWriteAheadTests
             writeAhead.PrepareAsync(CreateSession())).ConfigureAwait(false);
     }
 
+    [TestMethod]
+    public async Task LaterMutationCannotEraseAnUnfinishedMutation()
+    {
+        var workspace = new RecordingWorkspaceService();
+        var writeAhead = new MutationWriteAhead(workspace);
+        EditorSessionState session = CreateSession() with { HistoryUncertain = false };
+        EditorSessionState interrupted = await writeAhead.PrepareAsync(session).ConfigureAwait(false);
+        Assert.IsTrue(interrupted.MutationPending);
+
+        EditorSessionState later = await writeAhead.PrepareAsync(interrupted).ConfigureAwait(false);
+        later = await writeAhead.CompleteAsync(later).ConfigureAwait(false);
+
+        Assert.IsFalse(later.MutationPending);
+        Assert.IsTrue(later.HistoryUncertain == true);
+        Assert.IsTrue(later.IsDirty);
+        Assert.IsFalse(workspace.ObservedToken.CanBeCanceled);
+    }
+
     private static EditorSessionState CreateSession()
     {
         var root = Path.Combine(Path.GetTempPath(), "PcmCdbEditorTests", "write-ahead");
@@ -99,27 +117,37 @@ public sealed class MutationWriteAheadTests
 
         public Task<EditorSessionState> RecoverAsync(
             Guid sessionId,
+            CancellationToken cancellationToken,
+            DateTimeOffset? expectedUpdatedAtUtc = null) => throw new NotSupportedException();
+
+        public Task<SaveDestinationSnapshot> InspectSaveDestinationAsync(
+            string path,
             CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task<WorkspaceSaveResult> SaveAsync(
             EditorSessionState session,
-            CancellationToken cancellationToken) => throw new NotSupportedException();
+            CancellationToken cancellationToken,
+            SaveDestinationSnapshot? confirmedDestination = null) => throw new NotSupportedException();
 
         public Task<WorkspaceSaveResult> SaveAsAsync(
             EditorSessionState session,
             string destinationCdbPath,
-            CancellationToken cancellationToken) => throw new NotSupportedException();
+            CancellationToken cancellationToken,
+            SaveDestinationSnapshot? confirmedDestination = null) => throw new NotSupportedException();
 
         public Task CloseAsync(
             EditorSessionState session,
             bool discardDirtySession,
             CancellationToken cancellationToken) => throw new NotSupportedException();
 
+        public void ReleaseSession(Guid sessionId) => throw new NotSupportedException();
+
         public Task<IReadOnlyList<RecoverableSession>> GetRecoverableSessionsAsync(
             CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task DiscardRecoverableSessionAsync(
             Guid sessionId,
+            DateTimeOffset expectedUpdatedAtUtc,
             CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task CleanCompletedSessionsAsync(

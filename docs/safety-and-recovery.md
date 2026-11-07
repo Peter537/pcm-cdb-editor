@@ -1,6 +1,6 @@
 # Safety and recovery
 
-PCM CDB Editor's central invariant is that SQLiteExporter never receives the user's original CDB. Editing occurs in an isolated session. Save requires a staged CDB to exist and be non-empty, and it backs up an existing non-empty destination before replacement.
+SQLiteExporter receives an isolated working copy or staged SQLite file. Editing occurs in the working session. Save checks the destination and requires a non-empty staged CDB before replacement.
 
 ```mermaid
 flowchart TD
@@ -12,20 +12,21 @@ flowchart TD
     Readable -- "No" --> OpenFail
     Readable -- "Yes" --> Ready["Enter Ready; UI discovers the runtime catalog"]
     Ready --> Edit["Edit isolated SQLite; persist dirty metadata and history"]
-    Edit --> Stage["Copy SQLite to unique same-directory base and import staged CDB"]
+    Edit --> Baseline{"Destination matches the reviewed version?"}
+    Baseline -- "No or unknown" --> Decision["Choose Save as, overwrite the observed version, or cancel"]
+    Decision -- "Proceed" --> Baseline
+    Baseline -- "Yes" --> Stage["Copy SQLite to unique same-directory base and import staged CDB"]
     Stage --> SaveCheck{"Staged CDB exists and is non-empty?"}
     SaveCheck -- "No" --> SaveFail["Preserve prior session state; destination unchanged"]
-    SaveCheck -- "Yes" --> ExistingData{"Existing destination is non-empty?"}
-    ExistingData -- "Yes" --> Backup["Copy and validate backup in local app data"]
-    ExistingData -- "No" --> NoBackup["Continue without a backup"]
-    Backup --> Commit["Create or replace destination; use guarded fallback when needed"]
-    NoBackup --> Commit
-    Commit --> Durable{"Commit succeeds?"}
-    Durable -- "No" --> Rollback["Restore prior destination when needed; preserve prior session state"]
-    Durable -- "Yes" --> Clean["Mark saved baseline clean; retain backup"]
+    SaveCheck -- "Yes" --> Recheck{"Destination still matches?"}
+    Recheck -- "No" --> Decision
+    Recheck -- "Yes" --> Commit["Create without overwriting, or atomically replace and retain the displaced file"]
+    Commit --> Clean["Record the saved baseline and backup location"]
 ```
 
-The diagram describes the implemented `WorkspaceService` and `CdbConverter` lifecycle. The staged-output check establishes only that the expected CDB exists and is non-empty; it does not parse or reopen the staged CDB before commit.
+The staged-output check verifies that the expected CDB exists and is non-empty. Reopen the saved CDB in the editor when you need to verify its contents.
+
+The converter can change stored values during a round trip. On a copied career it refreshed the SQLite import and export tags and converted blank rider Limits from SQLite `NULL` to integer zero. The editor's typed review describes values in the working copy.
 
 ## Open rules
 
@@ -49,7 +50,9 @@ SQLiteExporter.exe -a -import <temporary-output-base>
 
 Before invocation, the working SQLite database is copied to `<temporary-output-base>.sqlite`. The base is unique and in the destination directory so final replacement does not cross volumes.
 
-If the destination exists and is non-empty, it is copied to `%LOCALAPPDATA%\PcmCdbEditor\Backups` and the backup is checked for non-empty content before replacement. A missing destination or a zero-byte placeholder is committed without a backup. `File.Replace` is preferred when a destination exists. The guarded fallback moves the previous destination aside, installs the staged file, and restores the previous file if installation fails.
+The editor fingerprints the current destination at open and after each successful save. Save as records the chosen file's state when the picker returns. If the destination differs before or after staging, the editor asks you to choose **Save as**, explicitly overwrite the observed version, or cancel. A recovered session created before destination fingerprints were stored requires the same decision. Overwrite authorization applies to the version shown by that decision.
+
+A new destination is created without overwriting another file. When a destination exists, Windows atomically replaces it and preserves the actual displaced file. The editor moves that backup to `%LOCALAPPDATA%\PcmCdbEditor\Backups` when possible. **Save details** shows its actual location, which can be beside the destination. If another process changes the file at the final replacement boundary, the editor preserves the displaced version and warns you. An unchanged zero-byte picker placeholder needs no retained backup. Managed session directories cannot be save destinations.
 
 Open/export/stage work remains cancellable. Once final replacement starts, cancellation is deliberately ignored until that short commit boundary completes. A failed save preserves the session's prior dirty state. A successful commit advances the persisted saved baseline and clears dirty state when present. A metadata/history-baseline failure after a successful commit is surfaced explicitly rather than pretending the session is fully synchronized.
 
@@ -66,9 +69,15 @@ Integration tests cover missing or invalid inputs, start and exit failures, miss
 
 ## Recovery and history
 
-Session metadata identifies the source and save paths, working files, lifecycle, dirty state, timestamps, and last backup without embedding row contents. Startup offers **Resume**, **Discard**, or **Not now** only for sessions whose metadata marks them dirty and whose working CDB and SQLite files still validate.
+Session metadata identifies the source and save paths, destination fingerprint, working files, lifecycle, dirty state, pending mutation, history uncertainty, timestamps, and last backup. A normal startup shows **Recovery** when it finds a recoverable session. Select a row by its path, timestamp, and session ID, then choose **Resume selected** or **Discard selected**. Navigating away keeps the listed sessions available. Opening the app with a CDB path opens that file first. The Recovery page remains available from navigation.
 
-Disk-backed history is stored inside the session and can contain complete typed row snapshots required to undo deletes and maintenance, including BLOB bytes encoded in the history document. It is written atomically, bounded to the session, and uses row presence and revision guards during replay. Redo is cleared by a new edit. Save and Save as record a baseline; edits can remain undoable after save while the baseline distinguishes saved from unsaved state.
+Active sessions hold an exclusive lock. Recovery checks skip sessions in use by another current editor and leave unreadable or invalid sessions intact. The editor verifies the selection again before resuming or discarding it.
+
+Disk-backed history is stored inside the session and can contain complete typed row snapshots required to undo deletes and maintenance, including BLOB bytes encoded in the history document. It is written atomically and uses row presence and revision guards during replay. **Changes** shows recorded operations, the next Undo and Redo, the saved baseline, and available before and after values. A new edit clears Redo. Ordinary Save and Save as preserve the recorded sequence while advancing the baseline.
+
+Before a write, the app durably marks its mutation pending. It clears that marker only after the corresponding history record or replay completion is durable, or the operation is known to have made no change. An interrupted write or save, invalid history, or missing recovered history keeps the working copy unsaved through subsequent edits and Undo. An explicit successful save establishes a new baseline and retires uncertain Undo and Redo entries. The app preserves unreadable history for diagnosis.
+
+Generic writes and replay refuse triggers, cascading referential actions, and allocation-counter changes that their row-level history cannot restore. Insert reads the actual SQLite-returned identity and verifies its row within the transaction. SQLite constraint rejection leaves a row-dialog draft available for correction; an ambiguous commit is kept as unsaved recovery work rather than offered as a safe retry.
 
 Settings are stored separately. They do not contain database row values, but they can contain schema and table names plus up to twelve recent CDB filesystem paths. Treat settings, sessions, history, and backups as sensitive user data. Do not attach them to issues, commit them, or copy their contents into logs.
 
@@ -84,7 +93,9 @@ Write paths attempt rollback without reusing the canceled token. SQLite may alre
 
 Closing a table tab retains database edits and does not prompt. Replacing the open database or closing the app prompts when doing so could discard dirty work.
 
-The app removes a session after an ordinary clean close or an explicitly confirmed discard. Startup also removes session directories already marked closed or cancelled. It does not automatically expire or delete backups.
+Uncreated Create Rider input has a separate discard decision. Saving a CDB does not create or save that draft. Cancelled close/replacement decisions retain its values, and exclusive operations prevent new input from arriving after the discard decision.
+
+The app removes the active session after an ordinary clean close or an explicitly confirmed discard. In **Recovery**, **Clean completed sessions** checks closed or cancelled sessions and removes only completed, clean records after confirmation. Recoverable sessions and CDB backups remain available.
 
 The installer is configured per user under `%LOCALAPPDATA%\Programs\PcmCdbEditor`. Settings, sessions, and backups live under `%LOCALAPPDATA%\PcmCdbEditor`, outside installed application files. Ordinary uninstall removes the application and file-association registration but intentionally preserves that user data; reinstalling or uninstalling is not a cleanup mechanism.
 

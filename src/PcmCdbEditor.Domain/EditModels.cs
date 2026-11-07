@@ -21,13 +21,15 @@ public sealed record RowUpdateOperation : EditOperation
         RowIdentity identity,
         IEnumerable<KeyValuePair<string, SqliteValue>> oldValues,
         IEnumerable<KeyValuePair<string, SqliteValue>> newValues,
-        RowRevision expectedRevision)
+        RowRevision expectedRevision,
+        IEnumerable<KeyValuePair<string, RelationshipLookupOption>>? chosenRelationships = null)
         : base(operationId, tableName, createdAtUtc)
     {
         Identity = identity;
         OldValues = ModelCollections.FreezeDictionary(oldValues);
         NewValues = ModelCollections.FreezeDictionary(newValues);
         ExpectedRevision = expectedRevision;
+        ChosenRelationships = ModelCollections.FreezeDictionary(chosenRelationships);
     }
 
     public RowIdentity Identity { get; }
@@ -37,6 +39,8 @@ public sealed record RowUpdateOperation : EditOperation
     public IReadOnlyDictionary<string, SqliteValue> NewValues { get; }
 
     public RowRevision ExpectedRevision { get; }
+
+    public IReadOnlyDictionary<string, RelationshipLookupOption> ChosenRelationships { get; }
 }
 
 public sealed record RowInsertionOperation : EditOperation
@@ -334,4 +338,76 @@ public sealed record EditHistoryState(
     int RedoCount,
     bool IsDirty = false,
     bool HasPendingReplay = false,
-    bool RecoveredInterruptedReplay = false);
+    bool RecoveredInterruptedReplay = false,
+    bool HistoryUncertain = false);
+
+/// <summary>
+/// A stable view of the recorded operations and the position of the saved baseline.
+/// The operation lists are in next Undo and next Redo order, respectively.
+/// </summary>
+public sealed class EditHistorySnapshot
+{
+    private EditHistorySnapshot(
+        EditHistoryState state,
+        IReadOnlyList<EditOperation> applied,
+        IReadOnlyList<EditOperation> undone,
+        int? savedAppliedCount)
+    {
+        State = state;
+        Applied = applied;
+        Undone = undone;
+        SavedAppliedCount = savedAppliedCount;
+    }
+
+    public EditHistoryState State { get; }
+    public IReadOnlyList<EditOperation> Applied { get; }
+    public IReadOnlyList<EditOperation> Undone { get; }
+    public EditOperation? NextUndo => Applied.Count == 0 ? null : Applied[0];
+    public EditOperation? NextRedo => Undone.Count == 0 ? null : Undone[0];
+
+    /// <summary>
+    /// The number of retained operations applied at the saved baseline. A null
+    /// value means that baseline is unknown or outside the retained timeline.
+    /// </summary>
+    public int? SavedAppliedCount { get; }
+
+    public static EditHistorySnapshot FromTimeline(
+        EditHistoryState state,
+        Guid currentStateId,
+        Guid savedStateId,
+        IEnumerable<(EditOperation Operation, Guid BeforeStateId)> undo,
+        IEnumerable<(EditOperation Operation, Guid AfterStateId)> redo)
+    {
+        // A checked-out replay has not yet established which side of the cursor
+        // contains that operation. Defer inspection until it completes or is restored.
+        if (state.HasPendingReplay)
+        {
+            return new EditHistorySnapshot(state, [], [], null);
+        }
+
+        int? savedAppliedCount = !state.HistoryUncertain && currentStateId == savedStateId
+            ? state.UndoCount
+            : null;
+        var applied = new List<EditOperation>(state.UndoCount);
+        var undone = new List<EditOperation>(state.RedoCount);
+        foreach (var (operation, beforeStateId) in undo)
+        {
+            applied.Add(operation);
+            if (!state.HistoryUncertain && beforeStateId == savedStateId)
+            {
+                savedAppliedCount = state.UndoCount - applied.Count;
+            }
+        }
+
+        foreach (var (operation, afterStateId) in redo)
+        {
+            undone.Add(operation);
+            if (!state.HistoryUncertain && afterStateId == savedStateId)
+            {
+                savedAppliedCount = state.UndoCount + undone.Count;
+            }
+        }
+
+        return new EditHistorySnapshot(state, applied.AsReadOnly(), undone.AsReadOnly(), savedAppliedCount);
+    }
+}

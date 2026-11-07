@@ -96,7 +96,12 @@ public sealed record RiderRecoveryTarget
 
 public sealed record RiderTeamOption(long TeamId, string DisplayName, long RiderCount)
 {
-    public override string ToString() => $"{DisplayName} · {TeamId} ({RiderCount:N0} riders)";
+    public string IdentityLabel => string.IsNullOrWhiteSpace(DisplayName)
+        ? $"Team ID {TeamId:N0}"
+        : $"{DisplayName} · Team ID {TeamId:N0}";
+
+    public override string ToString() =>
+        $"{IdentityLabel} ({RiderCount:N0} {(RiderCount == 1 ? "rider" : "riders")})";
 }
 
 public enum RiderContractRole
@@ -115,6 +120,13 @@ public sealed record RiderAbilityDefinition(
     string Label,
     string CurrentColumn,
     string LimitColumn);
+
+public static class RiderCurrentAbility
+{
+    public const string ColumnName = "value_f_current_ability";
+
+    public static double Calculate(IEnumerable<int> currentValues) => currentValues.Average();
+}
 
 public sealed record RiderAbilityInput
 {
@@ -397,9 +409,11 @@ public sealed record RiderCreationInput
 
     public int ContractEndYear { get; }
 
-    public bool MissingLimitsAcknowledged { get; }
+    public bool MissingLimitsAcknowledged { get; private init; }
 
     public IReadOnlyDictionary<string, SqliteValue> RiderAdvancedValues { get; }
+
+    public bool UsesAutomaticCurrentAbility => !RiderAdvancedValues.ContainsKey(RiderCurrentAbility.ColumnName);
 
     public IReadOnlyDictionary<string, SqliteValue> ContractAdvancedValues { get; }
 
@@ -408,6 +422,9 @@ public sealed record RiderCreationInput
     public double Potential { get; }
 
     public IReadOnlyList<long> FavoriteRaceIds { get; }
+
+    internal RiderCreationInput AcknowledgeMissingLimits() =>
+        this with { MissingLimitsAcknowledged = true };
 }
 
 public sealed record RiderCreationPreview
@@ -423,7 +440,11 @@ public sealed record RiderCreationPreview
         IEnumerable<string> warnings,
         IEnumerable<RiderLookupOption> favoriteRaces,
         IEnumerable<KeyValuePair<string, SqliteValue>> riderValues,
-        IEnumerable<KeyValuePair<string, SqliteValue>> contractValues)
+        IEnumerable<KeyValuePair<string, SqliteValue>> contractValues,
+        RiderLookupOption? team = null,
+        RiderLookupOption? region = null,
+        RiderLookupOption? riderType = null,
+        IEnumerable<RiderAbilityDefinition>? abilityDefinitions = null)
     {
         SnapshotToken = string.IsNullOrWhiteSpace(snapshotToken)
             ? throw new ArgumentException("A rider-creation snapshot token is required.", nameof(snapshotToken))
@@ -438,11 +459,15 @@ public sealed record RiderCreationPreview
         FavoriteRaces = ModelCollections.Freeze(favoriteRaces);
         RiderValues = ModelCollections.FreezeDictionary(riderValues);
         ContractValues = ModelCollections.FreezeDictionary(contractValues);
+        Team = team ?? new RiderLookupOption(input.TeamId, "Team");
+        Region = region ?? new RiderLookupOption(input.RegionId, "Region");
+        RiderType = riderType ?? new RiderLookupOption(input.RiderTypeId, "Rider type");
+        AbilityDefinitions = ModelCollections.Freeze(abilityDefinitions);
     }
 
     public string SnapshotToken { get; }
 
-    public RiderCreationInput Input { get; }
+    public RiderCreationInput Input { get; private init; }
 
     public string RiderIdentityColumn { get; }
 
@@ -461,6 +486,20 @@ public sealed record RiderCreationPreview
     public IReadOnlyDictionary<string, SqliteValue> RiderValues { get; }
 
     public IReadOnlyDictionary<string, SqliteValue> ContractValues { get; }
+
+    public RiderLookupOption Team { get; }
+
+    public RiderLookupOption Region { get; }
+
+    public RiderLookupOption RiderType { get; }
+
+    public IReadOnlyList<RiderAbilityDefinition> AbilityDefinitions { get; }
+
+    public bool UsesAutomaticCurrentAbility => Input.UsesAutomaticCurrentAbility;
+
+    public RiderCreationPreview AcknowledgeMissingLimits() => Input.MissingLimitsAcknowledged
+        ? this
+        : this with { Input = Input.AcknowledgeMissingLimits() };
 }
 
 public sealed record RiderRecoveryChange(long CyclistId, RiderRecoveryValues OldValues, RiderRecoveryValues NewValues);
@@ -480,7 +519,9 @@ public sealed record RiderRecoveryPreview
         string snapshotToken,
         RiderRecoveryTarget target,
         IEnumerable<long> cyclistIds,
-        IEnumerable<RiderRecoveryChange> changes)
+        IEnumerable<RiderRecoveryChange> changes,
+        bool targetTeamMissing = false,
+        IEnumerable<KeyValuePair<long, string>>? riderNames = null)
     {
         SnapshotToken = snapshotToken;
         Target = target ?? throw new ArgumentNullException(nameof(target));
@@ -488,6 +529,9 @@ public sealed record RiderRecoveryPreview
         Changes = ModelCollections.Freeze(changes);
         FoundCyclistIds = ModelCollections.Freeze(Changes.Select(static change => change.CyclistId).Distinct().Order());
         MissingCyclistIds = ModelCollections.Freeze(CyclistIds.Except(FoundCyclistIds).Order());
+        TargetTeamMissing = targetTeamMissing;
+        RiderNames = new System.Collections.ObjectModel.ReadOnlyDictionary<long, string>(
+            (riderNames ?? []).ToDictionary());
     }
 
     public string SnapshotToken { get; }
@@ -502,7 +546,39 @@ public sealed record RiderRecoveryPreview
 
     public IReadOnlyList<long> MissingCyclistIds { get; }
 
+    public bool TargetTeamMissing { get; }
+
+    public IReadOnlyDictionary<long, string> RiderNames { get; }
+
     public int RowsNeedingChanges => Changes.Count(static change => change.OldValues != change.NewValues);
+
+    public string? NoChangeSummary
+    {
+        get
+        {
+            if (RowsNeedingChanges != 0)
+            {
+                return null;
+            }
+            if (TargetTeamMissing)
+            {
+                return "The selected team is no longer in the working database.";
+            }
+            if (CyclistIds.Count == 0)
+            {
+                return Target.Kind == RiderRecoveryTargetKind.Team
+                    ? "The selected team has no riders."
+                    : "No rider IDs were supplied.";
+            }
+            if (FoundCyclistIds.Count == 0)
+            {
+                return "None of the resolved riders has a fitness row.";
+            }
+            return MissingCyclistIds.Count != 0
+                ? "Some riders have no fitness row. The rows found need no changes."
+                : "All resolved riders already match the recovery preset.";
+        }
+    }
 }
 
 public sealed record JanuaryFirstRepairPreview(string SnapshotToken, DateOnly CurrentDate, long RowCount);
@@ -524,7 +600,10 @@ public sealed record CountryQuotaChange(
     int WorldRank,
     int? EuropeanRank,
     CountryQuotaValues OldValues,
-    CountryQuotaValues NewValues);
+    CountryQuotaValues NewValues)
+{
+    public string? CountryName { get; init; }
+}
 
 public sealed record CountryQuotaPreview
 {

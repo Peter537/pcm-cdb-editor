@@ -4,6 +4,8 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Automation.Peers;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media;
 using Microsoft.Data.Sqlite;
 using System.Collections.ObjectModel;
 using System.Data;
@@ -29,6 +31,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly IWorkspaceService _workspaceService;
     private readonly ITableCatalog _tableCatalog;
     private readonly ITableDataStore _tableDataStore;
+    private readonly IRelationshipLookup _relationshipLookup;
     private readonly IRiderRecoveryService _riderRecoveryService;
     private readonly IRiderCreationService _riderCreationService;
     private readonly IJanuaryFirstRepairService _januaryFirstRepairService;
@@ -44,7 +47,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly List<TableListItem> _allTables = [];
     private readonly Dictionary<string, TabViewItem> _tableTabs = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<TabViewItem, CancellationTokenSource> _countCancellations = [];
-    private readonly SemaphoreSlim _pageSizePreferenceSaveGate = new(1, 1);
+    private readonly SemaphoreSlim _preferenceSaveGate = new(1, 1);
 
     private AppWindow? _appWindow;
     private EditorSessionState? _session;
@@ -54,6 +57,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private bool _operationMutationPrepared;
     private bool _allowClose;
     private bool _closeInProgress;
+    private bool _rowEditorOpen;
     private bool _disposed;
     private TypedRow? _selectedRow;
     private EditHistory? _editHistory;
@@ -69,8 +73,13 @@ public sealed partial class MainWindow : Window, IDisposable
     private NavigationViewItem? _lastContentNavigationItem;
     private Guid? _maintenanceTargetsSessionId;
     private Guid? _maintenanceTeamsSessionId;
+    private int _maintenanceTeamGeneration;
+    private bool _maintenanceTeamsLoading;
     private long[] _selectedRecoveryRiderIds = [];
     private Guid? _riderCreationSessionId;
+    private CancellationTokenSource? _riderPreparation;
+    private long _riderDraftGeneration;
+    private long _riderViewGeneration;
     private RiderCreationDraft? _riderCreationDraft;
     private RiderCreationPreview? _riderCreationPreview;
     private RiderLookupOption? _riderCreationTeam;
@@ -92,12 +101,14 @@ public sealed partial class MainWindow : Window, IDisposable
     private bool _suppressRiderLookupText;
     private bool _suppressFavoriteRaceText;
     private bool _suppressRiderGameDisplayNameEvents;
+    private string[]? _riderDraftBaseline;
 
     public MainWindow(
         string? launchPath,
         IWorkspaceService workspaceService,
         ITableCatalog tableCatalog,
         ITableDataStore tableDataStore,
+        IRelationshipLookup relationshipLookup,
         IRiderRecoveryService riderRecoveryService,
         IRiderCreationService riderCreationService,
         IJanuaryFirstRepairService januaryFirstRepairService,
@@ -109,6 +120,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _workspaceService = workspaceService ?? throw new ArgumentNullException(nameof(workspaceService));
         _tableCatalog = tableCatalog ?? throw new ArgumentNullException(nameof(tableCatalog));
         _tableDataStore = tableDataStore ?? throw new ArgumentNullException(nameof(tableDataStore));
+        _relationshipLookup = relationshipLookup ?? throw new ArgumentNullException(nameof(relationshipLookup));
         _riderRecoveryService = riderRecoveryService ?? throw new ArgumentNullException(nameof(riderRecoveryService));
         _riderCreationService = riderCreationService ?? throw new ArgumentNullException(nameof(riderCreationService));
         _januaryFirstRepairService = januaryFirstRepairService ?? throw new ArgumentNullException(nameof(januaryFirstRepairService));
@@ -126,9 +138,11 @@ public sealed partial class MainWindow : Window, IDisposable
         SetTitleBar(AppTitleBar);
         ConfigureWindow();
         TableGrid.SelectionChanged += TableGrid_SelectionChanged;
+        TableGrid.PresentedRowChanged += (_, _) => UpdatePresentedRow();
         TableGrid.ColumnHeaderActivated += TableGrid_ColumnHeaderActivated;
         TableGrid.EditCommitted += TableGrid_EditCommitted;
         TableGrid.EditRejected += TableGrid_EditRejected;
+        TableGrid.RelationshipEditRequested += TableGrid_RelationshipEditRequested;
         Activated += MainWindow_Activated;
     }
 
@@ -157,15 +171,19 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             _preferences = await _settingsStore.LoadPreferencesAsync(_lifetimeCancellation.Token);
             ApplyPreferences();
-            await _workspaceService.CleanCompletedSessionsAsync(_lifetimeCancellation.Token);
-            bool recovered = await OfferRecoveryAsync(_lifetimeCancellation.Token);
-            if (!recovered && IsCdbPath(_launchPath))
+            if (IsCdbPath(_launchPath))
             {
                 await OpenPathAsync(_launchPath!);
             }
-            else if (!recovered)
+            else if (_session is null && _operationLease is null)
             {
                 ResetToNoFile();
+                if (await RefreshRecoverySessionsAsync(_lifetimeCancellation.Token) &&
+                    _session is null && _operationLease is null &&
+                    (Navigation.SelectedItem is null || ReferenceEquals(Navigation.SelectedItem, TablesNavigationItem)))
+                {
+                    Navigation.SelectedItem = RecoveryNavigationItem;
+                }
             }
         }
         catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
@@ -174,93 +192,13 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            ResetToNoFile();
+            if (_session is null && _operationLease is null)
+            {
+                ResetToNoFile();
+            }
             PresentError(
-                "Startup recovery was unavailable",
-                SafeFailureMessage(exception, "The saved recovery information could not be inspected."));
-        }
-    }
-
-    private async Task<bool> OfferRecoveryAsync(CancellationToken cancellationToken)
-    {
-        IReadOnlyList<RecoverableSession> sessions =
-            await _workspaceService.GetRecoverableSessionsAsync(cancellationToken);
-        for (var index = 0; index < sessions.Count; index++)
-        {
-            RecoverableSession recoverable = sessions[index];
-            ViewModel.State = ShellOperationState.Recovery;
-            ViewModel.Status = "An unsaved working session is available.";
-            string additional = sessions.Count - index - 1 == 1
-                ? " One older session is also available."
-                : sessions.Count - index - 1 > 1
-                    ? $" {sessions.Count - index - 1:N0} older sessions are also available."
-                    : string.Empty;
-            var dialog = CreateDialog(
-                "Resume unsaved work?",
-                $"{recoverable.Description}.{additional} Resume this isolated session, discard it, or leave it untouched for next time.",
-                "Resume",
-                "Discard",
-                "Not now");
-            ContentDialogResult result = await dialog.ShowAsync();
-            if (result == ContentDialogResult.Primary)
-            {
-                return await RecoverSessionAsync(recoverable.Session.SessionId, cancellationToken);
-            }
-
-            if (result == ContentDialogResult.Secondary)
-            {
-                await _workspaceService.DiscardRecoverableSessionAsync(
-                    recoverable.Session.SessionId,
-                    cancellationToken);
-                continue;
-            }
-
-            // The close button is the deliberate "leave untouched" path.
-            return false;
-        }
-
-        return false;
-    }
-
-    private async Task<bool> RecoverSessionAsync(Guid sessionId, CancellationToken cancellationToken)
-    {
-        SetBusyPresentation(
-            "Resuming working session",
-            "Validating the isolated CDB and SQLite working files.",
-            allowCancellation: false);
-        try
-        {
-            EditorSessionState session = await _workspaceService.RecoverAsync(sessionId, cancellationToken);
-            DatabaseSchemaCatalog catalog = await _tableCatalog.DiscoverAsync(
-                session.WorkingSqlitePath,
-                cancellationToken);
-            await ActivateSessionAsync(session, catalog, cancellationToken);
-            bool recoveredInterruptedReplay = _editHistory?.State.RecoveredInterruptedReplay == true;
-            if (recoveredInterruptedReplay)
-            {
-                PresentWarning(
-                    "Unsaved work resumed after an interrupted undo or redo",
-                    "The app recovered the interrupted action. Before another undo or redo, it will check the saved rows so that a change that may already have finished is not applied twice.");
-            }
-            else
-            {
-                PresentSuccess(
-                    "Unsaved work resumed",
-                    "The recovered working copy is open. Save it when you are ready to safely replace the destination CDB.");
-            }
-            return true;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception exception) when (IsExpectedOperationFailure(exception))
-        {
-            ResetToNoFile();
-            PresentError(
-                "Could not resume the session",
-                SafeFailureMessage(exception, "The recoverable working files were left untouched."));
-            return false;
+                "Could not finish startup",
+                SafeFailureMessage(exception, "Open a CDB or check Recovery to continue."));
         }
     }
 
@@ -400,7 +338,18 @@ public sealed partial class MainWindow : Window, IDisposable
             return true;
         }
 
+        if (TableGrid.IsEditing)
+        {
+            PresentWarning("Finish the cell edit", "Press Enter to commit the value or Escape to cancel it, then try again.");
+            return false;
+        }
+
         await PersistActiveTableStateAsync(cancellationToken);
+
+        if (!await ConfirmDiscardRiderDraftAsync())
+        {
+            return false;
+        }
 
         bool discard = false;
         if (_session.IsDirty)
@@ -439,11 +388,12 @@ public sealed partial class MainWindow : Window, IDisposable
         DisposeTableCoordinators();
         _session = session;
         _catalog = catalog;
+        _relationshipReturn = null;
         ResetMaintenanceTargetsForSession(session.SessionId);
         _tableTabs.Clear();
         TableTabs.TabItems.Clear();
         ViewModel.Tabs.Clear();
-        AttachEditHistory(session);
+        await AttachEditHistoryAsync(session);
         _allTables.Clear();
 
         foreach (TableSchema table in catalog.Tables.OrderBy(static table => table.Name, StringComparer.OrdinalIgnoreCase))
@@ -550,7 +500,7 @@ public sealed partial class MainWindow : Window, IDisposable
             if (request.Lease.IsCurrent)
             {
                 RestorePreviousTable(request, "The previous table remains available.");
-                PresentError(
+                PresentTableQueryError(
                     "Could not load the table",
                     SafeFailureMessage(exception, "The working database was not changed."));
             }
@@ -570,7 +520,9 @@ public sealed partial class MainWindow : Window, IDisposable
         long offset = 0,
         IReadOnlyList<SortDescriptor>? sorts = null,
         TableFilterDefinition? filterDefinition = null,
-        TableLoadRequest? loadRequest = null)
+        TableLoadRequest? loadRequest = null,
+        TableOpenPresentation? presentation = null,
+        bool refresh = false)
     {
         EditorSessionState session = _session
             ?? throw new InvalidOperationException("A working session is required.");
@@ -593,7 +545,7 @@ public sealed partial class MainWindow : Window, IDisposable
         if (!string.IsNullOrWhiteSpace(searchText))
         {
             string[] eligibleColumns = table.Columns
-                .Where(static column => !column.IsHidden && column.Affinity != SqliteAffinity.Blob)
+                .Where(static column => !column.IsHidden)
                 .Select(static column => column.Name)
                 .ToArray();
             if (eligibleColumns.Length == 0)
@@ -606,8 +558,8 @@ public sealed partial class MainWindow : Window, IDisposable
 
         _tableTabs.TryGetValue(table.Name, out TabViewItem? existingTab);
         TableTabContext? existingContext = existingTab?.Tag as TableTabContext;
-        TableViewState? viewState = existingContext?.ViewState;
-        if (existingContext is null)
+        TableViewState? viewState = presentation?.ViewState ?? existingContext?.ViewState;
+        if (existingContext is null && viewState is null)
         {
             viewState = await _settingsStore.LoadTableViewStateAsync(
                 catalog.SchemaSignature,
@@ -626,7 +578,6 @@ public sealed partial class MainWindow : Window, IDisposable
             ForeignKeySortDescriptorMapper.Restore(
                 catalog,
                 table,
-                foreignKeyDisplayMode,
                 sorts ?? existingContext?.Sorts);
         var query = new TableQuery(
             table.Name,
@@ -635,7 +586,7 @@ public sealed partial class MainWindow : Window, IDisposable
             filter: filter,
             search: search,
             foreignKeyDisplayMode: foreignKeyDisplayMode);
-        bool canReuseCoordinator = existingContext is not null &&
+        bool canReuseCoordinator = !refresh && existingContext is not null &&
             existingContext.SearchText.Equals(searchText, StringComparison.Ordinal) &&
             ReferenceEquals(existingContext.Filter, filter) &&
             existingContext.Sorts.SequenceEqual(query.Sorts) &&
@@ -673,6 +624,30 @@ public sealed partial class MainWindow : Window, IDisposable
 
                 int chunkIndex = checked((int)(offset - chunk.Offset));
                 TypedRow[] rows = chunk.Items.Skip(chunkIndex).Take(pageSize).ToArray();
+                countState = canReuseCoordinator
+                    ? existingContext!.CountState
+                    : TableRowCountState.Loading;
+                if (rows.Length == 0 && offset > 0)
+                {
+                    countState = await coordinator.LoadCountAsync(cancellationToken);
+                    EnsureTableLoadCurrent(loadRequest, cancellationToken);
+                    long count = countState.Value ?? 0;
+                    offset = count == 0 ? 0 : (count - 1) / pageSize * pageSize;
+                    chunk = await coordinator.LoadChunkContainingAsync(offset, cancellationToken);
+                    EnsureTableLoadCurrent(loadRequest, cancellationToken);
+                    chunkIndex = checked((int)(offset - chunk.Offset));
+                    rows = chunk.Items.Skip(chunkIndex).Take(pageSize).ToArray();
+                    if (rows.Length == 0 && offset > 0)
+                    {
+                        // A concurrent working-copy change can invalidate the count before the read.
+                        offset = 0;
+                        chunk = await coordinator.LoadChunkContainingAsync(offset, cancellationToken);
+                        EnsureTableLoadCurrent(loadRequest, cancellationToken);
+                        chunkIndex = 0;
+                        rows = chunk.Items.Take(pageSize).ToArray();
+                        countState = TableRowCountState.Unknown;
+                    }
+                }
                 bool provisionalHasMore = chunkIndex + rows.Length < chunk.Items.Count ||
                     chunk.Items.Count == VirtualTableQueryCoordinator.ChunkSize;
                 display = new TableDisplayWindow(
@@ -680,9 +655,6 @@ public sealed partial class MainWindow : Window, IDisposable
                     offset,
                     rows,
                     provisionalHasMore);
-                countState = canReuseCoordinator
-                    ? existingContext!.CountState
-                    : TableRowCountState.Loading;
             }
 
             if (_session?.SessionId != session.SessionId)
@@ -692,6 +664,10 @@ public sealed partial class MainWindow : Window, IDisposable
 
             EnsureTableLoadCurrent(loadRequest, cancellationToken);
 
+            var (selection, viewport) = presentation is null
+                ? (existingContext?.Selection ?? new GridSelection(null, null, []),
+                   existingContext?.Viewport ?? new GridViewport(null, 0))
+                : presentation.Resolve(display);
             var context = new TableTabContext(
                 table,
                 display,
@@ -705,8 +681,8 @@ public sealed partial class MainWindow : Window, IDisposable
                 foreignKeyDisplayMode,
                 countState,
                 IsInvalidated: false,
-                Selection: existingContext?.Selection ?? new GridSelection(null, null, []),
-                Viewport: existingContext?.Viewport ?? new GridViewport(null, 0));
+                Selection: selection,
+                Viewport: viewport);
             if (!_tableTabs.TryGetValue(table.Name, out TabViewItem? tab))
             {
                 tab = new TabViewItem
@@ -746,7 +722,14 @@ public sealed partial class MainWindow : Window, IDisposable
                 _suppressTabSelection = false;
             }
 
+            bool wasBound = _gridBindingSession.IsBoundTo(tab);
+            ClearTableQueryBanner();
             EnsureTabBound(tab);
+            if (presentation is not null && wasBound)
+            {
+                TableGrid.RestoreSelection(selection);
+                TableGrid.RestoreViewport(viewport);
+            }
         }
         finally
         {
@@ -765,18 +748,25 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         bool switchingTabs = !_gridBindingSession.IsBoundTo(tab);
+        if (switchingTabs)
+        {
+            ClearTableQueryBanner();
+        }
         TableGrid.SetDensity(_preferences.Density);
         _gridBindingSession.BindIfChanged(
             tab,
             context.Display.Rows,
             context.ViewState,
-            () => TableGrid.Bind(context.Schema, context.Display.Rows, context.ViewState));
+            () =>
+            {
+                TableGrid.SetRelationshipPickerColumns(GetRelationshipPickerColumns(context.Schema));
+                TableGrid.Bind(context.Schema, context.Display.Rows, context.ViewState, context.ForeignKeyDisplayMode);
+            });
         TableHeaderSortIndicator? sortIndicator = _catalog is null
             ? null
             : ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(
                 _catalog,
                 context.Schema,
-                context.ForeignKeyDisplayMode,
                 context.Sorts);
         if (switchingTabs)
         {
@@ -789,10 +779,10 @@ public sealed partial class MainWindow : Window, IDisposable
             sortIndicator?.Direction);
 
         SetTableLoadingSurface(isVisible: false);
-        SetTableGridPresented(isPresented: true);
-        EmptyState.Visibility = Visibility.Collapsed;
+        PresentTableRows(context);
         BusyIndicator.Visibility = Visibility.Collapsed;
         UpdateTabChrome(tab, context);
+        UpdatePresentedRow();
         if (context.CountState.Status == TableRowCountStatus.Available)
         {
             UpdateTabCountLabel(
@@ -826,12 +816,19 @@ public sealed partial class MainWindow : Window, IDisposable
             : "Read-only table";
         UpdateCountAndPagingChrome(tab, context);
         ViewModel.PageSizeLabel = context.Display.RowDisplay.StatusLabel;
-        FiltersButton.Content = context.FilterDefinition.RuleCount == 0
+        int appliedFilters = CountAppliedFilters(context.Filter);
+        FiltersButton.Content = appliedFilters == 0
             ? "Filters"
-            : $"Filters ({context.FilterDefinition.RuleCount:N0})";
+            : $"Filters ({appliedFilters:N0})";
         SortButton.Content = context.Sorts.Count == 0
             ? "Sort"
             : $"Sort ({context.Sorts.Count:N0})";
+        string sortSummary = context.Sorts.Count == 0
+            ? "No active sort. Click a column header to set the first priority."
+            : string.Join(" → ", context.Sorts.Select(ForeignKeySortDescriptorMapper.Describe));
+        ToolTipService.SetToolTip(SortButton, sortSummary);
+        AutomationProperties.SetHelpText(SortButton, sortSummary);
+        UpdateQuerySummary(context, sortSummary);
         SetInsertRowActionsEnabled(_operationLease is null &&
             _activeTableLoad is null &&
             context.Schema.EditCapability == TableEditCapability.Editable);
@@ -1011,26 +1008,19 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void TableGrid_SelectionChanged(object? sender, GridSelection selection)
     {
-        InspectorValues.ItemsSource = null;
-        _selectedRow = null;
-        SetSelectedRowActionsEnabled(isEnabled: false);
         _selectedRecoveryRiderIds = [];
         UseSelectedRiderRowsButton.IsEnabled = false;
         if (selection.CurrentRow is null ||
             TableTabs.SelectedItem is not TabViewItem tab ||
             tab.Tag is not TableTabContext context)
         {
-            InspectorHeading.Text = "No row selected";
             return;
         }
 
-        TypedRow? row = context.Display.Rows.FirstOrDefault(candidate =>
-            candidate.Identity is not null && candidate.Identity.Equals(selection.CurrentRow));
-        TypedRow[] selectedRows = context.Display.Rows
+        HashSet<RowIdentity> checkedRows = selection.SelectedRows.ToHashSet();
+        long[] selectedCyclistIds = context.Display.Rows
             .Where(candidate => candidate.Identity is not null &&
-                selection.SelectedRows.Any(identity => candidate.Identity.Equals(identity)))
-            .ToArray();
-        long[] selectedCyclistIds = selectedRows
+                checkedRows.Contains(candidate.Identity))
             .Select(TryReadCyclistId)
             .Where(static id => id.HasValue && id.Value > 0)
             .Select(static id => id!.Value)
@@ -1040,29 +1030,6 @@ public sealed partial class MainWindow : Window, IDisposable
         _selectedRecoveryRiderIds = selectedCyclistIds;
         UseSelectedRiderRowsButton.IsEnabled = RecoveryIdsModeRadioButton.IsChecked == true
             && selectedCyclistIds.Length != 0;
-        if (row is null)
-        {
-            InspectorHeading.Text = "No row selected";
-            return;
-        }
-
-        InspectorHeading.Text = context.Schema.EditCapability == TableEditCapability.Editable
-            ? "Selected editable row"
-            : "Selected read-only row";
-        InspectorValues.ItemsSource = context.Schema.Columns
-            .Where(static column => !column.IsHidden)
-            .OrderBy(static column => column.Ordinal)
-            .Select(column => new InspectorValueItem(
-                column.Name,
-                row.Values.TryGetValue(column.Name, out SqliteValue value)
-                    ? FormatSqliteValue(value)
-                    : "NULL"))
-            .ToArray();
-        _selectedRow = row;
-        bool canMutate = _operationLease is null &&
-            context.Schema.EditCapability == TableEditCapability.Editable &&
-            row.Identity is not null;
-        SetSelectedRowActionsEnabled(canMutate);
     }
 
     private async void TableGrid_EditCommitted(object? sender, EditOperation operation)
@@ -1188,42 +1155,33 @@ public sealed partial class MainWindow : Window, IDisposable
             .OrderBy(static column => column.Ordinal)
             .ToArray();
         var editors = CreateRowEditors(columns, row.Values, allowDefault: false);
-        ContentDialogResult result = await ShowRowEditorAsync("Edit row", editors, "Update");
-        if (result != ContentDialogResult.Primary)
+        var relationshipChoices = new Dictionary<string, RelationshipLookupOption>(StringComparer.OrdinalIgnoreCase);
+        EditorSessionState session = _session!;
+        string workingPath = session.WorkingSqlitePath;
+        DatabaseSchemaCatalog catalog = _catalog!;
+        await ShowRowEditorAsync("Edit one row", editors, "Update", changedOnly: true, async values =>
         {
-            return;
-        }
+            if (_session?.SessionId != session.SessionId || !ReferenceEquals(_catalog, catalog))
+            {
+                return new RowEditResult(true, "The working session changed. Reopen the row to edit it.");
+            }
 
-        if (!TryReadRowEditors(editors, changedOnly: true, out Dictionary<string, SqliteValue> values, out string? error))
-        {
-            PresentWarning("Invalid row value", error!);
-            return;
-        }
-
-        if (values.Count == 0)
-        {
-            PresentInformation("No row changes", "Every typed value is unchanged.");
-            return;
-        }
-
-        var oldValues = values.Keys.ToDictionary(
-            static name => name,
-            name => row.Values[name],
-            StringComparer.OrdinalIgnoreCase);
-        var operation = new RowUpdateOperation(
-            Guid.NewGuid(),
-            context.Schema.Name,
-            DateTimeOffset.UtcNow,
-            row.Identity!,
-            oldValues,
-            values,
-            row.Revision);
-        await ExecuteEditAsync(operation, async cancellationToken =>
-            await _tableDataStore.UpdateRowAsync(
-                _session!.WorkingSqlitePath,
-                _catalog!,
-                operation,
-                cancellationToken));
+            if (values.Count == 0)
+            {
+                PresentInformation("No row changes", "Every typed value is unchanged.");
+                return new RowEditResult(false);
+            }
+            var oldValues = values.Keys.ToDictionary(
+                static name => name, name => row.Values[name], StringComparer.OrdinalIgnoreCase);
+            var operation = new RowUpdateOperation(
+                Guid.NewGuid(), context.Schema.Name, DateTimeOffset.UtcNow,
+                row.Identity!, oldValues, values, row.Revision,
+                relationshipChoices.Where(choice => values.ContainsKey(choice.Key)));
+            return await ExecuteEditAsync(operation, cancellationToken =>
+                _tableDataStore.UpdateRowAsync(workingPath, catalog, operation, cancellationToken));
+        }, editor => CreateRelationshipChoiceButton(workingPath, catalog, context.Schema, editor, relationshipChoices),
+            relationshipChoices, DescribeRowAction(context, row),
+            TableGrid.GetCurrentColumnForRow(row));
     }
 
     private async void DeleteRow_Click(object sender, RoutedEventArgs e)
@@ -1234,8 +1192,9 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         var dialog = CreateDialog(
-            "Delete selected row?",
-            "This changes only the isolated working SQLite database until Save. The complete typed row is retained for Undo.",
+            "Delete one row?",
+            DescribeRowAction(context, row) +
+                "\n\nThe deletion affects the working copy until Save. Undo can restore the complete row.",
             "Delete",
             string.Empty,
             "Cancel");
@@ -1259,8 +1218,11 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async void InsertRow_Click(object sender, RoutedEventArgs e)
     {
-        if (TableTabs.SelectedItem is not TabViewItem tab ||
-            tab.Tag is not TableTabContext context ||
+        if (TablesView.Visibility != Visibility.Visible ||
+            _operationLease is not null || _activeTableLoad is not null ||
+            TableTabs.SelectedItem is not TabViewItem tab ||
+            !_gridBindingSession.IsBoundTo(tab) ||
+            tab.Tag is not TableTabContext { IsInvalidated: false } context ||
             context.Schema.EditCapability != TableEditCapability.Editable)
         {
             PresentWarning("Insert unavailable", "Choose an editable table first.");
@@ -1271,41 +1233,26 @@ public sealed partial class MainWindow : Window, IDisposable
             .Where(static column => !column.IsHidden && !column.IsGenerated)
             .OrderBy(static column => column.Ordinal)
             .ToArray();
-        var editors = CreateRowEditors(columns, values: null, allowDefault: true);
-        ContentDialogResult result = await ShowRowEditorAsync("Insert row", editors, "Insert");
-        if (result != ContentDialogResult.Primary)
+        var editors = CreateRowEditors(columns, values: null, allowDefault: true,
+            allowGeneratedKeyDefault: !context.Schema.IsWithoutRowId);
+        await ShowRowEditorAsync("Insert row", editors, "Insert", changedOnly: false, async values =>
         {
-            return;
-        }
-
-        if (!TryReadRowEditors(editors, changedOnly: false, out Dictionary<string, SqliteValue> values, out string? error))
-        {
-            PresentWarning("Invalid row value", error!);
-            return;
-        }
-
-        var operation = new RowInsertionOperation(
-            Guid.NewGuid(),
-            context.Schema.Name,
-            DateTimeOffset.UtcNow,
-            values);
-        await ExecuteEditAsync(operation, async cancellationToken =>
-            await _tableDataStore.InsertRowAsync(
-                _session!.WorkingSqlitePath,
-                _catalog!,
-                operation,
-                cancellationToken));
+            var operation = new RowInsertionOperation(
+                Guid.NewGuid(), context.Schema.Name, DateTimeOffset.UtcNow, values);
+            return await ExecuteEditAsync(operation, cancellationToken =>
+                _tableDataStore.InsertRowAsync(_session!.WorkingSqlitePath, _catalog!, operation, cancellationToken));
+        });
     }
 
     private bool TryGetEditableSelection(out TableTabContext context, out TypedRow row)
     {
-        if (TableTabs.SelectedItem is TabViewItem tab &&
-            tab.Tag is TableTabContext selectedContext &&
+        if (TablesView.Visibility == Visibility.Visible && _operationLease is null && _activeTableLoad is null &&
+            TryGetPresentedRow(out TableTabContext selectedContext, out TypedRow presented) &&
             selectedContext.Schema.EditCapability == TableEditCapability.Editable &&
-            _selectedRow?.Identity is not null)
+            presented.Identity is not null)
         {
             context = selectedContext;
-            row = _selectedRow;
+            row = presented;
             return true;
         }
 
@@ -1318,7 +1265,8 @@ public sealed partial class MainWindow : Window, IDisposable
     private static List<RowValueEditor> CreateRowEditors(
         ColumnSchema[] columns,
         IReadOnlyDictionary<string, SqliteValue>? values,
-        bool allowDefault)
+        bool allowDefault,
+        bool allowGeneratedKeyDefault = false)
     {
         var editors = new List<RowValueEditor>(columns.Length);
         foreach (ColumnSchema column in columns)
@@ -1337,7 +1285,8 @@ public sealed partial class MainWindow : Window, IDisposable
 
             bool canUseDefault = allowDefault &&
                 (column.DefaultExpression is not null ||
-                 column.IsPrimaryKey && column.Affinity == SqliteAffinity.Integer);
+                 allowGeneratedKeyDefault && column.IsPrimaryKey && column.DeclaredType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase)
+                 && columns.Count(static item => item.IsPrimaryKey) == 1);
             SqliteValueKind initialStorageClass = hasValue &&
                 (value.Kind is SqliteValueKind.Integer or SqliteValueKind.Real or SqliteValueKind.Text)
                     ? value.Kind
@@ -1407,10 +1356,16 @@ public sealed partial class MainWindow : Window, IDisposable
         return editors;
     }
 
-    private async Task<ContentDialogResult> ShowRowEditorAsync(
+    private async Task ShowRowEditorAsync(
         string title,
         IReadOnlyList<RowValueEditor> editors,
-        string primaryButtonText)
+        string primaryButtonText,
+        bool changedOnly,
+        Func<Dictionary<string, SqliteValue>, Task<RowEditResult>> submit,
+        Func<RowValueEditor, Button?>? relationshipChoice = null,
+        IReadOnlyDictionary<string, RelationshipLookupOption>? relationshipChoices = null,
+        string? rowScope = null,
+        string? currentColumn = null)
     {
         var panel = new StackPanel { Spacing = 8 };
         panel.Children.Add(new TextBlock
@@ -1419,6 +1374,14 @@ public sealed partial class MainWindow : Window, IDisposable
             TextWrapping = TextWrapping.Wrap,
             Opacity = 0.72,
         });
+        var validation = new TextBlock
+        {
+            TextWrapping = TextWrapping.Wrap,
+            Visibility = Visibility.Collapsed,
+            Foreground = (Microsoft.UI.Xaml.Media.Brush)Microsoft.UI.Xaml.Application.Current.Resources["SystemFillColorCriticalBrush"],
+        };
+        AutomationProperties.SetLiveSetting(validation, AutomationLiveSetting.Assertive);
+        var fields = new List<(RowValueEditor Editor, FrameworkElement Root)>();
         foreach (RowValueEditor editor in editors)
         {
             var columnEditor = new StackPanel
@@ -1439,50 +1402,188 @@ public sealed partial class MainWindow : Window, IDisposable
                 Opacity = 0.72,
             });
             var valueFields = new Grid { ColumnSpacing = 8 };
-            valueFields.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
+            valueFields.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             valueFields.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             Grid.SetColumn(editor.StorageClassPicker, 0);
             Grid.SetColumn(editor.TextBox, 1);
             valueFields.Children.Add(editor.StorageClassPicker);
             valueFields.Children.Add(editor.TextBox);
             columnEditor.Children.Add(valueFields);
-            var options = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
+            var options = new StackPanel { Spacing = 4 };
             options.Children.Add(editor.NullBox);
             if (editor.UseDefaultBox.IsEnabled)
             {
                 options.Children.Add(editor.UseDefaultBox);
             }
             columnEditor.Children.Add(options);
+            if (relationshipChoice?.Invoke(editor) is { } chooseRelationship)
+            {
+                columnEditor.Children.Add(chooseRelationship);
+            }
             panel.Children.Add(columnEditor);
+            fields.Add((editor, columnEditor));
         }
 
         var scroll = new ScrollViewer
         {
             Content = panel,
             MaxHeight = 520,
-            Width = 520,
+            MaxWidth = 520,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            HorizontalScrollMode = ScrollMode.Disabled,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
         };
+        var content = new StackPanel { Spacing = 8 };
+        if (rowScope is not null)
+        {
+            content.Children.Add(new TextBlock { Text = rowScope, TextWrapping = TextWrapping.Wrap });
+        }
+        var fieldSearch = new TextBox
+        {
+            PlaceholderText = "Find a field by column name",
+            Visibility = editors.Count >= 8 ? Visibility.Visible : Visibility.Collapsed,
+        };
+        AutomationProperties.SetName(fieldSearch, "Find a field by column name");
+        var noFields = new TextBlock
+        {
+            Text = "No fields match.",
+            Visibility = Visibility.Collapsed,
+        };
+        AutomationProperties.SetLiveSetting(noFields, AutomationLiveSetting.Polite);
+        fieldSearch.TextChanged += (_, _) =>
+        {
+            bool anyVisible = false;
+            foreach (var (editor, root) in fields)
+            {
+                bool matches = editor.Column.Name.Contains(fieldSearch.Text.Trim(), StringComparison.OrdinalIgnoreCase);
+                root.Visibility = matches ? Visibility.Visible : Visibility.Collapsed;
+                anyVisible |= matches;
+            }
+            noFields.Visibility = anyVisible ? Visibility.Collapsed : Visibility.Visible;
+        };
+        fieldSearch.KeyDown += (_, args) =>
+        {
+            if (args.Key == Windows.System.VirtualKey.Enter)
+            {
+                args.Handled = true;
+            }
+        };
+        content.Children.Add(fieldSearch);
+        content.Children.Add(noFields);
+        content.Children.Add(validation);
+        content.Children.Add(scroll);
         var dialog = new ContentDialog
         {
             XamlRoot = WindowRoot.XamlRoot,
             Title = title,
-            Content = scroll,
+            Content = content,
             PrimaryButtonText = primaryButtonText,
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary,
         };
-        return await dialog.ShowAsync();
+        if (editors.FirstOrDefault(editor =>
+                editor.Column.Name.Equals(currentColumn, StringComparison.OrdinalIgnoreCase)) is { } currentEditor)
+        {
+            dialog.Opened += (_, _) =>
+            {
+                Control input = currentEditor.TextBox.IsEnabled ? currentEditor.TextBox : currentEditor.NullBox;
+                input.Focus(FocusState.Programmatic);
+                input.StartBringIntoView(new BringIntoViewOptions { VerticalAlignmentRatio = 0.2 });
+            };
+        }
+        bool submitting = false;
+        dialog.Closing += (dialogSender, args) => args.Cancel = submitting;
+        dialog.PrimaryButtonClick += async (dialogSender, args) =>
+        {
+            args.Cancel = true;
+            var deferral = args.GetDeferral();
+            try
+            {
+                foreach (RowValueEditor editor in editors)
+                {
+                    editor.TextBox.ClearValue(AutomationProperties.HelpTextProperty);
+                    editor.StorageClassPicker.ClearValue(AutomationProperties.HelpTextProperty);
+                    editor.NullBox.ClearValue(AutomationProperties.HelpTextProperty);
+                }
+                if (!TryReadRowEditors(editors, changedOnly, relationshipChoices,
+                        out var values, out string? error, out Control? invalidInput))
+                {
+                    ShowValidation(error!, invalidInput);
+                    return;
+                }
+                submitting = true;
+                dialog.IsPrimaryButtonEnabled = false;
+                scroll.IsEnabled = false;
+                fieldSearch.IsEnabled = false;
+                RowEditResult result = await submit(values);
+                if (result.Retry)
+                {
+                    scroll.IsEnabled = true;
+                    RowValueEditor? invalidEditor = editors.FirstOrDefault(editor =>
+                        editor.Column.Name.Equals(result.ColumnName, StringComparison.OrdinalIgnoreCase));
+                    Control? focusTarget = invalidEditor is null ? null
+                        : invalidEditor.TextBox.IsEnabled ? invalidEditor.TextBox
+                        : invalidEditor.UseDefaultBox.IsEnabled ? invalidEditor.UseDefaultBox
+                        : invalidEditor.NullBox;
+                    ShowValidation(result.Error! + " Your row draft is retained.", focusTarget);
+                }
+                else
+                {
+                    args.Cancel = false;
+                }
+            }
+            finally
+            {
+                submitting = false;
+                scroll.IsEnabled = true;
+                fieldSearch.IsEnabled = true;
+                dialog.IsPrimaryButtonEnabled = true;
+                deferral.Complete();
+            }
+        };
+        _rowEditorOpen = true;
+        try
+        {
+            await dialog.ShowAsync();
+        }
+        finally
+        {
+            _rowEditorOpen = false;
+        }
+
+        void ShowValidation(string error, Control? input)
+        {
+            validation.Text = error;
+            validation.Visibility = Visibility.Visible;
+            if (input?.IsEnabled == true)
+            {
+                fieldSearch.Text = string.Empty;
+                content.UpdateLayout();
+                AutomationProperties.SetHelpText(input, error);
+                input.StartBringIntoView();
+                input.Focus(FocusState.Programmatic);
+            }
+        }
     }
 
     private static bool TryReadRowEditors(
         IReadOnlyList<RowValueEditor> editors,
         bool changedOnly,
+        IReadOnlyDictionary<string, RelationshipLookupOption>? relationshipChoices,
         out Dictionary<string, SqliteValue> values,
-        out string? error)
+        out string? error,
+        out Control? invalidInput)
     {
         values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        invalidInput = null;
         foreach (RowValueEditor editor in editors)
         {
+            if (relationshipChoices?.TryGetValue(editor.Column.Name, out RelationshipLookupOption? choice) == true)
+            {
+                values[editor.Column.Name] = choice.Key;
+                continue;
+            }
+
             if (editor.UseDefaultBox.IsChecked == true)
             {
                 continue;
@@ -1493,6 +1594,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 if (!editor.Column.IsNullable)
                 {
                     error = $"{editor.Column.Name} cannot be NULL.";
+                    invalidInput = editor.NullBox;
                     return false;
                 }
 
@@ -1507,6 +1609,7 @@ public sealed partial class MainWindow : Window, IDisposable
             if (editor.StorageClassPicker.SelectedItem is not SqliteValueKind storageClass)
             {
                 error = $"Choose a storage class for {editor.Column.Name}.";
+                invalidInput = editor.StorageClassPicker;
                 return false;
             }
 
@@ -1542,6 +1645,7 @@ public sealed partial class MainWindow : Window, IDisposable
                     error = storageClass == SqliteValueKind.Integer
                         ? $"{editor.Column.Name} needs a valid invariant whole number."
                         : $"{editor.Column.Name} needs a finite invariant real number.";
+                    invalidInput = editor.TextBox;
                     return false;
             }
 
@@ -1555,18 +1659,18 @@ public sealed partial class MainWindow : Window, IDisposable
         return true;
     }
 
-    private async Task ExecuteEditAsync(
+    private async Task<RowEditResult> ExecuteEditAsync(
         EditOperation operation,
         Func<CancellationToken, Task<EditResult>> apply)
     {
         if (_session is null || _catalog is null)
         {
-            return;
+            return new RowEditResult(true, "The working session is no longer open.");
         }
 
         if (!TryBeginOperation("Row change", out CancellationToken cancellationToken))
         {
-            return;
+            return new RowEditResult(true, "Wait for the current operation, then try again.");
         }
 
         bool mutationCommitted = false;
@@ -1574,6 +1678,18 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             await PrepareMutationWriteAheadAsync(_session);
             EditResult result = await apply(cancellationToken);
+            if (operation is (CellUpdateOperation or RowUpdateOperation) &&
+                result is { AffectedRows: 0, CurrentRow: not null })
+            {
+                if (!await CompleteUnchangedMutationAsync())
+                {
+                    return new RowEditResult(true, "The row was unchanged, but recovery information could not be updated.");
+                }
+
+                PresentInformation("No row changes", "The stored values already match the edit.");
+                return new RowEditResult(false);
+            }
+
             if (result.AffectedRows != 1)
             {
                 throw new InvalidDataException("The row operation did not affect exactly one row.");
@@ -1582,6 +1698,7 @@ public sealed partial class MainWindow : Window, IDisposable
             mutationCommitted = true;
             InvalidateTableCaches();
             RecordCommittedEdit(operation, result);
+            _session = await _mutationWriteAhead.CompleteAsync(_session!);
 
             UpdateHistoryButtons();
             await RefreshSelectedTableAsync();
@@ -1600,6 +1717,34 @@ public sealed partial class MainWindow : Window, IDisposable
                     "Row operation cancelled",
                     "The app could not confirm whether the database transaction finished. It kept the working session for recovery so that a change that finished late is not overlooked. Review the working copy before making more changes.");
             }
+        }
+        catch (Exception exception) when (!mutationCommitted &&
+            (exception is UnsafeRowMutationException or DBConcurrencyException ||
+             exception is SqliteException { SqliteErrorCode: 19 or 20 }))
+        {
+            string message = exception switch
+            {
+                UnsafeRowMutationException => exception.Message,
+                DBConcurrencyException => "The row changed after it was loaded. Reopen the row to work from its current values.",
+                _ => "The database rejected a value. Check storage classes, required values, unique keys, and referenced IDs.",
+            };
+            if (!await CompleteUnchangedMutationAsync())
+            {
+                return new RowEditResult(true, "The row was not changed, but recovery information could not be updated. Cancel this dialog and save the working copy before making more changes.");
+            }
+            string? invalidColumn = (exception as UnsafeRowMutationException)?.ColumnName;
+            if (exception is SqliteException && _catalog!.TryGetTable(operation.TableName, out TableSchema table))
+            {
+                invalidColumn = table.Columns.OrderByDescending(static column => column.Name.Length)
+                    .FirstOrDefault(column => exception.Message.Contains(
+                        $"{table.Name}.{column.Name}", StringComparison.OrdinalIgnoreCase))?.Name;
+                if (invalidColumn is null && exception is SqliteException { SqliteErrorCode: 20 })
+                {
+                    invalidColumn = table.StableIdentity.Columns.Count == 0 ? null : table.StableIdentity.Columns[0];
+                }
+            }
+            PresentWarning("The row was not changed", message);
+            return new RowEditResult(true, message, invalidColumn);
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
@@ -1626,6 +1771,29 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             EndOperation();
         }
+        return new RowEditResult(false);
+    }
+
+    private sealed record RowEditResult(bool Retry, string? Error = null, string? ColumnName = null);
+
+    private async Task<bool> CompleteUnchangedMutationAsync()
+    {
+        try
+        {
+            if (_operationMutationPrepared && _session?.MutationPending == true)
+            {
+                _session = await _mutationWriteAhead.CompleteAsync(_session);
+                await ReconcileSessionWithHistoryBaselineAsync();
+            }
+            return true;
+        }
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+        {
+            await HandlePreparedMutationFailureAsync(
+                "The row was not changed; recovery information is incomplete",
+                "Save the working copy before making more changes.");
+            return false;
+        }
     }
 
     private void RecordCommittedEdit(EditOperation operation, EditResult result)
@@ -1638,6 +1806,16 @@ public sealed partial class MainWindow : Window, IDisposable
             {
                 TypedRow current = result.CurrentRow
                     ?? throw new InvalidDataException("An updated row was not read back for guarded history.");
+                operation = operation switch
+                {
+                    CellUpdateOperation cell => cell with { NewValue = current.Values[cell.ColumnName] },
+                    RowUpdateOperation row => new RowUpdateOperation(
+                        row.OperationId, row.TableName, row.CreatedAtUtc, row.Identity, row.OldValues,
+                        row.NewValues.Keys.ToDictionary(name => name, name => current.Values[name], StringComparer.OrdinalIgnoreCase),
+                        row.ExpectedRevision),
+                    _ => operation
+                };
+
                 history.Record(operation, [RowReplayGuard.Present(operation.TableName, current)]);
                 break;
             }
@@ -1715,7 +1893,6 @@ public sealed partial class MainWindow : Window, IDisposable
 
         public RiderLookupOption? SelectedLookup { get; set; }
 
-        public CancellationTokenSource? SearchCancellation { get; set; }
     }
 
     private sealed record RiderRoleOption(RiderContractRole Role, string Label)
@@ -1750,9 +1927,13 @@ public sealed partial class MainWindow : Window, IDisposable
         try
         {
             pending = isUndo ? _editHistory.TakeUndoReplay() : _editHistory.TakeRedoReplay();
+            _historyReplayActive = true;
+            RefreshSessionChanges();
         }
-        catch (InvalidOperationException)
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
+            PresentError("Could not start Undo or Redo", SafeFailureMessage(exception, "The working database was not changed."));
+            _historyReplayActive = false;
             UpdateHistoryButtons();
             EndOperation();
             return;
@@ -1768,6 +1949,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 pending,
                 cancellationToken);
             replayCommitted = true;
+            UpdateRiderReceiptAfterReplay(pending.Operation, isUndo);
             InvalidateTableCaches();
             if (isUndo)
             {
@@ -1778,6 +1960,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 _editHistory.CompleteRedo(pending, result.OppositeGuards);
             }
 
+            _session = await _mutationWriteAhead.CompleteAsync(_session!);
             await ReconcileSessionWithHistoryBaselineAsync();
             await RefreshSelectedTableAsync();
             string affectedRowLabel = result.AffectedRows == 1 ? "row" : "rows";
@@ -1796,10 +1979,17 @@ public sealed partial class MainWindow : Window, IDisposable
             }
             else if (_operationMutationPrepared)
             {
-                RestoreFailedReplay(pending, isUndo);
+                if (!RestoreFailedReplay(pending, isUndo)) { return; }
                 await HandleUnconfirmedMutationCancellationAsync(
                     "History replay cancelled",
                     "The app could not confirm whether the undo or redo finished. Reload before trying again. The app will check the saved rows first so that it does not apply a completed change twice.");
+            }
+        }
+        catch (UnsafeRowMutationException exception) when (!replayCommitted)
+        {
+            if (RestoreFailedReplay(pending, isUndo) && await CompleteUnchangedMutationAsync())
+            {
+                PresentWarning("Undo or Redo is unavailable", exception.Message);
             }
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
@@ -1810,7 +2000,7 @@ public sealed partial class MainWindow : Window, IDisposable
             }
             else if (_operationMutationPrepared)
             {
-                RestoreFailedReplay(pending, isUndo);
+                if (!RestoreFailedReplay(pending, isUndo)) { return; }
                 await HandlePreparedMutationFailureAsync(
                     isUndo ? "Could not undo the change" : "Could not redo the change",
                     SafeFailureMessage(
@@ -1819,7 +2009,7 @@ public sealed partial class MainWindow : Window, IDisposable
             }
             else
             {
-                RestoreFailedReplay(pending, isUndo);
+                if (!RestoreFailedReplay(pending, isUndo)) { return; }
                 PresentError(
                     isUndo ? "Could not undo the change" : "Could not redo the change",
                     SafeFailureMessage(exception, "The history entry remains available."));
@@ -1827,34 +2017,51 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         finally
         {
+            _historyReplayActive = false;
             UpdateHistoryButtons();
             EndOperation();
         }
     }
 
-    private void RestoreFailedReplay(EditHistoryReplay replay, bool isUndo)
+    private bool RestoreFailedReplay(EditHistoryReplay replay, bool isUndo)
     {
-        if (isUndo)
+        try
         {
-            _editHistory!.RestoreFailedUndo(replay);
+            if (isUndo)
+            {
+                _editHistory!.RestoreFailedUndo(replay);
+            }
+            else
+            {
+                _editHistory!.RestoreFailedRedo(replay);
+            }
+            return true;
         }
-        else
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            _editHistory!.RestoreFailedRedo(replay);
+            // The pending marker remains intact; reopening recovers the replay safely.
+            PresentWarning("History recovery is incomplete", "Reopen the working session before another Undo or Redo.");
+            return false;
         }
     }
 
     private void UpdateHistoryButtons()
     {
         EditHistoryState? state = _editHistory?.State;
-        UndoButton.IsEnabled = state?.CanUndo == true && !ViewModel.IsBusy && _operationLease is null;
-        RedoButton.IsEnabled = state?.CanRedo == true && !ViewModel.IsBusy && _operationLease is null;
+        UndoButton.IsEnabled = state?.CanUndo == true && !state.HasPendingReplay && !ViewModel.IsBusy && _operationLease is null;
+        RedoButton.IsEnabled = state?.CanRedo == true && !state.HasPendingReplay && !ViewModel.IsBusy && _operationLease is null;
     }
 
-    private void AttachEditHistory(EditorSessionState session)
+    private async Task AttachEditHistoryAsync(EditorSessionState session)
     {
         string historyPath = Path.Combine(session.SessionDirectory, "edit-history.json");
-        _editHistory = new EditHistory(historyPath);
+        _editHistory = new EditHistory(historyPath, recovering: session.IsDirty);
+        if (_editHistory.State.HistoryUncertain || session.MutationPending ||
+            session.IsDirty && !_editHistory.State.IsDirty)
+        {
+            _session = session with { IsDirty = true, HistoryUncertain = true };
+            _session = await _workspaceService.MarkDirtyAsync(_session, CancellationToken.None);
+        }
         UpdateHistoryButtons();
     }
 
@@ -1864,15 +2071,27 @@ public sealed partial class MainWindow : Window, IDisposable
         UpdateHistoryButtons();
     }
 
-    private bool TryMarkHistorySavedBaseline()
+    private async Task<bool> TryMarkHistorySavedBaselineAsync(bool retireUncertainHistory)
     {
         try
         {
-            _editHistory?.MarkSavedBaseline();
+            _editHistory?.MarkSavedBaseline(retireUncertainHistory);
             return true;
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
+            if (_session is not null)
+            {
+                _session = _session with { IsDirty = true, HistoryUncertain = true };
+                try
+                {
+                    _session = await _workspaceService.MarkDirtyAsync(_session, CancellationToken.None);
+                }
+                catch (Exception persistException) when (IsExpectedOperationFailure(persistException))
+                {
+                    // Retain the in-memory warning if recovery metadata is also unavailable.
+                }
+            }
             return false;
         }
     }
@@ -1893,7 +2112,7 @@ public sealed partial class MainWindow : Window, IDisposable
             throw new InvalidOperationException("History baseline reconciliation cannot run during a pending replay.");
         }
 
-        if (historyState.IsDirty)
+        if (historyState.IsDirty || currentSession.MutationPending || currentSession.HistoryUncertain != false)
         {
             if (!currentSession.IsDirty)
             {
@@ -1933,6 +2152,9 @@ public sealed partial class MainWindow : Window, IDisposable
             throw new InvalidOperationException("A database mutation requires an exclusive operation lease.");
         }
 
+        // Replay must restore its pending history entry before reconciling the session baseline.
+        CancellationToken cancellationToken = _historyReplayActive ? CancellationToken.None : _operationLease.Token;
+        cancellationToken.ThrowIfCancellationRequested();
         EditorSessionState currentSession = _session
             ?? throw new InvalidOperationException("The active working session closed before the mutation boundary.");
         if (currentSession.SessionId != expectedSession.SessionId ||
@@ -1945,12 +2167,19 @@ public sealed partial class MainWindow : Window, IDisposable
 
         _session = currentSession with { IsDirty = true };
         ViewModel.State = ShellOperationState.Dirty;
+        UpdatePersistentSaveState();
         _session = await _mutationWriteAhead.PrepareAsync(currentSession);
         _operationMutationPrepared = true;
+        if (cancellationToken.IsCancellationRequested)
+        {
+            _operationMutationPrepared = !await CompleteUnchangedMutationAsync();
+            cancellationToken.ThrowIfCancellationRequested();
+        }
     }
 
     private void InvalidateTableCaches()
     {
+        InvalidateMaintenanceTeamChoices();
         TableTabContext[] contexts = _tableTabs.Values
             .Select(static tab => tab.Tag)
             .OfType<TableTabContext>()
@@ -1971,6 +2200,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
         foreach (TabViewItem tab in _tableTabs.Values)
         {
+            CancelVirtualCount(tab);
             if (tab.Tag is TableTabContext context)
             {
                 TableRowCountState countState = context.Display.RowDisplay.IsAllRows
@@ -2060,9 +2290,9 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void PresentCommittedRefreshCancellation(string completedChange)
     {
-        PresentWarning(
+        PresentTableQueryWarning(
             "Table refresh cancelled",
-            $"{completedChange} The previous completed rows remain visible and may now be stale. Change the table query or switch tabs to reload them.");
+            $"{completedChange} The previous completed rows remain visible and may now be stale. Use Refresh to reload them.");
     }
 
     private async void CurrentTableSearchBox_TextChanged(
@@ -2117,7 +2347,7 @@ public sealed partial class MainWindow : Window, IDisposable
             if (request.Lease.IsCurrent)
             {
                 RestorePreviousTable(request, "The previous table remains available.");
-                PresentError(
+                PresentTableQueryError(
                     "Could not search the table",
                     SafeFailureMessage(exception, "The working database was not changed."));
             }
@@ -2136,6 +2366,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private async void PageSizeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_suppressPageSizeSelection ||
+            PageSizeBox.SelectedIndex < 0 ||
             _operationLease is not null ||
             _activeTableLoad is not null ||
             TableTabs.SelectedItem is not TabViewItem tab ||
@@ -2146,86 +2377,26 @@ public sealed partial class MainWindow : Window, IDisposable
 
         TableRowDisplayChoice rowDisplay = TableRowDisplayOptions.FromToolbarIndex(
             PageSizeBox.SelectedIndex);
-        context = context with
-        {
-            PendingRowDisplay = rowDisplay,
-            IsInvalidated = true,
-        };
-        tab.Tag = context;
-        UpdateCountAndPagingChrome(tab, context);
-        if (!rowDisplay.IsAllRows)
-        {
-            int pageSize = rowDisplay.PageSize!.Value;
-            var preferencesToSave = new EditorPreferences(
-                _preferences.Theme,
-                _preferences.Density,
-                pageSize,
-                _preferences.ForeignKeyDisplayMode,
-                _preferences.RecentFiles);
-            _preferences = preferencesToSave;
-            var saveGateEntered = false;
-            try
-            {
-                await _pageSizePreferenceSaveGate.WaitAsync(_lifetimeCancellation.Token);
-                saveGateEntered = true;
-                await _settingsStore.SavePreferencesAsync(
-                    preferencesToSave,
-                    _lifetimeCancellation.Token);
-            }
-            catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception exception) when (IsExpectedOperationFailure(exception))
-            {
-                PresentWarning(
-                    "Page-size preference was not saved",
-                    SafeFailureMessage(exception, "The current table can still be reloaded."));
-            }
-            finally
-            {
-                if (saveGateEntered)
-                {
-                    _pageSizePreferenceSaveGate.Release();
-                }
-            }
-
-            if (_operationLease is not null ||
-                _activeTableLoad is not null ||
-                !ReferenceEquals(TableTabs.SelectedItem, tab) ||
-                tab.Tag is not TableTabContext currentContext ||
-                !ReferenceEquals(currentContext.Display, context.Display) ||
-                !ReferenceEquals(currentContext.Coordinator, context.Coordinator) ||
-                PageSizeBox.SelectedIndex != TableRowDisplayOptions.GetToolbarIndex(rowDisplay))
-            {
-                return;
-            }
-
-            context = currentContext;
-        }
-
-        TableQueryOutcome queryOutcome = await LoadTableQueryAsync(
-            context,
-            context.SearchText,
-            context.Filter,
-            rowDisplay);
-        if (queryOutcome == TableQueryOutcome.Succeeded ||
-            tab.Tag is not TableTabContext pendingContext ||
-            !ReferenceEquals(pendingContext.Display, context.Display) ||
-            !ReferenceEquals(pendingContext.Coordinator, context.Coordinator))
+        TableQueryOutcome outcome = await LoadTableQueryAsync(
+            context, context.SearchText, context.Filter, rowDisplay);
+        if (outcome != TableQueryOutcome.Succeeded || rowDisplay.IsAllRows)
         {
             return;
         }
 
-        pendingContext = pendingContext with
+        try
         {
-            PendingRowDisplay = rowDisplay,
-            IsInvalidated = true,
-        };
-        tab.Tag = pendingContext;
-        if (ReferenceEquals(TableTabs.SelectedItem, tab) && _activeTableLoad is null)
+            await SavePreferencesAsync(current => new EditorPreferences(
+                current.Theme, current.Density, rowDisplay.PageSize!.Value,
+                current.ForeignKeyDisplayMode, current.RecentFiles), _lifetimeCancellation.Token);
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
         {
-            UpdateTabChrome(tab, pendingContext);
+        }
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+        {
+            PresentWarning("Default page size was not saved",
+                SafeFailureMessage(exception, "The loaded table keeps its selected page size."));
         }
     }
 
@@ -2286,11 +2457,13 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
-        ColumnSchema[] columns = context.Schema.Columns
-            .Where(static column => !column.IsHidden && column.Affinity != SqliteAffinity.Blob)
-            .OrderBy(static column => column.Ordinal)
+        DatabaseSchemaCatalog catalog = _catalog
+            ?? throw new InvalidOperationException("A schema catalog is required.");
+        TableQueryColumnOption[] columns = ForeignKeySortDescriptorMapper.GetOptions(catalog, context.Schema)
+            .Where(column => column.Affinity != SqliteAffinity.Blob ||
+                RelationshipMetadata.TryGetLabelRelation(catalog, context.Schema, column.ColumnName, out _))
             .ToArray();
-        if (columns.Length == 0)
+        if (columns.Length == 0 && context.FilterDefinition.ReferenceFilter is null)
         {
             PresentWarning("Filter unavailable", "This table has no columns supported by typed filters.");
             return;
@@ -2320,7 +2493,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async Task<TableFilterDialogOutcome?> ShowTableFilterDialogAsync(
         TableTabContext context,
-        ColumnSchema[] columns)
+        TableQueryColumnOption[] columns)
     {
         var quickRows = new List<FilterRuleEditor>();
         var advancedRows = new List<FilterRuleEditor>();
@@ -2411,6 +2584,14 @@ public sealed partial class MainWindow : Window, IDisposable
             {
                 advancedRows.Remove(editor);
                 RefreshAdvancedRules();
+                string number = editor.Number.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                bool referenced = System.Text.RegularExpressions.Regex.IsMatch(expressionBox.Text, $@"(?<![0-9])0*{number}(?![0-9])");
+                validationText.Text = referenced
+                    ? $"Rule {number} was removed. Remove its number and any dangling AND or OR from the expression."
+                    : $"Rule {number} was removed.";
+                AutomationProperties.SetName(validationText, validationText.Text);
+                validationText.Visibility = Visibility.Visible;
+                expressionBox.Focus(FocusState.Programmatic);
             };
             advancedRows.Add(editor);
             RefreshAdvancedRules();
@@ -2433,35 +2614,54 @@ public sealed partial class MainWindow : Window, IDisposable
         RefreshQuickRules();
         RefreshAdvancedRules();
 
-        var addQuickButton = new Button { Content = "Add quick rule" };
+        var addQuickButton = new Button { Content = "Add quick rule", IsEnabled = columns.Length != 0 };
         addQuickButton.Click += (_, _) => AddQuickRule(
-            new FilterRuleDraft(0, columns[0].Name, FilterOperator.Contains, string.Empty),
+            new FilterRuleDraft(0, columns[0].ColumnName, FilterOperator.Contains, string.Empty, columns[0].Target),
             moveFocus: true);
         AutomationProperties.SetHelpText(
             addQuickButton,
             "Quick rules are combined with each other and the advanced expression using AND.");
-        var addAdvancedButton = new Button { Content = "Add advanced rule" };
+        var addAdvancedButton = new Button { Content = "Add advanced rule", IsEnabled = columns.Length != 0 };
+        int nextRuleNumber = advancedRows.Count == 0 ? 1 : checked(advancedRows.Max(row => row.Number) + 1);
         addAdvancedButton.Click += (_, _) =>
         {
-            int nextNumber = advancedRows.Count == 0
-                ? 1
-                : checked(advancedRows.Max(static row => row.Number) + 1);
+            int nextNumber = nextRuleNumber++;
             AddAdvancedRule(
                 new FilterRuleDraft(
                     nextNumber,
-                    columns[0].Name,
+                    columns[0].ColumnName,
                     FilterOperator.Contains,
-                    string.Empty),
+                    string.Empty,
+                    columns[0].Target),
                 moveFocus: true);
             expressionBox.Text = string.IsNullOrWhiteSpace(expressionBox.Text)
                 ? nextNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                : $"{expressionBox.Text.Trim()} AND {nextNumber}";
+                : $"({expressionBox.Text.Trim()}) AND {nextNumber}";
         };
         AutomationProperties.SetHelpText(
             addAdvancedButton,
             "Adds a numbered rule that can be referenced in the advanced expression.");
 
-        var content = new StackPanel { Spacing = 12, Width = 640 };
+        var content = new StackPanel { Spacing = 12, MaxWidth = 640 };
+        FilterCondition? referenceFilter = context.FilterDefinition.ReferenceFilter;
+        if (referenceFilter is { } currentReference)
+        {
+            var reference = new StackPanel { Spacing = 4 };
+            reference.Children.Add(new TextBlock
+            {
+                Text = $"Referenced row filter: {currentReference.ColumnName} equals {DescribeRelationshipKey(currentReference.Value)}",
+                TextWrapping = TextWrapping.Wrap,
+            });
+            var removeReference = new Button { Content = "Remove referenced row filter" };
+            removeReference.Click += (_, _) =>
+            {
+                referenceFilter = null;
+                reference.Visibility = Visibility.Collapsed;
+                expressionBox.Focus(FocusState.Programmatic);
+            };
+            reference.Children.Add(removeReference);
+            content.Children.Add(reference);
+        }
         content.Children.Add(new TextBlock
         {
             Text = "Quick rules always use AND. Advanced rules accept AND, OR, and parentheses; AND runs first.",
@@ -2481,7 +2681,7 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             Content = content,
             MaxHeight = 560,
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
         };
         var dialog = new ContentDialog
@@ -2499,19 +2699,13 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             try
             {
-                FilterRuleDraft[] quickDrafts = quickRows
-                    .Select(static editor => editor.ToDraft(number: 0))
-                    .ToArray();
                 FilterCondition[] quickConditions = quickRows
-                    .Select(editor => BuildFilterCondition(editor, columns))
-                    .ToArray();
-                FilterRuleDraft[] advancedDrafts = advancedRows
-                    .Select(static editor => editor.ToDraft(editor.Number))
+                    .Select(BuildFilterCondition)
                     .ToArray();
                 NumberedFilterRule[] advancedRules = advancedRows
                     .Select(editor => new NumberedFilterRule(
                         editor.Number,
-                        BuildFilterCondition(editor, columns)))
+                        BuildFilterCondition(editor)))
                     .ToArray();
                 FilterExpression? advancedFilter = null;
                 if (advancedRules.Length > 0)
@@ -2527,12 +2721,15 @@ public sealed partial class MainWindow : Window, IDisposable
                 }
 
                 var definition = new TableFilterDefinition(
-                    quickDrafts,
-                    advancedDrafts,
-                    expressionBox.Text.Trim());
+                    quickRows.Select(static editor => editor.ToDraft(number: 0)),
+                    advancedRows.Select(static editor => editor.ToDraft(editor.Number)),
+                    expressionBox.Text.Trim(),
+                    referenceFilter);
                 outcome = new TableFilterDialogOutcome(
                     definition,
-                    CombineWithAnd(quickConditions, advancedFilter));
+                    CombineWithAnd(referenceFilter is { } referenced
+                        ? quickConditions.Prepend(referenced)
+                        : quickConditions, advancedFilter));
                 validationText.Text = string.Empty;
                 validationText.Visibility = Visibility.Collapsed;
             }
@@ -2559,17 +2756,16 @@ public sealed partial class MainWindow : Window, IDisposable
     }
 
     private static FilterRuleEditor CreateFilterRuleEditor(
-        ColumnSchema[] columns,
+        TableQueryColumnOption[] columns,
         FilterRuleDraft draft,
         int number)
     {
-        string[] columnNames = columns.Select(static column => column.Name).ToArray();
-        int columnIndex = Array.FindIndex(columnNames, name =>
-            name.Equals(draft.ColumnName, StringComparison.OrdinalIgnoreCase));
+        int columnIndex = Array.FindIndex(columns, option => option.Matches(draft.ColumnName, draft.Target));
         var columnPicker = new ComboBox
         {
             Header = "Column",
-            ItemsSource = columnNames,
+            ItemsSource = columns,
+            DisplayMemberPath = nameof(TableQueryColumnOption.Label),
             SelectedIndex = Math.Max(0, columnIndex),
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
@@ -2650,7 +2846,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
         void UpdateOperators(FilterOperator preferred)
         {
-            ColumnSchema selectedColumn = columns[Math.Max(0, columnPicker.SelectedIndex)];
+            TableQueryColumnOption selectedColumn = columns[Math.Max(0, columnPicker.SelectedIndex)];
             IReadOnlyList<FilterOperatorChoice> choices = GetFilterOperatorChoices(selectedColumn);
             operatorPicker.ItemsSource = choices;
             int selectedIndex = choices
@@ -2682,16 +2878,20 @@ public sealed partial class MainWindow : Window, IDisposable
         return editor;
     }
 
-    private static List<FilterOperatorChoice> GetFilterOperatorChoices(ColumnSchema column)
+    private static List<FilterOperatorChoice> GetFilterOperatorChoices(TableQueryColumnOption column)
     {
         var choices = new List<FilterOperatorChoice>
         {
             new(FilterOperator.Contains, "Contains"),
             new(FilterOperator.StartsWith, "Starts with"),
             new(FilterOperator.EndsWith, "Ends with"),
-            new(FilterOperator.Equals, "Equals"),
-            new(FilterOperator.NotEquals, "Not equal"),
         };
+        if (column.Affinity != SqliteAffinity.Blob)
+        {
+            choices.Add(new FilterOperatorChoice(FilterOperator.Equals, "Equals"));
+            choices.Add(new FilterOperatorChoice(FilterOperator.NotEquals, "Not equal"));
+        }
+
         if (column.Affinity is SqliteAffinity.Integer or SqliteAffinity.Real or SqliteAffinity.Numeric)
         {
             choices.Add(new FilterOperatorChoice(FilterOperator.GreaterThan, "Greater than"));
@@ -2700,8 +2900,9 @@ public sealed partial class MainWindow : Window, IDisposable
             choices.Add(new FilterOperatorChoice(FilterOperator.LessThanOrEqual, "Less than or equal"));
         }
 
-        choices.Add(new FilterOperatorChoice(FilterOperator.IsNull, "Is NULL"));
-        choices.Add(new FilterOperatorChoice(FilterOperator.IsNotNull, "Is not NULL"));
+        bool isLabel = column.Target == QueryValueTarget.RelatedLabel;
+        choices.Add(new FilterOperatorChoice(FilterOperator.IsNull, isLabel ? "Name unavailable" : "Is NULL"));
+        choices.Add(new FilterOperatorChoice(FilterOperator.IsNotNull, isLabel ? "Name available" : "Is not NULL"));
         return choices;
     }
 
@@ -2717,26 +2918,30 @@ public sealed partial class MainWindow : Window, IDisposable
         AutomationProperties.SetName(editor.RemoveButton, $"Remove {label.ToLowerInvariant()}");
     }
 
-    private static FilterCondition BuildFilterCondition(
-        FilterRuleEditor editor,
-        ColumnSchema[] columns)
+    private static FilterCondition BuildFilterCondition(FilterRuleEditor editor)
     {
-        if (editor.ColumnPicker.SelectedItem is not string columnName ||
+        if (editor.ColumnPicker.SelectedItem is not TableQueryColumnOption column ||
             editor.OperatorPicker.SelectedItem is not FilterOperatorChoice operatorChoice)
         {
             throw new FilterParseException($"{editor.Label.Text} is incomplete.");
         }
 
-        ColumnSchema column = columns.First(candidate =>
-            candidate.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase));
-        if (!TryParseFilterValue(column, operatorChoice.Operator, editor.ValueBox.Text, out SqliteValue value))
+        if (editor.ValueBox.Text.Length == 0 &&
+            operatorChoice.Operator is FilterOperator.Contains or FilterOperator.StartsWith or FilterOperator.EndsWith)
+        {
+            editor.ValueBox.Focus(FocusState.Programmatic);
+            throw new FilterParseException(
+                $"{editor.Label.Text} needs text for a pattern. Choose Equals for empty text.");
+        }
+
+        if (!TryParseFilterValue(column.Affinity, operatorChoice.Operator, editor.ValueBox.Text, out SqliteValue value))
         {
             editor.ValueBox.Focus(FocusState.Programmatic);
             throw new FilterParseException(
                 $"{editor.Label.Text} needs an invariant value compatible with {column.Affinity} affinity.");
         }
 
-        return new FilterCondition(column.Name, operatorChoice.Operator, value);
+        return new FilterCondition(column.ColumnName, operatorChoice.Operator, value, column.Target);
     }
 
     private static FilterExpression? CombineWithAnd(
@@ -2775,10 +2980,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
         DatabaseSchemaCatalog catalog = _catalog
             ?? throw new InvalidOperationException("A schema catalog is required.");
-        TableSortOption[] options = ForeignKeySortDescriptorMapper.GetOptions(
-            catalog,
-            context.Schema,
-            context.ForeignKeyDisplayMode);
+        TableQueryColumnOption[] options = ForeignKeySortDescriptorMapper.GetOptions(catalog, context.Schema);
         if (options.Length == 0)
         {
             PresentWarning("Sort unavailable", "This table has no visible columns to sort.");
@@ -2810,7 +3012,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async Task<IReadOnlyList<SortDescriptor>?> ShowTableSortDialogAsync(
         TableTabContext context,
-        TableSortOption[] options)
+        TableQueryColumnOption[] options)
     {
         var sortRows = new List<SortRuleEditor>();
         var sortRowsPanel = new StackPanel { Spacing = 6 };
@@ -2847,12 +3049,9 @@ public sealed partial class MainWindow : Window, IDisposable
 
         void AddSortRule(SortDescriptor? descriptor = null, bool moveFocus = true)
         {
-            string selectedColumn = descriptor?.ColumnName ?? options.First(option =>
-                !sortRows.Any(row =>
-                    row.ColumnPicker.SelectedItem is TableSortOption selected &&
-                    selected.DescriptorColumnName.Equals(
-                        option.DescriptorColumnName,
-                        StringComparison.OrdinalIgnoreCase))).DescriptorColumnName;
+            TableQueryColumnOption selectedColumn = descriptor is null
+                ? options.First(option => !sortRows.Any(row => Equals(row.ColumnPicker.SelectedItem, option)))
+                : options.First(option => option.Matches(descriptor.ColumnName, descriptor.Target));
             SortRuleEditor editor = CreateSortRuleEditor(
                 options,
                 selectedColumn,
@@ -2884,7 +3083,6 @@ public sealed partial class MainWindow : Window, IDisposable
                     editor.ColumnPicker.Focus(FocusState.Programmatic);
                 }
             };
-            editor.ColumnPicker.SelectionChanged += (_, _) => RefreshSortRows();
             sortRows.Add(editor);
             RefreshSortRows();
             if (moveFocus)
@@ -2906,9 +3104,9 @@ public sealed partial class MainWindow : Window, IDisposable
         addSortButton.Click += (_, _) => AddSortRule();
         AutomationProperties.SetHelpText(
             addSortButton,
-            "Adds the next sort priority. Duplicate columns are rejected when the sort is applied.");
+            "Adds the next sort priority. Each stored value or related name can be used once.");
 
-        var content = new StackPanel { Spacing = 12, Width = 620 };
+        var content = new StackPanel { Spacing = 12, MaxWidth = 620 };
         content.Children.Add(new TextBlock
         {
             Text = "Priority runs from top to bottom. Stable identity columns are appended automatically for deterministic paging.",
@@ -2921,7 +3119,7 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             Content = content,
             MaxHeight = 540,
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
         };
         var dialog = new ContentDialog
@@ -2934,16 +3132,15 @@ public sealed partial class MainWindow : Window, IDisposable
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary,
         };
+        dialog.Opened += (_, _) => sortRows[0].ColumnPicker.Focus(FocusState.Programmatic);
         IReadOnlyList<SortDescriptor>? acceptedSorts = null;
         dialog.PrimaryButtonClick += (_, args) =>
         {
-            TableSortOption[] selectedOptions = sortRows
-                .Select(static editor => (TableSortOption)editor.ColumnPicker.SelectedItem)
+            TableQueryColumnOption[] selectedOptions = sortRows
+                .Select(static editor => (TableQueryColumnOption)editor.ColumnPicker.SelectedItem)
                 .ToArray();
-            TableSortOption? duplicate = selectedOptions
-                .GroupBy(
-                    static option => option.DescriptorColumnName,
-                    StringComparer.OrdinalIgnoreCase)
+            TableQueryColumnOption? duplicate = selectedOptions
+                .GroupBy(static option => option)
                 .FirstOrDefault(static group => group.Count() > 1)
                 ?.First();
             if (duplicate is not null)
@@ -2955,20 +3152,20 @@ public sealed partial class MainWindow : Window, IDisposable
                 AutomationProperties.SetName(
                     validationText,
                     $"Sort validation error: {validationText.Text}");
-                sortRows.First(row =>
-                    row.ColumnPicker.SelectedItem is TableSortOption selected &&
-                    selected.DescriptorColumnName.Equals(
-                        duplicate.DescriptorColumnName,
-                        StringComparison.OrdinalIgnoreCase)).ColumnPicker.Focus(FocusState.Programmatic);
+                sortRows.First(row => Equals(row.ColumnPicker.SelectedItem, duplicate))
+                    .ColumnPicker.Focus(FocusState.Programmatic);
                 return;
             }
 
             acceptedSorts = sortRows
-                .Select(static editor => new SortDescriptor(
-                    ((TableSortOption)editor.ColumnPicker.SelectedItem).DescriptorColumnName,
-                    editor.DirectionPicker.SelectedIndex == 1
-                        ? SortDirection.Descending
-                        : SortDirection.Ascending))
+                .Select(static editor =>
+                {
+                    var column = (TableQueryColumnOption)editor.ColumnPicker.SelectedItem;
+                    return new SortDescriptor(
+                        column.ColumnName,
+                        editor.DirectionPicker.SelectedIndex == 1 ? SortDirection.Descending : SortDirection.Ascending,
+                        column.Target);
+                })
                 .ToArray();
             validationText.Text = string.Empty;
             validationText.Visibility = Visibility.Collapsed;
@@ -2984,12 +3181,10 @@ public sealed partial class MainWindow : Window, IDisposable
     }
 
     private static SortRuleEditor CreateSortRuleEditor(
-        TableSortOption[] options,
-        string selectedColumn,
+        TableQueryColumnOption[] options,
+        TableQueryColumnOption selectedColumn,
         SortDirection direction)
     {
-        int selectedIndex = Array.FindIndex(options, option =>
-            option.DescriptorColumnName.Equals(selectedColumn, StringComparison.OrdinalIgnoreCase));
         var priorityLabel = new TextBlock
         {
             VerticalAlignment = VerticalAlignment.Center,
@@ -3031,8 +3226,8 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             Header = "Column",
             ItemsSource = options,
-            DisplayMemberPath = nameof(TableSortOption.Label),
-            SelectedIndex = Math.Max(0, selectedIndex),
+            DisplayMemberPath = nameof(TableQueryColumnOption.Label),
+            SelectedItem = selectedColumn,
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
         var directionPicker = new ComboBox
@@ -3072,7 +3267,8 @@ public sealed partial class MainWindow : Window, IDisposable
         TableRowDisplayChoice rowDisplay,
         long offset = 0,
         IReadOnlyList<SortDescriptor>? sorts = null,
-        TableFilterDefinition? filterDefinition = null)
+        TableFilterDefinition? filterDefinition = null,
+        bool refresh = false)
     {
         TableLoadRequest request = BeginQuery(context.Schema.Name, showLoadingSurface: true);
         TableQueryOutcome outcome;
@@ -3087,7 +3283,8 @@ public sealed partial class MainWindow : Window, IDisposable
                 offset,
                 sorts ?? context.Sorts,
                 filterDefinition ?? context.FilterDefinition,
-                loadRequest: request);
+                loadRequest: request,
+                refresh: refresh);
             request.Lease.ThrowIfSuperseded(request.Token);
             outcome = TableQueryOutcome.Succeeded;
         }
@@ -3103,7 +3300,7 @@ public sealed partial class MainWindow : Window, IDisposable
             if (request.Lease.IsCurrent)
             {
                 RestorePreviousTable(request, "The previous table remains available.");
-                PresentError(
+                PresentTableQueryError(
                     "Could not update the table query",
                     SafeFailureMessage(exception, "The working database was not changed."));
             }
@@ -3117,7 +3314,7 @@ public sealed partial class MainWindow : Window, IDisposable
     }
 
     private static bool TryParseFilterValue(
-        ColumnSchema column,
+        SqliteAffinity affinity,
         FilterOperator filterOperator,
         string text,
         out SqliteValue value)
@@ -3134,7 +3331,7 @@ public sealed partial class MainWindow : Window, IDisposable
             return true;
         }
 
-        switch (column.Affinity)
+        switch (affinity)
         {
             case SqliteAffinity.Integer when long.TryParse(
                 text,
@@ -3212,6 +3409,8 @@ public sealed partial class MainWindow : Window, IDisposable
             CaptureCurrentTabState(previous);
             stateToPersist = previous.Tag as TableTabContext;
         }
+        Task persistLayout = PersistCapturedTableStateAsync(
+            stateToPersist, sessionId, _lifetimeCancellation.Token);
 
         TabViewItem? selected = TableTabs.SelectedItem as TabViewItem;
         if (selected is not null)
@@ -3237,202 +3436,16 @@ public sealed partial class MainWindow : Window, IDisposable
 
         SynchronizeTableSelectionToTab(TableTabs.SelectedItem as TabViewItem);
 
-        await PersistCapturedTableStateAsync(
-            stateToPersist,
-            sessionId,
-            _lifetimeCancellation.Token);
-    }
-
-    private async void Save_Click(object sender, RoutedEventArgs e)
-    {
-        await SaveCurrentAsync();
-    }
-
-    private async Task<bool> SaveCurrentAsync(CancellationToken? ownedOperationToken = null)
-    {
-        if (_session is null || ViewModel.IsBusy)
-        {
-            PresentWarning("Save is unavailable", "No ready working session is open.");
-            return false;
-        }
-
-        bool ownsOperation = !ownedOperationToken.HasValue;
-        CancellationToken cancellationToken;
-        if (ownsOperation)
-        {
-            if (!TryBeginOperation("Save", out cancellationToken))
-            {
-                return false;
-            }
-        }
-        else
-        {
-            if (_operationLease is null)
-            {
-                throw new InvalidOperationException("A nested save requires the caller's exclusive operation lease.");
-            }
-
-            cancellationToken = ownedOperationToken!.Value;
-        }
-
-        ViewModel.State = ShellOperationState.Saving;
-        ViewModel.Status = "Saving database…";
-        BusyIndicator.Visibility = Visibility.Visible;
-        CancelOperationButton.Visibility = Visibility.Visible;
-        CancelOperationButton.IsEnabled = true;
-        PresentInformation("Saving database", "Converting to a staged CDB before the destination is replaced.");
-        try
-        {
-            WorkspaceSaveResult result = await _workspaceService.SaveAsync(_session, cancellationToken);
-            _session = result.Session;
-            bool historyBaselineSaved = TryMarkHistorySavedBaseline();
-            SetReadyState();
-            if (historyBaselineSaved)
-            {
-                PresentSuccess(
-                    "Database saved",
-                    result.BackupPath is null
-                        ? "The destination was replaced from a validated staged CDB."
-                        : "The destination was replaced and the previous CDB was backed up.");
-            }
-            else
-            {
-                PresentWarning(
-                    "Database saved; reopen before editing",
-                    "The destination was replaced safely, but the app could not mark the current Undo history as saved. Reopen the database before making more edits.");
-            }
-            return true;
-        }
-        catch (WorkspaceSaveCommitException exception)
-        {
-            await AdoptCommittedSaveAfterMetadataFailureAsync(
-                exception.CommittedSave,
-                rememberDestination: false);
-            return true;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            RestoreSessionState();
-            if (!_lifetimeCancellation.IsCancellationRequested)
-            {
-                PresentWarning("Save cancelled", "The destination was not replaced.");
-            }
-
-            return false;
-        }
-        catch (Exception exception) when (IsExpectedOperationFailure(exception))
-        {
-            RestoreSessionState();
-            PresentError(
-                "Could not save the database",
-                SafeFailureMessage(exception, "The destination was not replaced."));
-            return false;
-        }
-        finally
-        {
-            BusyIndicator.Visibility = Visibility.Collapsed;
-            if (ownsOperation)
-            {
-                EndOperation();
-            }
-        }
-    }
-
-    private async void SaveAs_Click(object sender, RoutedEventArgs e)
-    {
-        if (_session is null || ViewModel.IsBusy)
-        {
-            PresentWarning("Save as is unavailable", "No ready working session is open.");
-            return;
-        }
-
-        var picker = new FileSavePicker
-        {
-            SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
-            SuggestedFileName = Path.GetFileNameWithoutExtension(_session.SaveTargetCdbPath),
-            DefaultFileExtension = ".cdb",
-        };
-        picker.FileTypeChoices.Add("PCM database", [".cdb"]);
-        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
-        Windows.Storage.StorageFile? selected = await picker.PickSaveFileAsync();
-        if (selected is null)
-        {
-            return;
-        }
-
-        if (!TryBeginOperation("Save as", out CancellationToken cancellationToken))
-        {
-            return;
-        }
-
-        ViewModel.State = ShellOperationState.Saving;
-        ViewModel.Status = "Saving a new CDB…";
-        BusyIndicator.Visibility = Visibility.Visible;
-        CancelOperationButton.Visibility = Visibility.Visible;
-        CancelOperationButton.IsEnabled = true;
-        PresentInformation("Saving database as", "Converting to a staged CDB before the chosen destination is replaced.");
-        try
-        {
-            WorkspaceSaveResult result = await _workspaceService.SaveAsAsync(
-                _session,
-                selected.Path,
-                cancellationToken);
-            _session = result.Session;
-            bool historyBaselineSaved = TryMarkHistorySavedBaseline();
-            ViewModel.DatabaseName = Path.GetFileName(result.Session.SaveTargetCdbPath);
-            await RememberRecentFileAsync(
-                result.Session.SaveTargetCdbPath,
-                CancellationToken.None);
-            SetReadyState();
-            if (historyBaselineSaved)
-            {
-                PresentSuccess(
-                    "Database saved as",
-                    result.BackupPath is null
-                        ? "The new destination was created from a validated staged CDB."
-                        : "The destination was replaced and its previous CDB was backed up.");
-            }
-            else
-            {
-                PresentWarning(
-                    "Database saved as; reopen before editing",
-                    "The chosen destination was replaced safely, but the app could not mark the current Undo history as saved. Reopen the database before making more edits.");
-            }
-        }
-        catch (WorkspaceSaveCommitException exception)
-        {
-            await AdoptCommittedSaveAfterMetadataFailureAsync(
-                exception.CommittedSave,
-                rememberDestination: true);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            RestoreSessionState();
-            if (!_lifetimeCancellation.IsCancellationRequested)
-            {
-                PresentWarning("Save as cancelled", "The chosen destination was not replaced.");
-            }
-        }
-        catch (Exception exception) when (IsExpectedOperationFailure(exception))
-        {
-            RestoreSessionState();
-            PresentError(
-                "Could not save the database as",
-                SafeFailureMessage(exception, "The chosen destination was not replaced."));
-        }
-        finally
-        {
-            BusyIndicator.Visibility = Visibility.Collapsed;
-            EndOperation();
-        }
+        await persistLayout;
     }
 
     private async Task AdoptCommittedSaveAfterMetadataFailureAsync(
         WorkspaceSaveResult committedSave,
-        bool rememberDestination)
+        bool rememberDestination,
+        bool retireUncertainHistory)
     {
         _session = committedSave.Session;
-        bool historyBaselineSaved = TryMarkHistorySavedBaseline();
+        bool historyBaselineSaved = await TryMarkHistorySavedBaselineAsync(retireUncertainHistory);
         if (rememberDestination)
         {
             ViewModel.DatabaseName = Path.GetFileName(committedSave.Session.SaveTargetCdbPath);
@@ -3442,18 +3455,15 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         SetReadyState();
-        if (historyBaselineSaved)
+        string message = historyBaselineSaved
+            ? "The destination was saved, but the app could not update the saved session information."
+            : "The destination was saved, but the app could not update the session information or the Undo baseline.";
+        if (committedSave.DestinationChangedAtCommit)
         {
-            PresentWarning(
-                "Destination saved; reopen before editing",
-                "The destination was saved, but the app could not update the saved session information. Reopen the saved CDB before making more edits.");
+            message += " The destination changed during replacement. Open Save details for the preserved backup.";
         }
-        else
-        {
-            PresentWarning(
-                "Destination saved; reopen before editing",
-                "The destination was saved, but the app could not update the saved session information or mark the current Undo history as saved. Reopen the saved CDB before making more edits.");
-        }
+        PresentWarning("Destination saved. Reopen before editing",
+            $"{message} Reopen the saved CDB before making more edits.");
     }
 
     private async void AppWindow_Closing(AppWindow sender, AppWindowClosingEventArgs args)
@@ -3461,6 +3471,19 @@ public sealed partial class MainWindow : Window, IDisposable
         if (_allowClose)
         {
             Dispose();
+            return;
+        }
+
+        if (_rowEditorOpen || _rowDetailsOpen || _relationshipCellEditorOpen)
+        {
+            args.Cancel = true;
+            return;
+        }
+
+        if (TableGrid.IsEditing)
+        {
+            args.Cancel = true;
+            PresentWarning("Finish the cell edit", "Press Enter to commit the value or Escape to cancel it, then close the window.");
             return;
         }
 
@@ -3494,6 +3517,10 @@ public sealed partial class MainWindow : Window, IDisposable
         try
         {
             await PersistActiveTableStateAsync(cancellationToken);
+            if (!await ConfirmDiscardRiderDraftAsync())
+            {
+                return;
+            }
             bool discard = false;
             if (_session.IsDirty)
             {
@@ -3545,6 +3572,7 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.IsInspectorOpen = false;
         RowInspectorToggle.IsChecked = false;
         ApplyInspectorPresentation(Workspace.ActualWidth);
+        TableGrid.FocusCurrentRow();
     }
 
     private void RowInspectorToggle_Click(object sender, RoutedEventArgs e)
@@ -3561,6 +3589,21 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         ApplyInspectorPresentation(e.NewSize.Width);
+        bool stackQuery = e.NewSize.Width < 900;
+        TableSidebarColumn.Width = new GridLength(stackQuery
+            ? Math.Clamp(e.NewSize.Width * 0.27, 110, 220)
+            : 220);
+        Grid.SetColumnSpan(CurrentTableSearchBox, stackQuery ? 4 : 1);
+        Grid.SetRow(TableQueryButtons, stackQuery ? 1 : 0);
+        Grid.SetRow(PageSizeBox, stackQuery ? 1 : 0);
+        Grid.SetRow(TablePagingButtons, stackQuery ? 1 : 0);
+
+        bool stackRiderActions = e.NewSize.Width < 580;
+        RecoveryActions.Orientation = stackRiderActions ? Orientation.Vertical : Orientation.Horizontal;
+        RiderAbilityLimitActions.Orientation = stackRiderActions ? Orientation.Vertical : Orientation.Horizontal;
+        Grid.SetColumnSpan(RiderCurrentAbilityOverrideBox, stackRiderActions ? 2 : 1);
+        Grid.SetColumn(ResetRiderCurrentAbilityButton, stackRiderActions ? 0 : 1);
+        Grid.SetRow(ResetRiderCurrentAbilityButton, stackRiderActions ? 1 : 0);
 
         Navigation.PaneDisplayMode = e.NewSize.Width < 720
             ? NavigationViewPaneDisplayMode.LeftMinimal
@@ -3570,11 +3613,31 @@ public sealed partial class MainWindow : Window, IDisposable
     private void ApplyInspectorPresentation(double workspaceWidth)
     {
         bool isVisible = ViewModel.IsInspectorOpen && workspaceWidth >= 980;
+        bool moveFocus = !isVisible && Inspector.Visibility == Visibility.Visible &&
+            IsInsideInspector(FocusManager.GetFocusedElement(WindowRoot.XamlRoot) as DependencyObject);
         Inspector.Visibility = isVisible ? Visibility.Visible : Visibility.Collapsed;
         InspectorColumn.Width = isVisible ? new GridLength(300) : new GridLength(0);
-        AutomationProperties.SetName(
-            RowInspectorToggle,
-            ViewModel.IsInspectorOpen ? "Hide row inspector" : "Show row inspector");
+        RowInspectorToggle.Visibility = workspaceWidth >= 980 ? Visibility.Visible : Visibility.Collapsed;
+        RowDetailsButton.Visibility = workspaceWidth < 980 ? Visibility.Visible : Visibility.Collapsed;
+        RowInspectorToggle.Label = isVisible ? "Hide row inspector" : "Show row inspector";
+        RowInspectorToggle.IsChecked = isVisible;
+        AutomationProperties.SetName(RowInspectorToggle, RowInspectorToggle.Label);
+        if (moveFocus)
+        {
+            TableGrid.FocusCurrentRow();
+        }
+    }
+
+    private bool IsInsideInspector(DependencyObject? element)
+    {
+        for (DependencyObject? ancestor = element; ancestor is not null; ancestor = VisualTreeHelper.GetParent(ancestor))
+        {
+            if (ReferenceEquals(ancestor, Inspector))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private async void Navigation_SelectionChanged(
@@ -3607,8 +3670,24 @@ public sealed partial class MainWindow : Window, IDisposable
 
         string? tag = (args.SelectedItem as NavigationViewItem)?.Tag as string;
         TablesView.Visibility = tag is null or "tables" ? Visibility.Visible : Visibility.Collapsed;
+        OverflowInsertRowButton.Visibility = TablesView.Visibility;
+        OverflowEditRowButton.Visibility = TablesView.Visibility;
+        OverflowDeleteRowButton.Visibility = TablesView.Visibility;
+        RelationshipTablesVisibilityChanged();
+        if (TablesView.Visibility != Visibility.Visible)
+        {
+            ClearTableQueryBanner();
+        }
+        UpdatePresentedRow();
         MaintenanceView.Visibility = tag == "maintenance" ? Visibility.Visible : Visibility.Collapsed;
-        RiderCreationView.Visibility = tag == "create-rider" ? Visibility.Visible : Visibility.Collapsed;
+        ChangesView.Visibility = tag == "changes" ? Visibility.Visible : Visibility.Collapsed;
+        Visibility riderVisibility = tag == "create-rider" ? Visibility.Visible : Visibility.Collapsed;
+        if (RiderCreationView.Visibility != riderVisibility)
+        {
+            _riderViewGeneration++;
+            RiderCreationView.Visibility = riderVisibility;
+            ClearRiderLookupFeedback();
+        }
         RecoveryView.Visibility = tag == "recovery" ? Visibility.Visible : Visibility.Collapsed;
         if (tag == "maintenance")
         {
@@ -3630,11 +3709,22 @@ public sealed partial class MainWindow : Window, IDisposable
                 await InitializeRiderCreationAsync(_session, _lifetimeCancellation.Token);
             }
         }
+        else if (tag == "changes")
+        {
+            RefreshSessionChanges();
+        }
         else if (tag == "recovery")
         {
-            ViewModel.Status = "Recovery sessions are stored as isolated working copies.";
+            if (!ViewModel.IsBusy && _operationLease is null)
+            {
+                ViewModel.Status = "Choose a working session to resume or discard.";
+                if (RecoverySessionsList.ItemsSource is null)
+                {
+                    await RefreshRecoverySessionsAsync(_lifetimeCancellation.Token);
+                }
+            }
         }
-        else if (_session is not null)
+        else if (_session is not null && _operationLease is null)
         {
             SetReadyState();
         }
@@ -3647,38 +3737,45 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async Task ShowSettingsAsync()
     {
+        EditorPreferences opening = _preferences;
         var themePicker = new ComboBox
         {
             Header = "Theme",
             ItemsSource = Enum.GetValues<EditorApplicationTheme>(),
-            SelectedItem = _preferences.Theme,
+            SelectedItem = opening.Theme,
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
         var densityPicker = new ComboBox
         {
             Header = "Grid density",
             ItemsSource = Enum.GetValues<GridDensity>(),
-            SelectedItem = _preferences.Density,
+            SelectedItem = opening.Density,
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
         var pageSizePicker = new ComboBox
         {
             Header = "Rows per page",
             ItemsSource = TableRowDisplayOptions.FinitePageSizes,
-            SelectedItem = _preferences.PageSize,
+            SelectedItem = opening.PageSize,
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
+        (ForeignKeyDisplayMode Mode, string Label)[] foreignKeyModes =
+        [
+            (ForeignKeyDisplayMode.RawValue, "IDs only"),
+            (ForeignKeyDisplayMode.ResolvedName, "Names only"),
+            (ForeignKeyDisplayMode.RawAndName, "Names and IDs"),
+        ];
         var foreignKeyPicker = new ComboBox
         {
             Header = "Foreign-key display",
-            ItemsSource = Enum.GetValues<ForeignKeyDisplayMode>(),
-            SelectedItem = _preferences.ForeignKeyDisplayMode,
+            ItemsSource = foreignKeyModes.Select(static choice => choice.Label).ToArray(),
+            SelectedIndex = Array.FindIndex(foreignKeyModes, choice => choice.Mode == opening.ForeignKeyDisplayMode),
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
         var recentFiles = new ListView
         {
             Header = "Recent CDB files",
-            ItemsSource = _preferences.RecentFiles,
+            ItemsSource = opening.RecentFiles,
             MaxHeight = 150,
             SelectionMode = ListViewSelectionMode.Single,
         };
@@ -3781,20 +3878,22 @@ public sealed partial class MainWindow : Window, IDisposable
         var tableRefreshPending = false;
         try
         {
-            int previousPageSize = _preferences.PageSize;
-            var updatedPreferences = new EditorPreferences(
-                (EditorApplicationTheme)themePicker.SelectedItem,
-                (GridDensity)densityPicker.SelectedItem,
-                (int)pageSizePicker.SelectedItem,
-                (ForeignKeyDisplayMode)foreignKeyPicker.SelectedItem,
-                recentFiles.ItemsSource is IEnumerable<string> currentRecentFiles
-                    ? currentRecentFiles
-                    : []);
-            bool foreignKeyModeChanged =
-                updatedPreferences.ForeignKeyDisplayMode != _preferences.ForeignKeyDisplayMode;
-            bool pageSizeChanged = updatedPreferences.PageSize != previousPageSize;
-            await _settingsStore.SavePreferencesAsync(updatedPreferences, cancellationToken);
-            _preferences = updatedPreferences;
+            var theme = (EditorApplicationTheme)themePicker.SelectedItem;
+            var density = (GridDensity)densityPicker.SelectedItem;
+            int pageSize = (int)pageSizePicker.SelectedItem;
+            ForeignKeyDisplayMode mode = foreignKeyModes[foreignKeyPicker.SelectedIndex].Mode;
+            var remainingRecent = recentFiles.ItemsSource as IEnumerable<string> ?? [];
+            HashSet<string> removedRecent = opening.RecentFiles
+                .Except(remainingRecent, StringComparer.OrdinalIgnoreCase)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            EditorPreferences previous = await SavePreferencesAsync(current => new EditorPreferences(
+                theme == opening.Theme ? current.Theme : theme,
+                density == opening.Density ? current.Density : density,
+                pageSize == opening.PageSize ? current.PageSize : pageSize,
+                mode == opening.ForeignKeyDisplayMode ? current.ForeignKeyDisplayMode : mode,
+                current.RecentFiles.Where(path => !removedRecent.Contains(path))), cancellationToken);
+            bool foreignKeyModeChanged = _preferences.ForeignKeyDisplayMode != previous.ForeignKeyDisplayMode;
+            bool pageSizeChanged = _preferences.PageSize != previous.PageSize;
             ApplyPreferences();
             if (foreignKeyModeChanged)
             {
@@ -3821,7 +3920,7 @@ public sealed partial class MainWindow : Window, IDisposable
                     context.SearchText,
                     context.Filter,
                     rowDisplay,
-                    offset: 0,
+                    offset: pageSizeChanged ? 0 : GetRequestedOffset(context),
                     context.Sorts);
             }
             if (queryOutcome != TableQueryOutcome.Succeeded)
@@ -3839,13 +3938,21 @@ public sealed partial class MainWindow : Window, IDisposable
                 ViewModel.Status = "Preferences saved; table refresh pending.";
                 if (queryOutcome == TableQueryOutcome.Cancelled)
                 {
-                    PresentWarning(
+                    PresentTableQueryWarning(
                         "Preferences saved; table refresh cancelled",
-                        "The previous rows remain visible. Refresh the query or switch tabs to apply the new table preferences.");
+                        "The previous rows remain visible. Use Refresh to apply the new table preferences.");
                 }
                 return;
             }
             PresentSuccess("Preferences saved", "Theme, density, paging, and foreign-key display were updated.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+        {
+            PresentError("Preferences were not saved",
+                SafeFailureMessage(exception, "The previous preferences remain in use."));
         }
         finally
         {
@@ -3880,18 +3987,14 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async void Density_Click(object sender, RoutedEventArgs e)
     {
-        GridDensity density = _preferences.Density == GridDensity.Compact
-            ? GridDensity.Comfortable
-            : GridDensity.Compact;
-        _preferences = new EditorPreferences(
-            _preferences.Theme,
-            density,
-            _preferences.PageSize,
-            _preferences.ForeignKeyDisplayMode,
-            _preferences.RecentFiles);
         try
         {
-            await _settingsStore.SavePreferencesAsync(_preferences, _lifetimeCancellation.Token);
+            await SavePreferencesAsync(current => new EditorPreferences(
+                current.Theme,
+                current.Density == GridDensity.Compact ? GridDensity.Comfortable : GridDensity.Compact,
+                current.PageSize,
+                current.ForeignKeyDisplayMode,
+                current.RecentFiles), _lifetimeCancellation.Token);
             ApplyPreferences();
             if (TableTabs.SelectedItem is TabViewItem selected)
             {
@@ -3901,6 +4004,9 @@ public sealed partial class MainWindow : Window, IDisposable
                     UpdateTabChrome(selected, context);
                 }
             }
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
@@ -3914,7 +4020,7 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         var dialog = CreateDialog(
             "Keyboard shortcuts",
-            "Ctrl+O Open · Ctrl+S Save · Ctrl+Z Undo · Ctrl+Y Redo · Enter or F2 Edit cell · Arrow keys Navigate grid",
+            "Ctrl+O Open · Ctrl+S Save · Ctrl+Z Undo · Ctrl+Y Redo · F2 Edit cell · Enter Open relationship picker or commit edit · Arrow keys Navigate grid",
             "Close",
             string.Empty,
             string.Empty);
@@ -3934,26 +4040,17 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async Task RememberRecentFileAsync(string path, CancellationToken cancellationToken)
     {
-        string[] recentFiles = new[] { Path.GetFullPath(path) }
-            .Concat(_preferences.RecentFiles)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(12)
-            .ToArray();
-        _preferences = new EditorPreferences(
-            _preferences.Theme,
-            _preferences.Density,
-            _preferences.PageSize,
-            _preferences.ForeignKeyDisplayMode,
-            recentFiles);
         try
         {
-            await _settingsStore.SavePreferencesAsync(_preferences, cancellationToken);
+            string fullPath = Path.GetFullPath(path);
+            await SavePreferencesAsync(current => new EditorPreferences(
+                current.Theme, current.Density, current.PageSize, current.ForeignKeyDisplayMode,
+                new[] { fullPath }.Concat(current.RecentFiles).Distinct(StringComparer.OrdinalIgnoreCase).Take(12)),
+                cancellationToken);
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            PresentWarning(
-                "Recent files were not updated",
-                SafeFailureMessage(exception, "The database remains open and no row content was stored."));
+            // Recent files are auxiliary to opening, saving, and recovery.
         }
     }
 
@@ -3963,31 +4060,6 @@ public sealed partial class MainWindow : Window, IDisposable
         _activeTableLoad?.Cancellation.Cancel();
         CancelOperationButton.IsEnabled = false;
         ViewModel.Status = "Cancelling safely…";
-    }
-
-    private async void CheckRecovery_Click(object sender, RoutedEventArgs e)
-    {
-        if (ViewModel.IsBusy)
-        {
-            return;
-        }
-
-        try
-        {
-            IReadOnlyList<RecoverableSession> recoverable =
-                await _workspaceService.GetRecoverableSessionsAsync(_lifetimeCancellation.Token);
-            PresentInformation(
-                "Recovery check complete",
-                recoverable.Count == 0
-                    ? "No recoverable unsaved sessions were found."
-                    : $"{recoverable.Count:N0} recoverable session(s) will be offered at the next startup.");
-        }
-        catch (Exception exception) when (IsExpectedOperationFailure(exception))
-        {
-            PresentError(
-                "Could not check recovery sessions",
-                SafeFailureMessage(exception, "No recovery session was changed."));
-        }
     }
 
     private void RecoveryTargetMode_Changed(object sender, RoutedEventArgs e)
@@ -4029,13 +4101,15 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         _maintenanceTargetsSessionId = sessionId;
-        _maintenanceTeamsSessionId = null;
+        InvalidateMaintenanceTeamChoices();
         _selectedRecoveryRiderIds = [];
         RiderIdsTextBox.Text = string.Empty;
         UseSelectedRiderRowsButton.IsEnabled = false;
         RiderRecoveryTeamComboBox.ItemsSource = null;
         RiderRecoveryTeamComboBox.SelectedItem = null;
         RiderRecoveryTeamComboBox.IsEnabled = false;
+        RecoveryIdsModeRadioButton.IsChecked = true;
+        RecoveryTeamModeRadioButton.IsEnabled = false;
         RiderRecoveryTeamComboBox.PlaceholderText = "Loading teams…";
         RiderRecoveryTeamStatusText.Text = sessionId is null
             ? "Open a database to load teams. Rider IDs remain available without team tables."
@@ -4053,6 +4127,14 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
+        if (_maintenanceTeamsLoading)
+        {
+            return;
+        }
+
+        _maintenanceTeamsLoading = true;
+        int generation = _maintenanceTeamGeneration;
+        long? selectedTeamId = (RiderRecoveryTeamComboBox.SelectedItem as RiderTeamOption)?.TeamId;
         RiderRecoveryTeamStatusText.Text = "Loading teams…";
         RiderRecoveryTeamComboBox.IsEnabled = false;
         try
@@ -4060,16 +4142,24 @@ public sealed partial class MainWindow : Window, IDisposable
             IReadOnlyList<RiderTeamOption> teams = await _riderRecoveryService.ListTeamsAsync(
                 session.WorkingSqlitePath,
                 cancellationToken);
-            if (_session?.SessionId != session.SessionId)
+            if (_session?.SessionId != session.SessionId || generation != _maintenanceTeamGeneration)
             {
                 return;
             }
 
             _maintenanceTeamsSessionId = session.SessionId;
             RiderRecoveryTeamComboBox.ItemsSource = teams;
+            RiderRecoveryTeamComboBox.SelectedItem = teams.FirstOrDefault(team => team.TeamId == selectedTeamId);
+            RiderRecoveryTeamComboBox.PlaceholderText = teams.Count == 0 ? "No teams found" : "Choose a team";
             RiderRecoveryTeamStatusText.Text = teams.Count == 0
                 ? "No teams were found. Rider IDs can still be entered directly."
-                : $"{teams.Count:N0} teams loaded for this session.";
+                : $"{teams.Count:N0} {(teams.Count == 1 ? "team" : "teams")} available.";
+            RecoveryTeamModeRadioButton.IsEnabled = teams.Count != 0;
+            if (teams.Count == 0)
+            {
+                RecoveryIdsModeRadioButton.IsChecked = true;
+            }
+
             RecoveryTargetMode_Changed(this, new RoutedEventArgs());
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -4078,35 +4168,49 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            if (_session?.SessionId != session.SessionId)
+            if (_session?.SessionId != session.SessionId || generation != _maintenanceTeamGeneration)
             {
                 return;
             }
 
-            _maintenanceTeamsSessionId = session.SessionId;
-            RiderRecoveryTeamStatusText.Text =
-                "Team lookup is unavailable for this database. Enter rider IDs directly instead.";
+            RiderRecoveryTeamStatusText.Text = exception is InvalidOperationException
+                && exception.Message.StartsWith("Team selection is unavailable because ", StringComparison.Ordinal)
+                    ? exception.Message
+                    : SafeFailureMessage(exception, "Team lookup is unavailable. Enter rider IDs directly.");
             RiderRecoveryTeamComboBox.PlaceholderText = "Team lookup unavailable";
             RecoveryIdsModeRadioButton.IsChecked = true;
+            RecoveryTeamModeRadioButton.IsEnabled = false;
         }
+        finally
+        {
+            if (generation == _maintenanceTeamGeneration)
+            {
+                _maintenanceTeamsLoading = false;
+            }
+        }
+    }
+
+    private void InvalidateMaintenanceTeamChoices()
+    {
+        _maintenanceTeamGeneration++;
+        _maintenanceTeamsSessionId = null;
+        _maintenanceTeamsLoading = false;
+        RiderRecoveryTeamComboBox.IsEnabled = false;
     }
 
     private void ResetRiderCreationForSession(Guid? sessionId)
     {
+        _riderPreparation?.Cancel();
+        _riderPreparation = null;
+        _riderDraftGeneration++;
+        _riderDraftBaseline = null;
         foreach (CancellationTokenSource cancellation in _riderLookupCancellations.Values)
         {
             cancellation.Cancel();
-            cancellation.Dispose();
         }
 
         _riderLookupCancellations.Clear();
-        foreach (RiderAdvancedFieldEditor editor in _riderAdvancedEditors.Concat(_contractAdvancedEditors))
-        {
-            editor.SearchCancellation?.Cancel();
-            editor.SearchCancellation?.Dispose();
-        }
-
-        _riderCreationSessionId = null;
+        _riderCreationSessionId = sessionId;
         _riderCreationDraft = null;
         _riderCreationPreview = null;
         _riderCreationTeam = null;
@@ -4149,6 +4253,11 @@ public sealed partial class MainWindow : Window, IDisposable
         RiderReviewAbilitiesText.Text = string.Empty;
         RiderReviewTechnicalValuesTextBox.Text = string.Empty;
         RiderReviewWarningInfo.IsOpen = false;
+        RiderReviewProfileText.Text = string.Empty;
+        ClearRiderLookupFeedback();
+        ClearRiderValidationMessage();
+        ResetCurrentAbilityOverride();
+        SetRiderReceipt(null);
         RiderAbilityWarningInfo.IsOpen = false;
         _suppressRiderLookupText = true;
         RiderTeamSuggestBox.Text = string.Empty;
@@ -4182,21 +4291,34 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async Task InitializeRiderCreationAsync(
         EditorSessionState session,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool startAnother = false)
     {
-        if (_riderCreationSessionId == session.SessionId && _riderCreationDraft is not null)
+        if (!startAnother && _riderCreationSessionId == session.SessionId && _riderCreationDraft is not null)
         {
-            ViewModel.Status = $"Create Rider draft retained · Step {_riderCreationStep + 1} of 6.";
+            if (RiderCreationView.Visibility == Visibility.Visible)
+            {
+                ViewModel.Status = RiderCreationReceipt.Visibility == Visibility.Visible
+                    ? RiderReceiptHeading.Text
+                    : $"Create Rider draft retained · Step {_riderCreationStep + 1} of 6.";
+            }
             return;
         }
 
+        if (_riderCreationSessionId == session.SessionId && _riderPreparation is not null)
+        {
+            return;
+        }
         ResetRiderCreationForSession(session.SessionId);
+        var preparation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _riderPreparation = preparation;
+        CancellationToken token = preparation.Token;
         try
         {
             MaintenanceCapability capability = await _riderCreationService.CheckCapabilityAsync(
                 session.WorkingSqlitePath,
-                cancellationToken);
-            if (_session?.SessionId != session.SessionId)
+                token);
+            if (!OwnsRiderPreparation(session, preparation))
             {
                 return;
             }
@@ -4206,20 +4328,21 @@ public sealed partial class MainWindow : Window, IDisposable
                 RiderCreationCapabilityInfo.Severity = InfoBarSeverity.Warning;
                 RiderCreationCapabilityInfo.Title = "Create Rider is unavailable for this database";
                 RiderCreationCapabilityInfo.Message = FormatCapabilityDetails(capability);
-                ViewModel.Status = "The open database does not support Create Rider.";
+                if (RiderCreationView.Visibility == Visibility.Visible)
+                {
+                    ViewModel.Status = "The open database does not support Create Rider.";
+                }
                 return;
             }
 
             RiderCreationDraft draft = await _riderCreationService.PrepareAsync(
                 session.WorkingSqlitePath,
-                cancellationToken);
-            if (_session?.SessionId != session.SessionId)
+                token);
+            if (!OwnsRiderPreparation(session, preparation))
             {
                 return;
             }
 
-            _riderCreationSessionId = session.SessionId;
-            _riderCreationDraft = draft;
             _riderTeamLookup = RequireRiderLookup(draft, "DYN_cyclist", "fkIDteam");
             _riderRegionLookup = RequireRiderLookup(draft, "DYN_cyclist", "fkIDregion");
             _riderTypeLookup = RequireRiderLookup(draft, "DYN_cyclist", "fkIDtype_rider");
@@ -4240,20 +4363,24 @@ public sealed partial class MainWindow : Window, IDisposable
             RiderRoleComboBox.ItemsSource = CreateRiderRoleOptions();
             BuildRiderAbilityEditors(draft);
             BuildRiderAdvancedEditors(draft);
+            UpdateCurrentAbilityPresentation();
+            _riderCreationDraft = draft;
+            _riderDraftBaseline = CaptureRiderDraftValues();
             RiderCreationStepContentControl.IsEnabled = true;
             RiderCreationNextButton.IsEnabled = true;
             RiderCreationCapabilityInfo.IsOpen = false;
-            ViewModel.Status = "Create Rider is ready. Complete Identity to continue.";
-            await LoadInitialRiderLookupsAsync(session, cancellationToken);
-            RiderFirstNameTextBox.Focus(FocusState.Programmatic);
+            if (RiderCreationView.Visibility == Visibility.Visible)
+            {
+                ViewModel.Status = "Create Rider is ready. Complete Identity to continue.";
+            }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
             // Navigation, session replacement, or shutdown owns cancellation.
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            if (_session?.SessionId != session.SessionId)
+            if (!OwnsRiderPreparation(session, preparation))
             {
                 return;
             }
@@ -4264,8 +4391,87 @@ public sealed partial class MainWindow : Window, IDisposable
             RiderCreationCapabilityInfo.Message = SafeFailureMessage(
                 exception,
                 "The database was not changed. Reopen the CDB and try again.");
-            ViewModel.Status = "Create Rider could not be prepared.";
+            if (RiderCreationView.Visibility == Visibility.Visible)
+            {
+                ViewModel.Status = "Create Rider could not be prepared.";
+            }
         }
+        finally
+        {
+            if (ReferenceEquals(_riderPreparation, preparation))
+            {
+                _riderPreparation = null;
+            }
+            preparation.Dispose();
+        }
+    }
+
+    private bool OwnsRiderPreparation(EditorSessionState session, CancellationTokenSource preparation) =>
+        ReferenceEquals(_riderPreparation, preparation) && !preparation.IsCancellationRequested &&
+        _session?.SessionId == session.SessionId;
+
+    private string[] CaptureRiderDraftValues()
+    {
+        var values = new List<string>
+        {
+            RiderFirstNameTextBox.Text,
+            RiderLastNameTextBox.Text,
+            RiderGameDisplayNameTextBox.Text,
+            RiderTeamSuggestBox.Text,
+            RiderRegionSuggestBox.Text,
+            RiderTypeSuggestBox.Text,
+            RiderBirthDatePicker.Date?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty,
+            RiderHeightNumberBox.Text,
+            RiderWeightNumberBox.Text,
+            RiderPotentialNumberBox.Text,
+            RiderPhotoTextBox.Text,
+            RiderSoundNameTextBox.Text,
+            RiderWageNumberBox.Text,
+            RiderContractEndYearNumberBox.Text,
+            RiderBulkCurrentNumberBox.Text,
+            RiderBulkLimitNumberBox.Text,
+            RiderCurrentAbilityOverrideToggle.IsChecked?.ToString() ?? string.Empty,
+            RiderCurrentAbilityOverrideBox.Text,
+            RiderMissingLimitsAcknowledgement.IsChecked?.ToString() ?? string.Empty,
+            RiderRoleComboBox.SelectedIndex.ToString(CultureInfo.InvariantCulture),
+            RiderFavoriteRaceSuggestBox.Text,
+            string.Join(",", _riderFavoriteRaces.Select(static race => race.Id)),
+        };
+        foreach (RiderAbilityEditor editor in _riderAbilityEditors)
+        {
+            values.Add(editor.Current.Text);
+            values.Add(editor.Limit.Text);
+        }
+        foreach (RiderAdvancedFieldEditor editor in _riderAdvancedEditors.Concat(_contractAdvancedEditors))
+        {
+            values.Add(editor.ValueEditor switch
+            {
+                TextBox textBox => textBox.Text,
+                NumberBox numberBox => numberBox.Text,
+                AutoSuggestBox suggestBox => suggestBox.Text,
+                _ => string.Empty,
+            });
+            values.Add(editor.NullBox?.IsChecked?.ToString() ?? string.Empty);
+            values.Add(editor.UseDefaultBox?.IsChecked?.ToString() ?? string.Empty);
+        }
+        return values.ToArray();
+    }
+
+    private async Task<bool> ConfirmDiscardRiderDraftAsync()
+    {
+        if (_riderDraftBaseline is null || _riderDraftBaseline.SequenceEqual(CaptureRiderDraftValues()))
+        {
+            return true;
+        }
+
+        var dialog = CreateDialog(
+            "Discard uncreated rider draft?",
+            "This rider has not been created. Saving the database does not save these draft values. Keep editing to retain them, or discard the draft to continue.",
+            "Discard rider draft",
+            string.Empty,
+            "Keep editing");
+        dialog.DefaultButton = ContentDialogButton.Close;
+        return await dialog.ShowAsync() == ContentDialogResult.Primary;
     }
 
     private static string FormatCapabilityDetails(MaintenanceCapability capability)
@@ -4380,7 +4586,10 @@ public sealed partial class MainWindow : Window, IDisposable
         ContractAdvancedFieldsPanel.Children.Clear();
         _riderAdvancedEditors.Clear();
         _contractAdvancedEditors.Clear();
-        foreach (RiderCreationField field in draft.Fields.Where(static field => field.IsEditable && !field.IsLocked))
+        foreach (RiderCreationField field in draft.Fields.Where(static field =>
+            field.IsEditable && !field.IsLocked &&
+            !(field.TableName.Equals("DYN_cyclist", StringComparison.OrdinalIgnoreCase) &&
+              field.Column.Name.Equals(RiderCurrentAbility.ColumnName, StringComparison.OrdinalIgnoreCase))))
         {
             (StackPanel panel, RiderAdvancedFieldEditor editor) = CreateRiderAdvancedFieldEditor(field);
             if (field.TableName.Equals("DYN_cyclist", StringComparison.OrdinalIgnoreCase))
@@ -4452,11 +4661,11 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             AutomationProperties.SetHelpText(valueEditor, helpText);
         }
-        CheckBox? nullBox = field.Column.IsNullable && !field.UsesDatabaseDefault
+        CheckBox? nullBox = field.Column.IsNullable
             ? new CheckBox
             {
                 Content = "Store NULL",
-                IsChecked = field.Value.Kind == SqliteValueKind.Null,
+                IsChecked = !field.UsesDatabaseDefault && field.Value.Kind == SqliteValueKind.Null,
             }
             : null;
         CheckBox? useDefaultBox = field.UsesDatabaseDefault
@@ -4472,6 +4681,14 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             suggestBox.TextChanged += RiderAdvancedLookup_TextChanged;
             suggestBox.SuggestionChosen += RiderAdvancedLookup_SuggestionChosen;
+        }
+        else if (valueEditor is NumberBox numberBox)
+        {
+            numberBox.ValueChanged += RiderDraftNumber_Changed;
+        }
+        else if (valueEditor is TextBox textBox)
+        {
+            textBox.TextChanged += RiderDraftText_Changed;
         }
 
         if (nullBox is not null)
@@ -4539,11 +4756,6 @@ public sealed partial class MainWindow : Window, IDisposable
             return "No unambiguous lookup relationship was found. Enter the stored numeric ID directly.";
         }
 
-        if (field.Column.Name.Equals("value_f_current_ability", StringComparison.OrdinalIgnoreCase))
-        {
-            return "Defaults to the arithmetic mean of the 14 Current abilities. This is not claimed to reproduce the game's internal formula.";
-        }
-
         return null;
     }
 
@@ -4556,7 +4768,23 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         if ((sender as FrameworkElement)?.Tag is RiderAdvancedFieldEditor editor)
         {
+            if (sender is CheckBox { IsChecked: true })
+            {
+                if (ReferenceEquals(sender, editor.NullBox) && editor.UseDefaultBox is not null)
+                {
+                    editor.UseDefaultBox.IsChecked = false;
+                }
+                else if (ReferenceEquals(sender, editor.UseDefaultBox) && editor.NullBox is not null)
+                {
+                    editor.NullBox.IsChecked = false;
+                }
+            }
             UpdateAdvancedEditorEnabled(editor);
+            if (editor.ValueEditor is AutoSuggestBox { IsEnabled: false } lookup)
+            {
+                CancelRiderLookup(lookup);
+            }
+            InvalidateRiderCreationPreview();
         }
     }
 
@@ -4626,55 +4854,8 @@ public sealed partial class MainWindow : Window, IDisposable
 
         _riderFavoriteRaceCandidate = null;
         AddFavoriteRaceButton.IsEnabled = false;
-        if (_riderFavoriteRaceLookup is null
-            || _session is null
-            || _riderCreationSessionId != _session.SessionId)
-        {
-            return;
-        }
-
-        if (_riderLookupCancellations.Remove(sender, out CancellationTokenSource? oldCancellation))
-        {
-            oldCancellation.Cancel();
-            oldCancellation.Dispose();
-        }
-
-        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
-        _riderLookupCancellations[sender] = cancellation;
-        UpdateFavoriteRaceStatus("Searching races…");
-        try
-        {
-            await Task.Delay(SearchDelayMilliseconds, cancellation.Token);
-            IReadOnlyList<RiderLookupOption> options = await _riderCreationService.SearchLookupAsync(
-                _session.WorkingSqlitePath,
-                _riderFavoriteRaceLookup,
-                sender.Text,
-                50,
-                cancellation.Token);
-            if (!cancellation.IsCancellationRequested && _riderCreationSessionId == _session?.SessionId)
-            {
-                sender.ItemsSource = options;
-                UpdateFavoriteRaceStatus(options.Count == 0 ? "No matching races found." : null);
-            }
-        }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
-        {
-            // A newer search or database session owns the suggestions.
-        }
-        catch (Exception exception) when (IsExpectedOperationFailure(exception))
-        {
-            sender.ItemsSource = Array.Empty<RiderLookupOption>();
-            UpdateFavoriteRaceStatus("Race search is unavailable. Try again or reopen the CDB.");
-        }
-        finally
-        {
-            if (_riderLookupCancellations.TryGetValue(sender, out CancellationTokenSource? current)
-                && ReferenceEquals(current, cancellation))
-            {
-                _riderLookupCancellations.Remove(sender);
-                cancellation.Dispose();
-            }
-        }
+        UpdateFavoriteRaceStatus();
+        await SearchRiderLookupAsync(sender, _riderFavoriteRaceLookup, 50);
     }
 
     private void RiderFavoriteRace_SuggestionChosen(
@@ -4686,6 +4867,7 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
+        CancelRiderLookup(sender);
         _riderFavoriteRaceCandidate = option;
         _suppressFavoriteRaceText = true;
         sender.Text = option.ToString();
@@ -4773,34 +4955,16 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void InvalidateRiderCreationPreview()
     {
+        if (_riderCreationDraft is null)
+        {
+            return;
+        }
+
+        _riderDraftGeneration++;
         _riderCreationPreview = null;
+        RiderMissingLimitsAcknowledgement.IsChecked = false;
+        ClearRiderValidationMessage();
         UpdateCreateRiderButtonState();
-    }
-
-    private async Task LoadInitialRiderLookupsAsync(
-        EditorSessionState session,
-        CancellationToken cancellationToken)
-    {
-        if (_riderTeamLookup is null || _riderRegionLookup is null || _riderTypeLookup is null)
-        {
-            return;
-        }
-
-        Task<IReadOnlyList<RiderLookupOption>> teams = _riderCreationService.SearchLookupAsync(
-            session.WorkingSqlitePath, _riderTeamLookup, string.Empty, 25, cancellationToken);
-        Task<IReadOnlyList<RiderLookupOption>> regions = _riderCreationService.SearchLookupAsync(
-            session.WorkingSqlitePath, _riderRegionLookup, string.Empty, 25, cancellationToken);
-        Task<IReadOnlyList<RiderLookupOption>> types = _riderCreationService.SearchLookupAsync(
-            session.WorkingSqlitePath, _riderTypeLookup, string.Empty, 25, cancellationToken);
-        await Task.WhenAll(teams, regions, types);
-        if (_session?.SessionId != session.SessionId)
-        {
-            return;
-        }
-
-        RiderTeamSuggestBox.ItemsSource = await teams;
-        RiderRegionSuggestBox.ItemsSource = await regions;
-        RiderTypeSuggestBox.ItemsSource = await types;
     }
 
     private async void RiderLookup_TextChanged(
@@ -4813,6 +4977,7 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         SetSelectedCoreLookup(sender, null);
+        InvalidateRiderCreationPreview();
         RiderLookupTarget? target = (sender.Tag as string) switch
         {
             "team" => _riderTeamLookup,
@@ -4820,56 +4985,7 @@ public sealed partial class MainWindow : Window, IDisposable
             "type" => _riderTypeLookup,
             _ => null,
         };
-        if (target is null || _session is null || _riderCreationSessionId != _session.SessionId)
-        {
-            return;
-        }
-
-        if (_riderLookupCancellations.Remove(sender, out CancellationTokenSource? oldCancellation))
-        {
-            oldCancellation.Cancel();
-            oldCancellation.Dispose();
-        }
-
-        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
-        _riderLookupCancellations[sender] = cancellation;
-        try
-        {
-            await Task.Delay(SearchDelayMilliseconds, cancellation.Token);
-            IReadOnlyList<RiderLookupOption> options = await _riderCreationService.SearchLookupAsync(
-                _session.WorkingSqlitePath,
-                target,
-                sender.Text,
-                25,
-                cancellation.Token);
-            if (!cancellation.IsCancellationRequested && _riderCreationSessionId == _session?.SessionId)
-            {
-                sender.ItemsSource = options;
-            }
-        }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
-        {
-            // A newer query or session owns the suggestions.
-        }
-        catch (Exception exception) when (IsExpectedOperationFailure(exception))
-        {
-            sender.ItemsSource = Array.Empty<RiderLookupOption>();
-            RiderCreationCapabilityInfo.IsOpen = true;
-            RiderCreationCapabilityInfo.Severity = InfoBarSeverity.Warning;
-            RiderCreationCapabilityInfo.Title = $"{target.Label} lookup is unavailable";
-            RiderCreationCapabilityInfo.Message = SafeFailureMessage(
-                exception,
-                "The database was not changed. Try a different search or reopen the CDB.");
-        }
-        finally
-        {
-            if (_riderLookupCancellations.TryGetValue(sender, out CancellationTokenSource? current)
-                && ReferenceEquals(current, cancellation))
-            {
-                _riderLookupCancellations.Remove(sender);
-                cancellation.Dispose();
-            }
-        }
+        await SearchRiderLookupAsync(sender, target, 25);
     }
 
     private void RiderLookup_SuggestionChosen(
@@ -4881,6 +4997,7 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
+        CancelRiderLookup(sender);
         SetSelectedCoreLookup(sender, option);
         _suppressRiderLookupText = true;
         sender.Text = option.ToString();
@@ -4898,6 +5015,10 @@ public sealed partial class MainWindow : Window, IDisposable
         if (ReferenceEquals(sender, RiderTeamSuggestBox))
         {
             _riderCreationTeam = option;
+            if (option is null)
+            {
+                RiderContractTeamText.Text = "Choose a team in Identity.";
+            }
         }
         else if (ReferenceEquals(sender, RiderRegionSuggestBox))
         {
@@ -4914,54 +5035,33 @@ public sealed partial class MainWindow : Window, IDisposable
         AutoSuggestBoxTextChangedEventArgs args)
     {
         if (args.Reason != AutoSuggestionBoxTextChangeReason.UserInput
-            || sender.Tag is not RiderAdvancedFieldEditor editor
-            || editor.Field.LookupTarget is null
-            || _session is null
-            || _riderCreationSessionId != _session.SessionId)
+            || sender.Tag is not RiderAdvancedFieldEditor editor)
         {
             return;
         }
 
         editor.SelectedLookup = null;
-        editor.SearchCancellation?.Cancel();
-        editor.SearchCancellation?.Dispose();
-        editor.SearchCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
-        CancellationToken token = editor.SearchCancellation.Token;
-        try
-        {
-            await Task.Delay(SearchDelayMilliseconds, token);
-            sender.ItemsSource = await _riderCreationService.SearchLookupAsync(
-                _session.WorkingSqlitePath,
-                editor.Field.LookupTarget,
-                sender.Text,
-                25,
-                token);
-        }
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
-        {
-            // A newer query or session owns the suggestions.
-        }
-        catch (Exception exception) when (IsExpectedOperationFailure(exception))
-        {
-            sender.ItemsSource = Array.Empty<RiderLookupOption>();
-        }
+        InvalidateRiderCreationPreview();
+        await SearchRiderLookupAsync(sender, editor.Field.LookupTarget, 25);
     }
 
-    private static void RiderAdvancedLookup_SuggestionChosen(
+    private void RiderAdvancedLookup_SuggestionChosen(
         AutoSuggestBox sender,
         AutoSuggestBoxSuggestionChosenEventArgs args)
     {
         if (sender.Tag is RiderAdvancedFieldEditor editor
             && args.SelectedItem is RiderLookupOption option)
         {
+            CancelRiderLookup(sender);
             editor.SelectedLookup = option;
             sender.Text = option.ToString();
+            InvalidateRiderCreationPreview();
         }
     }
 
     private void RiderCreationStep_Click(object sender, RoutedEventArgs e)
     {
-        if ((sender as FrameworkElement)?.Tag is not string value
+        if (_riderCreationDraft is null || (sender as FrameworkElement)?.Tag is not string value
             || !int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int step)
             || step > _riderCreationMaxVisitedStep)
         {
@@ -5010,9 +5110,15 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.Status = $"Create Rider draft retained · Step {_riderCreationStep + 1} of 6.";
     }
 
-    private void ShowRiderCreationStep(int step)
+    private void ShowRiderCreationStep(int step, bool focus = true)
     {
-        _riderCreationStep = Math.Clamp(step, 0, 5);
+        int next = Math.Clamp(step, 0, 5);
+        if (next != _riderCreationStep)
+        {
+            _riderViewGeneration++;
+            ClearRiderLookupFeedback();
+        }
+        _riderCreationStep = next;
         FrameworkElement[] panels =
         [
             RiderIdentityStep,
@@ -5063,12 +5169,15 @@ public sealed partial class MainWindow : Window, IDisposable
             _ => "Continue",
         };
         AutomationProperties.SetName(RiderCreationNextButton, RiderCreationNextButton.Content.ToString()!);
-        FocusRiderCreationStep(_riderCreationStep);
+        if (focus)
+        {
+            FocusRiderCreationStep(_riderCreationStep);
+        }
     }
 
     private void FocusRiderCreationStep(int step)
     {
-        if (!RiderCreationStepContentControl.IsEnabled)
+        if (!RiderCreationStepContentControl.IsEnabled || RiderCreationView.Visibility != Visibility.Visible)
         {
             return;
         }
@@ -5091,7 +5200,8 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         if (!IsWholeAbilityValue(RiderBulkCurrentNumberBox.Value))
         {
-            PresentWarning("Check Current value", "Enter a whole number from 50 to 85 before setting every Current ability.");
+            PresentRiderValidation("Check Current value", "Enter a whole number from 50 to 85 before setting every Current ability.");
+            RiderBulkCurrentNumberBox.Focus(FocusState.Programmatic);
             return;
         }
 
@@ -5105,7 +5215,8 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         if (!IsWholeAbilityValue(RiderBulkLimitNumberBox.Value))
         {
-            PresentWarning("Check Limit value", "Enter a whole number from 50 to 85 before setting every ability Limit.");
+            PresentRiderValidation("Check Limit value", "Enter a whole number from 50 to 85 before setting every ability Limit.");
+            RiderBulkLimitNumberBox.Focus(FocusState.Programmatic);
             return;
         }
 
@@ -5122,6 +5233,10 @@ public sealed partial class MainWindow : Window, IDisposable
             UpdateRiderAbilityWarning(editor);
         }
 
+        if (sender.Tag is RiderAbilityEditor ability && ReferenceEquals(ability.Current, sender))
+        {
+            UpdateCurrentAbilityPresentation();
+        }
         InvalidateRiderCreationPreview();
     }
 
@@ -5191,13 +5306,13 @@ public sealed partial class MainWindow : Window, IDisposable
                         showError, "Enter a birth date", "Birth date is required.", RiderBirthDatePicker);
                 }
 
-                if (!IsPositiveWholeNumber(RiderHeightNumberBox.Value))
+                if (!IsPositiveWholeNumber(RiderHeightNumberBox.Value) || RiderHeightNumberBox.Value > int.MaxValue)
                 {
                     return RejectRiderStep(
                         showError, "Check height", "Height must be a positive whole number of centimetres.", RiderHeightNumberBox);
                 }
 
-                if (!IsPositiveWholeNumber(RiderWeightNumberBox.Value))
+                if (!IsPositiveWholeNumber(RiderWeightNumberBox.Value) || RiderWeightNumberBox.Value > int.MaxValue)
                 {
                     return RejectRiderStep(
                         showError, "Check weight", "Weight must be a positive whole number of kilograms.", RiderWeightNumberBox);
@@ -5237,6 +5352,12 @@ public sealed partial class MainWindow : Window, IDisposable
                         invalidLimit.Limit);
                 }
 
+                if (RiderCurrentAbilityOverrideToggle.IsChecked == true && !double.IsFinite(RiderCurrentAbilityOverrideBox.Value))
+                {
+                    return RejectRiderStep(showError, "Check current ability", "Enter a finite override or use the calculated value.",
+                        RiderCurrentAbilityOverrideBox);
+                }
+
                 return _riderAbilityEditors.Count == 14;
 
             case 3:
@@ -5254,7 +5375,8 @@ public sealed partial class MainWindow : Window, IDisposable
 
                 if (!IsPositiveWholeNumber(RiderContractEndYearNumberBox.Value)
                     || _riderCreationDraft is null
-                    || RiderContractEndYearNumberBox.Value < _riderCreationDraft.SaveYear)
+                    || RiderContractEndYearNumberBox.Value < _riderCreationDraft.SaveYear
+                    || RiderContractEndYearNumberBox.Value > int.MaxValue)
                 {
                     string year = _riderCreationDraft?.SaveYear.ToString(CultureInfo.InvariantCulture) ?? "the save year";
                     return RejectRiderStep(
@@ -5276,35 +5398,43 @@ public sealed partial class MainWindow : Window, IDisposable
                         RiderGameDisplayNameTextBox);
                 }
 
-                return TryReadRiderAdvancedValues(out _, out _, out string? error)
-                    || RejectRiderStep(
-                        showError,
-                        "Check Advanced values",
-                        error ?? "One or more Advanced values are invalid.",
-                        RiderAdvancedExpander);
+                if (TryReadRiderAdvancedValues(out _, out _, out string? error, out RiderAdvancedFieldEditor? invalid))
+                {
+                    return true;
+                }
+                if (showError && invalid is not null)
+                {
+                    Expander group = _contractAdvancedEditors.Contains(invalid) ? ContractAdvancedExpander : RiderAdvancedExpander;
+                    group.IsExpanded = true;
+                }
+                return RejectRiderStep(showError, "Check Advanced values",
+                    error ?? "One or more Advanced values are invalid.",
+                    invalid?.ValueEditor as Control ?? RiderAdvancedExpander);
 
             default:
                 return _riderCreationPreview is not null;
         }
-    }
-
-    private bool RejectRiderStep(
-        bool showError,
-        string title,
-        string message,
-        Control focusTarget)
-    {
-        if (showError)
+        bool RejectRiderStep(bool display, string title, string message, Control focusTarget)
         {
-            PresentWarning(title, message);
-            focusTarget.Focus(FocusState.Programmatic);
+            if (display)
+            {
+                _riderCreationMaxVisitedStep = Math.Max(_riderCreationMaxVisitedStep, step);
+                ShowRiderCreationStep(step, focus: false);
+                if (ReferenceEquals(focusTarget, RiderGameDisplayNameTextBox))
+                {
+                    RiderAdvancedExpander.IsExpanded = true;
+                }
+                PresentRiderValidation(title, message);
+                RiderCreationStepContentControl.UpdateLayout();
+                focusTarget.Focus(FocusState.Programmatic);
+                focusTarget.StartBringIntoView(new BringIntoViewOptions { VerticalAlignmentRatio = 0.2 });
+            }
+            return false;
         }
-
-        return false;
     }
 
     private static bool IsPositiveWholeNumber(double value) =>
-        !double.IsNaN(value) && value > 0 && value <= long.MaxValue && Math.Truncate(value) == value;
+        value > 0 && value < 9_223_372_036_854_775_808d && Math.Truncate(value) == value;
 
     private static bool IsPotentialValue(double value) =>
         double.IsFinite(value)
@@ -5313,8 +5443,13 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async Task PrepareRiderCreationReviewAsync()
     {
+        if (ViewModel.IsBusy)
+        {
+            return;
+        }
+
         if (_session is null || _riderCreationDraft is null
-            || _riderCreationSessionId != _session.SessionId || ViewModel.IsBusy)
+            || _riderCreationSessionId != _session.SessionId || _riderReceipt is not null)
         {
             PresentWarning("Create Rider is not ready", "Open a supported CDB and wait for the wizard to finish loading.");
             return;
@@ -5324,41 +5459,97 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             if (!ValidateRiderCreationStep(step, showError: true))
             {
-                _riderCreationMaxVisitedStep = Math.Max(_riderCreationMaxVisitedStep, step);
-                ShowRiderCreationStep(step);
                 return;
             }
         }
 
         if (!TryBuildRiderCreationInput(
-                RiderMissingLimitsAcknowledgement.IsChecked == true,
+                missingLimitsAcknowledged: false,
                 out RiderCreationInput? input,
                 out string? error))
         {
-            PresentWarning("Check rider values", error ?? "The rider draft is incomplete.");
+            PresentRiderValidation("Check rider values", error ?? "The rider draft is incomplete.");
             return;
         }
 
         EditorSessionState session = _session;
+        if (_riderCreationStep == 5)
+        {
+            ShowRiderCreationStep(4, focus: false);
+        }
+        long draftGeneration = _riderDraftGeneration;
+        long viewGeneration = _riderViewGeneration;
+        long? publishedGeneration = null;
+        string? supersedingStatus = null;
+        InvalidDataException? presetFailure = null;
+        _riderCreationPreview = null;
+        RiderMissingLimitsAcknowledgement.IsChecked = false;
+        string[] draftValues = CaptureRiderDraftValues();
         await RunMaintenanceAsync(
             "Rider creation preview",
             async cancellationToken =>
             {
-                RiderCreationPreview preview = await _riderCreationService.PreviewAsync(
-                    session.WorkingSqlitePath,
-                    input,
-                    cancellationToken);
-                if (_session?.SessionId != session.SessionId)
+                RiderCreationPreview preview;
+                try
                 {
+                    preview = await _riderCreationService.PreviewAsync(
+                        session.WorkingSqlitePath, input, cancellationToken);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested &&
+                    !OwnsRiderReview(session, draftGeneration, viewGeneration))
+                {
+                    supersedingStatus = ViewModel.Status;
+                    return;
+                }
+                catch (Exception exception) when (IsExpectedOperationFailure(exception) &&
+                    !OwnsRiderReview(session, draftGeneration, viewGeneration))
+                {
+                    supersedingStatus = ViewModel.Status;
+                    return;
+                }
+                catch (InvalidDataException exception) when (exception.Message.StartsWith(
+                    "The effective default for 'DYN_cyclist.fkIDcontract_preference_preset'", StringComparison.Ordinal))
+                {
+                    presetFailure = exception;
+                    return;
+                }
+                if (!OwnsRiderReview(session, draftGeneration, viewGeneration) ||
+                    !draftValues.SequenceEqual(CaptureRiderDraftValues()))
+                {
+                    supersedingStatus = ViewModel.Status;
                     return;
                 }
 
                 _riderCreationPreview = preview;
                 PopulateRiderCreationReview(preview);
                 _riderCreationMaxVisitedStep = 5;
-                ShowRiderCreationStep(5);
-                ViewModel.Status = "Review the generated rider and contract before creating them.";
+                ShowRiderCreationStep(5, focus: false);
+                publishedGeneration = _riderViewGeneration;
             });
+        if (presetFailure is not null && OwnsRiderReview(session, draftGeneration, viewGeneration))
+        {
+            ShowRiderCreationStep(4, focus: false);
+            RiderAdvancedExpander.IsExpanded = true;
+            PresentRiderValidation("Choose a contract preference preset", presetFailure.Message);
+            RiderAdvancedFieldEditor? preset = _riderAdvancedEditors.FirstOrDefault(static editor =>
+                editor.Field.Column.Name.Equals("fkIDcontract_preference_preset", StringComparison.OrdinalIgnoreCase));
+            Control focusTarget = preset?.UseDefaultBox ?? (Control?)preset?.ValueEditor ?? RiderAdvancedExpander;
+            RiderCreationStepContentControl.UpdateLayout();
+            focusTarget.Focus(FocusState.Programmatic);
+            focusTarget.StartBringIntoView(new BringIntoViewOptions { VerticalAlignmentRatio = 0.2 });
+        }
+        else if (publishedGeneration is { } published && OwnsRiderReview(session, draftGeneration, published))
+        {
+            ViewModel.Status = "Review the generated rider and contract before creating them.";
+            FocusRiderCreationStep(5);
+        }
+        else if (supersedingStatus is { Length: > 0 } &&
+            !supersedingStatus.StartsWith("Checking rider creation preview", StringComparison.Ordinal) &&
+            !supersedingStatus.Equals("Cancelling safely…", StringComparison.Ordinal))
+        {
+            ViewModel.Status = supersedingStatus;
+        }
     }
 
     private bool TryBuildRiderCreationInput(
@@ -5379,7 +5570,7 @@ public sealed partial class MainWindow : Window, IDisposable
         if (!TryReadRiderAdvancedValues(
                 out Dictionary<string, SqliteValue> riderAdvanced,
                 out Dictionary<string, SqliteValue> contractAdvanced,
-                out error))
+                out error, out _))
         {
             return false;
         }
@@ -5425,14 +5616,26 @@ public sealed partial class MainWindow : Window, IDisposable
     private bool TryReadRiderAdvancedValues(
         out Dictionary<string, SqliteValue> riderValues,
         out Dictionary<string, SqliteValue> contractValues,
-        out string? error)
+        out string? error,
+        out RiderAdvancedFieldEditor? invalidEditor)
     {
         riderValues = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
         contractValues = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        invalidEditor = null;
+        if (RiderCurrentAbilityOverrideToggle.IsChecked == true)
+        {
+            if (!double.IsFinite(RiderCurrentAbilityOverrideBox.Value))
+            {
+                error = "Current ability override requires a finite number.";
+                return false;
+            }
+            riderValues.Add(RiderCurrentAbility.ColumnName, SqliteValue.Real(RiderCurrentAbilityOverrideBox.Value));
+        }
         foreach (RiderAdvancedFieldEditor editor in _riderAdvancedEditors.Concat(_contractAdvancedEditors))
         {
             if (!TryReadRiderAdvancedValue(editor, out bool include, out SqliteValue value, out error))
             {
+                invalidEditor = editor;
                 return false;
             }
 
@@ -5470,7 +5673,7 @@ public sealed partial class MainWindow : Window, IDisposable
         if (editor.NullBox?.IsChecked == true)
         {
             value = SqliteValue.Null;
-            include = editor.Field.Value.Kind != SqliteValueKind.Null;
+            include = editor.Field.UsesDatabaseDefault || editor.Field.Value.Kind != SqliteValueKind.Null;
             return true;
         }
 
@@ -5507,7 +5710,7 @@ public sealed partial class MainWindow : Window, IDisposable
             {
                 if (Math.Truncate(numberBox.Value) != numberBox.Value
                     || numberBox.Value < long.MinValue
-                    || numberBox.Value > long.MaxValue)
+                    || numberBox.Value >= 9_223_372_036_854_775_808d)
                 {
                     error = $"{editor.Field.Label} must be a whole SQLite integer.";
                     return false;
@@ -5536,22 +5739,28 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void PopulateRiderCreationReview(RiderCreationPreview preview)
     {
-        RiderRoleOption role = (RiderRoleOption)RiderRoleComboBox.SelectedItem;
+        RiderCreationInput input = preview.Input;
+        RiderRoleOption role = CreateRiderRoleOptions().Single(option => option.Role == input.Role);
         RiderReviewSummaryText.Text =
             $"{preview.Input.FirstName} {preview.Input.LastName} will be rider {preview.NewCyclistId:N0} with contract {preview.NewContractId:N0}. " +
-            $"Game display name: {preview.Input.GameDisplayName}. Potential: {preview.Input.Potential:N1}. " +
-            $"Team: {_riderCreationTeam}. Region: {_riderCreationRegion}. Rider type: {_riderCreationType}. " +
+            $"Game display name: “{preview.Input.GameDisplayName}”. Potential: {preview.Input.Potential:N1}. " +
+            $"Team: {preview.Team}. Region: {preview.Region}. Rider type: {preview.RiderType}. " +
             $"Contract: {role.Label} ({(int)role.Role}), wage {preview.Input.Wage:N0}, through {preview.Input.ContractEndYear}. " +
             "Both rows are one atomic change and one Undo operation.";
+        RiderReviewProfileText.Text =
+            $"Born {input.BirthDate:dd MMM yyyy} · {input.Height:N0} cm · {input.Weight:N0} kg\n" +
+            $"Photo: {(input.Photo.Length == 0 ? "Blank" : input.Photo)} · Sound name: {(input.SoundName.Length == 0 ? "Blank" : input.SoundName)}";
         RiderReviewFavoriteRacesText.Text = preview.FavoriteRaces.Count == 0
             ? "None selected · stored as ()"
             : string.Join(Environment.NewLine, preview.FavoriteRaces.Select(static race => race.ToString()));
         Dictionary<string, RiderAbilityInput> abilities = preview.Input.Abilities.ToDictionary(
             static ability => ability.Key,
             StringComparer.OrdinalIgnoreCase);
-        RiderReviewAbilitiesText.Text = string.Join(
+        string abilityMode = preview.UsesAutomaticCurrentAbility ? "Calculated" : "Override";
+        RiderReviewAbilitiesText.Text = $"Current ability · {abilityMode} · {FormatSqliteValue(preview.RiderValues[RiderCurrentAbility.ColumnName])}\n" +
+            string.Join(
             Environment.NewLine,
-            _riderCreationDraft!.Abilities.Select(definition =>
+            preview.AbilityDefinitions.Select(definition =>
             {
                 RiderAbilityInput ability = abilities[definition.Key];
                 string limit = ability.Limit?.ToString(CultureInfo.InvariantCulture) ?? "NULL";
@@ -5599,7 +5808,8 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         bool hasCurrentPreview = _riderCreationPreview is not null
             && _session is not null
-            && _riderCreationSessionId == _session.SessionId;
+            && _riderCreationSessionId == _session.SessionId
+            && _riderCreationStep == 5;
         CreateRiderButton.IsEnabled = RiderCreationCommandAvailability.CanCreate(
             hasCurrentPreview,
             _riderCreationPreview?.MissingLimitKeys.Count ?? 0,
@@ -5610,69 +5820,70 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async void CreateRider_Click(object sender, RoutedEventArgs e)
     {
-        if (_session is null || _riderCreationDraft is null
-            || _riderCreationSessionId != _session.SessionId || ViewModel.IsBusy)
+        if (_session is not { } session || _riderCreationPreview is not { } preview ||
+            !CreateRiderButton.IsEnabled || _riderCreationSessionId != session.SessionId || ViewModel.IsBusy)
         {
             return;
         }
 
-        if (!TryBuildRiderCreationInput(
-                RiderMissingLimitsAcknowledgement.IsChecked == true,
-                out RiderCreationInput? input,
-                out string? error))
+        if (RiderMissingLimitsAcknowledgement.IsChecked == true)
         {
-            PresentWarning("Check rider values", error ?? "The rider draft is incomplete.");
-            return;
+            preview = preview.AcknowledgeMissingLimits();
         }
-
-        if (input.Abilities.Any(static ability => ability.Limit is null)
-            && !input.MissingLimitsAcknowledged)
-        {
-            PresentWarning(
-                "Acknowledge blank Limits",
-                "Confirm that blank Limits will be stored as database NULL before creating the rider.");
-            RiderMissingLimitsAcknowledgement.Focus(FocusState.Programmatic);
-            return;
-        }
-
-        EditorSessionState session = _session;
+        long draftGeneration = _riderDraftGeneration;
+        long viewGeneration = _riderViewGeneration;
         await RunMaintenanceAsync(
             "Rider creation",
             async cancellationToken =>
             {
-                RiderCreationPreview preview = await _riderCreationService.PreviewAsync(
-                    session.WorkingSqlitePath,
-                    input,
-                    cancellationToken);
-                _riderCreationPreview = preview;
-                PopulateRiderCreationReview(preview);
                 var dialog = new ContentDialog
                 {
                     XamlRoot = WindowRoot.XamlRoot,
                     Title = "Create rider and contract?",
-                    Content = $"Create rider {preview.NewCyclistId:N0} ({input.FirstName} {input.LastName}) and contract {preview.NewContractId:N0}. Both rows will be inserted atomically and can be undone together.",
+                    Content = $"Create rider {preview.NewCyclistId:N0} ({preview.Input.FirstName} {preview.Input.LastName}) and contract {preview.NewContractId:N0}. Both rows will be inserted atomically and can be undone together.",
                     PrimaryButtonText = "Create",
                     CloseButtonText = "Keep editing",
-                    DefaultButton = ContentDialogButton.Primary,
+                    DefaultButton = ContentDialogButton.Close,
                 };
-                if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+                if (await dialog.ShowAsync() != ContentDialogResult.Primary ||
+                    !OwnsRiderReview(session, draftGeneration, viewGeneration))
                 {
                     return;
                 }
 
+                RiderDraftInputHost.IsEnabled = false;
                 await PrepareMutationWriteAheadAsync(session);
-                MaintenanceApplyResult result = await _riderCreationService.ApplyAsync(
-                    session.WorkingSqlitePath,
-                    preview,
-                    cancellationToken);
-                await CompleteMaintenanceApplyAsync(session, result);
-                if (_session is not null)
+                MaintenanceApplyResult result;
+                try
                 {
-                    EditorSessionState currentSession = _session;
-                    ResetRiderCreationForSession(currentSession.SessionId);
-                    await InitializeRiderCreationAsync(currentSession, cancellationToken);
+                    result = await _riderCreationService.ApplyAsync(session.WorkingSqlitePath, preview, cancellationToken);
                 }
+                catch (DBConcurrencyException exception)
+                {
+                    if (await CompleteUnchangedMutationAsync())
+                    {
+                        bool ownsView = OwnsRiderReview(session, draftGeneration, viewGeneration);
+                        InvalidateRiderCreationPreview();
+                        ShowRiderCreationStep(4, focus: false);
+                        if (ownsView)
+                        {
+                            PresentRiderValidation("Review the rider again", exception.Message);
+                        }
+                    }
+                    return;
+                }
+                if (_session?.SessionId == session.SessionId && result.AffectedRows > 0)
+                {
+                    _riderCreationPreview = null;
+                    SetRiderReceipt(preview, result.HistoryOperation?.OperationId);
+                }
+                await CompleteMaintenanceApplyAsync(session, result);
             });
+        if (ReferenceEquals(_riderReceipt, preview) && OwnsRiderReview(session, draftGeneration, viewGeneration))
+        {
+            ViewModel.Status = "Rider and contract created in the working copy.";
+            CreateAnotherRiderButton.Focus(FocusState.Programmatic);
+        }
     }
 
     private async void PreviewRiderRecovery_Click(object sender, RoutedEventArgs e)
@@ -5683,15 +5894,24 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         RiderRecoveryTarget target;
+        RiderTeamOption? chosenTeam = null;
         if (RecoveryTeamModeRadioButton.IsChecked == true)
         {
+            if (_maintenanceTeamsSessionId != session.SessionId)
+            {
+                PresentWarning("Team choices are loading", "Wait for team choices or enter rider IDs directly.");
+                return;
+            }
+
             if (RiderRecoveryTeamComboBox.SelectedItem is not RiderTeamOption team)
             {
                 PresentWarning("Choose a team", "Choose one team to resolve its current rider roster.");
+                RiderRecoveryTeamComboBox.Focus(FocusState.Programmatic);
                 return;
             }
 
             target = RiderRecoveryTarget.ForTeam(team.TeamId);
+            chosenTeam = team;
         }
         else
         {
@@ -5713,6 +5933,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 MaintenanceCapability capability = await _riderRecoveryService.CheckCapabilityAsync(
                     session.WorkingSqlitePath,
                     cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!PresentCapabilityFailure(capability))
                 {
                     return;
@@ -5722,32 +5943,40 @@ public sealed partial class MainWindow : Window, IDisposable
                     session.WorkingSqlitePath,
                     target,
                     cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 RiderRecoveryChange[] riderChanges = preview.Changes
                     .Where(static change => change.OldValues != change.NewValues)
                     .ToArray();
-                string riderRowLabel = riderChanges.Length == 1 ? "row" : "rows";
-                string targetSummary = preview.Target.Kind == RiderRecoveryTargetKind.Team
-                    ? $"team {preview.Target.TeamId:N0}"
-                    : $"{preview.CyclistIds.Count:N0} distinct rider ID(s)";
-                string missingSummary = preview.MissingCyclistIds.Count == 0
-                    ? "Every resolved rider has a fitness row."
-                    : $"Missing fitness rows: {string.Join(", ", preview.MissingCyclistIds)}.";
+                bool hasChanges = riderChanges.Length != 0;
+                string targetSummary = chosenTeam is null
+                    ? "Rider IDs"
+                    : chosenTeam.IdentityLabel;
+                int resolvedCount = preview.CyclistIds.Count;
+                int foundCount = preview.Changes.Count;
+                int missingCount = preview.MissingCyclistIds.Count;
+                int matchingCount = foundCount - riderChanges.Length;
+                string counts = $"{resolvedCount:N0} {(resolvedCount == 1 ? "rider" : "riders")} resolved. " +
+                    $"{foundCount:N0} fitness {(foundCount == 1 ? "row" : "rows")} found. " +
+                    $"{missingCount:N0} {(missingCount == 1 ? "rider has" : "riders have")} no fitness row.";
+                string outcome = preview.NoChangeSummary ??
+                    $"{riderChanges.Length:N0} fitness {(riderChanges.Length == 1 ? "row will change" : "rows will change")}. " +
+                    $"{matchingCount:N0} {(matchingCount == 1 ? "row already matches" : "rows already match")}.";
+                string RiderLabel(long id) => preview.RiderNames.TryGetValue(id, out string? name)
+                    ? $"{name} · Rider ID {id:N0}"
+                    : $"Rider ID {id:N0}";
                 ContentDialog dialog = CreateMaintenancePreviewDialog(
-                    "Apply rider recovery preset?",
-                    $"Resolved {preview.CyclistIds.Count:N0} rider(s) from {targetSummary}; {preview.FoundCyclistIds.Count:N0} fitness {riderRowLabel} were found and {riderChanges.Length:N0} need changes. {missingSummary} The exact resolved ID set is retained for apply.",
+                    "Review rider recovery preset",
+                    $"{targetSummary}\n{counts}\n{outcome}",
                     riderChanges.Select(change =>
-                        $"Rider {change.CyclistId:N0}: {FormatRiderValues(change.OldValues)} -> {FormatRiderValues(change.NewValues)}")
-                        .Concat(preview.MissingCyclistIds.Select(id => $"Rider {id:N0}: no fitness row found")));
-                if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+                        $"{RiderLabel(change.CyclistId)}\n{FormatRiderValues(change.OldValues)} → {FormatRiderValues(change.NewValues)}")
+                        .Concat(preview.MissingCyclistIds.Select(id => $"{RiderLabel(id)} · No fitness row found")),
+                    hasChanges);
+                if (await dialog.ShowAsync() != ContentDialogResult.Primary || !hasChanges)
                 {
                     return;
                 }
 
-                if (riderChanges.Length > 0)
-                {
-                    await PrepareMutationWriteAheadAsync(session);
-                }
-
+                await PrepareMutationWriteAheadAsync(session);
                 MaintenanceApplyResult result = await _riderRecoveryService.ApplyAsync(
                     session.WorkingSqlitePath,
                     preview,
@@ -5770,6 +5999,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 MaintenanceCapability capability = await _januaryFirstRepairService.CheckCapabilityAsync(
                     session.WorkingSqlitePath,
                     cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!PresentCapabilityFailure(capability))
                 {
                     return;
@@ -5778,21 +6008,25 @@ public sealed partial class MainWindow : Window, IDisposable
                 JanuaryFirstRepairPreview preview = await _januaryFirstRepairService.PreviewAsync(
                     session.WorkingSqlitePath,
                     cancellationToken);
-                string repairRowLabel = preview.RowCount == 1 ? "row" : "rows";
+                cancellationToken.ThrowIfCancellationRequested();
+                bool hasChanges = preview.RowCount != 0;
+                string outcome = preview.RowCount switch
+                {
+                    0 => "DYN_result_season_stage is empty. There are no rows to delete.",
+                    1 => "The repair will delete the one row in DYN_result_season_stage in the working copy.",
+                    _ => $"The repair will delete all {preview.RowCount:N0} rows from DYN_result_season_stage in the working copy."
+                };
                 ContentDialog dialog = CreateMaintenancePreviewDialog(
-                    "Apply January 1 repair?",
-                    $"Database date: {preview.CurrentDate:yyyy-MM-dd}. The repair will delete all {preview.RowCount:N0} {repairRowLabel} from DYN_result_season_stage in the isolated working database.",
-                    [$"Rows to delete from DYN_result_season_stage: {preview.RowCount:N0}"]);
-                if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+                    "Review January 1 season-stage repair",
+                    $"Game date {preview.CurrentDate:yyyy-MM-dd}. {outcome}",
+                    [],
+                    hasChanges);
+                if (await dialog.ShowAsync() != ContentDialogResult.Primary || !hasChanges)
                 {
                     return;
                 }
 
-                if (preview.RowCount > 0)
-                {
-                    await PrepareMutationWriteAheadAsync(session);
-                }
-
+                await PrepareMutationWriteAheadAsync(session);
                 MaintenanceApplyResult result = await _januaryFirstRepairService.ApplyAsync(
                     session.WorkingSqlitePath,
                     preview,
@@ -5815,6 +6049,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 MaintenanceCapability capability = await _countryQuotaMaintenanceService.CheckCapabilityAsync(
                     session.WorkingSqlitePath,
                     cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!PresentCapabilityFailure(capability))
                 {
                     return;
@@ -5823,20 +6058,17 @@ public sealed partial class MainWindow : Window, IDisposable
                 CountryQuotaPreview preview = await _countryQuotaMaintenanceService.PreviewAsync(
                     session.WorkingSqlitePath,
                     cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 var dialog = new CountryQuotaPreviewDialog(preview)
                 {
                     XamlRoot = WindowRoot.XamlRoot,
                 };
-                if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+                if (await dialog.ShowAsync() != ContentDialogResult.Primary || dialog.ChangeCount == 0)
                 {
                     return;
                 }
 
-                if (dialog.ChangeCount > 0)
-                {
-                    await PrepareMutationWriteAheadAsync(session);
-                }
-
+                await PrepareMutationWriteAheadAsync(session);
                 MaintenanceApplyResult result = await _countryQuotaMaintenanceService.ApplyAsync(
                     session.WorkingSqlitePath,
                     dialog.SourcePreview,
@@ -5875,22 +6107,39 @@ public sealed partial class MainWindow : Window, IDisposable
                 PresentWarning("Maintenance cancelled", "No database mutation was started.");
             }
         }
+        catch (UnsafeRowMutationException exception)
+        {
+            if (await CompleteUnchangedMutationAsync())
+            {
+                RestoreSessionState();
+                PresentWarning("Maintenance is unavailable", exception.Message);
+            }
+        }
+        catch (DBConcurrencyException exception)
+        {
+            if (await CompleteUnchangedMutationAsync())
+            {
+                RestoreSessionState();
+                PresentWarning("Maintenance preview is stale", exception.Message + " Run a new preview.");
+            }
+        }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
+            bool hasToolMessage = TryGetMaintenanceCapabilityMessage(exception, out string toolMessage);
             if (_operationMutationPrepared)
             {
                 await HandlePreparedMutationFailureAsync(
                     "Maintenance operation failed",
-                    SafeFailureMessage(
+                    hasToolMessage ? toolMessage : SafeFailureMessage(
                         exception,
                         "The app could not confirm whether the change finished. You can still recover this session; review the working copy before trying again."));
             }
             else
             {
                 RestoreSessionState();
-                if (TryGetMaintenanceCapabilityMessage(exception, out string? capabilityMessage))
+                if (hasToolMessage)
                 {
-                    PresentWarning("Tool unavailable for this database", capabilityMessage);
+                    PresentWarning("Tool unavailable for this database", toolMessage);
                 }
                 else
                 {
@@ -5958,6 +6207,7 @@ public sealed partial class MainWindow : Window, IDisposable
             try
             {
                 _editHistory.Record(result.HistoryOperation, result.UndoGuards);
+                _session = await _mutationWriteAhead.CompleteAsync(_session!);
             }
             catch (Exception exception) when (IsExpectedOperationFailure(exception))
             {
@@ -5967,13 +6217,17 @@ public sealed partial class MainWindow : Window, IDisposable
             }
 
             UpdateHistoryButtons();
-            string changedRowLabel = result.AffectedRows == 1 ? "row" : "rows";
-            PresentSuccess("Maintenance applied", $"{result.AffectedRows:N0} {changedRowLabel} changed in the isolated working copy.");
+            PresentSuccess("Maintenance applied", result.Summary);
         }
         else
         {
+            if (_operationMutationPrepared && _session?.MutationPending == true)
+            {
+                _session = await _mutationWriteAhead.CompleteAsync(_session);
+                await ReconcileSessionWithHistoryBaselineAsync();
+            }
             RestoreSessionState();
-            PresentSuccess("No changes needed", "The working database already matches the previewed maintenance state.");
+            PresentInformation("No maintenance changes applied", result.Summary);
         }
 
         try
@@ -5987,6 +6241,11 @@ public sealed partial class MainWindow : Window, IDisposable
                 result.AffectedRows > 0
                     ? "The maintenance change completed in the working copy."
                     : "The maintenance check completed without changing the working copy.");
+        }
+        catch (Exception exception) when (IsExpectedOperationFailure(exception))
+        {
+            PresentTableQueryWarning("Could not refresh the table",
+                SafeFailureMessage(exception, "The maintenance operation completed. Use Refresh to reload the previous view."));
         }
     }
 
@@ -6104,6 +6363,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 "Select a table or view from the list to load its rows.",
                 allowOpen: false);
             ViewModel.TableSummary = "No table selected";
+            ResetTableWorkspaceChrome();
         }
 
         ViewModel.Status = "Table tab closed; database edits are still retained.";
@@ -6128,7 +6388,8 @@ public sealed partial class MainWindow : Window, IDisposable
     private ContentDialog CreateMaintenancePreviewDialog(
         string title,
         string summary,
-        IEnumerable<string> changes)
+        IEnumerable<string> changes,
+        bool hasChanges)
     {
         var panel = new StackPanel { Spacing = 10 };
         panel.Children.Add(new TextBlock
@@ -6137,21 +6398,27 @@ public sealed partial class MainWindow : Window, IDisposable
             TextWrapping = TextWrapping.Wrap,
             MaxWidth = 680,
         });
-        panel.Children.Add(new ListView
+        string[] reviewRows = changes.ToArray();
+        if (reviewRows.Length != 0)
         {
-            ItemsSource = changes.ToArray(),
-            MaxHeight = 420,
-            MinWidth = 640,
-            SelectionMode = ListViewSelectionMode.None,
-        });
+            var rows = new ListView
+            {
+                ItemsSource = reviewRows,
+                MaxHeight = 420,
+                SelectionMode = ListViewSelectionMode.None,
+            };
+            rows.ItemTemplate = (DataTemplate)WindowRoot.Resources["WrappedListTextTemplate"];
+            AutomationProperties.SetName(rows, "Maintenance preview rows");
+            panel.Children.Add(rows);
+        }
         return new ContentDialog
         {
             XamlRoot = WindowRoot.XamlRoot,
             Title = title,
             Content = panel,
-            PrimaryButtonText = "Apply",
-            CloseButtonText = "Cancel",
-            DefaultButton = ContentDialogButton.Primary,
+            PrimaryButtonText = hasChanges ? "Apply" : string.Empty,
+            CloseButtonText = hasChanges ? "Cancel" : "Close",
+            DefaultButton = hasChanges ? ContentDialogButton.None : ContentDialogButton.Close,
         };
     }
 
@@ -6177,6 +6444,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private void SetReadyState()
     {
         ViewModel.HasDatabase = _session is not null;
+        UpdatePersistentSaveState();
         ViewModel.State = _session?.IsDirty == true
             ? ShellOperationState.Dirty
             : ShellOperationState.Ready;
@@ -6211,6 +6479,7 @@ public sealed partial class MainWindow : Window, IDisposable
         WorkingCopyStatus.Visibility = Visibility.Collapsed;
         _session = null;
         _catalog = null;
+        _relationshipReturn = null;
         ResetMaintenanceTargetsForSession(sessionId: null);
         _allTables.Clear();
         _tableTabs.Clear();
@@ -6229,6 +6498,7 @@ public sealed partial class MainWindow : Window, IDisposable
         TableTabs.TabItems.Clear();
         TableGrid.Clear();
         SetTableGridPresented(isPresented: false);
+        ResetTableWorkspaceChrome();
         BusyIndicator.Visibility = Visibility.Collapsed;
         SetTableLoadingSurface(isVisible: false);
         ApplyTableFilter(string.Empty);
@@ -6244,6 +6514,7 @@ public sealed partial class MainWindow : Window, IDisposable
         EmptyStateDescription.Text = description;
         AutomationProperties.SetName(EmptyState, title);
         EmptyStateOpenButton.Visibility = allowOpen ? Visibility.Visible : Visibility.Collapsed;
+        EmptyStateRecentDatabasesButton.Visibility = allowOpen ? Visibility.Visible : Visibility.Collapsed;
         EmptyStateReleaseLabel.Visibility = allowOpen ? Visibility.Visible : Visibility.Collapsed;
         EmptyState.Visibility = Visibility.Visible;
     }
@@ -6284,6 +6555,18 @@ public sealed partial class MainWindow : Window, IDisposable
     private void PresentError(string title, string message) =>
         PresentInfoBar(title, message, InfoBarSeverity.Error);
 
+    private void UpdatePersistentSaveState()
+    {
+        ViewModel.HasUnsavedChanges = _session?.IsDirty == true;
+        ViewModel.HasHistoryUncertainty = _session is not null &&
+            (_session.MutationPending || _session.HistoryUncertain != false ||
+            (!_historyReplayActive && _editHistory?.State is { HistoryUncertain: true } or { HasPendingReplay: true }));
+        ViewModel.SaveDestination = _session?.SaveTargetCdbPath ?? string.Empty;
+        LastSaveBackupText.Text = _session?.LastBackupPath ?? "No backup for this session’s last save.";
+        OpenBackupFolderButton.IsEnabled = _session?.LastBackupPath is not null;
+        WorkingCopyStatus.Visibility = _session is null ? Visibility.Collapsed : Visibility.Visible;
+    }
+
     private void PresentWorkingCopyReady()
     {
         OperationInfo.IsOpen = false;
@@ -6292,7 +6575,9 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void PresentInfoBar(string title, string message, InfoBarSeverity severity)
     {
-        WorkingCopyStatus.Visibility = Visibility.Collapsed;
+        _tableQueryBanner = false;
+        _riderValidationMessage = false;
+        UpdatePersistentSaveState();
         OperationInfo.Title = title;
         OperationInfo.Message = message;
         OperationInfo.Severity = severity;
@@ -6323,6 +6608,10 @@ public sealed partial class MainWindow : Window, IDisposable
         _operationMutationPrepared = false;
         cancellationToken = lease!.Token;
         ViewModel.IsOperationExclusive = true;
+        if (operationName is "Close" or "Open database" or "Resume session")
+        {
+            RiderDraftInputHost.IsEnabled = false;
+        }
         SetConflictingCommandsEnabled(isEnabled: false);
         SetTableQueryControlsEnabled(isEnabled: false);
         UpdateCreateRiderButtonState();
@@ -6341,13 +6630,25 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         ViewModel.IsOperationExclusive = false;
+        RiderDraftInputHost.IsEnabled = true;
+        UpdatePersistentSaveState();
+        RefreshSessionChanges();
         SetConflictingCommandsEnabled(isEnabled: true);
         SetTableQueryControlsEnabled(isEnabled: true);
         UpdateCreateRiderButtonState();
+        if (_session is { } session && MaintenanceView.Visibility == Visibility.Visible)
+        {
+            _ = LoadMaintenanceTeamsAsync(session, _lifetimeCancellation.Token);
+        }
     }
 
     private void SetConflictingCommandsEnabled(bool isEnabled)
     {
+        UpdateRecoveryCommands();
+        RecentDatabasesButton.IsEnabled = isEnabled;
+        EmptyStateRecentDatabasesButton.IsEnabled = isEnabled;
+        UpdateRelationshipNavigationCommands();
+        TableGrid.SetEditingAllowed(isEnabled);
         OpenButton.IsEnabled = isEnabled;
         SaveButton.IsEnabled = isEnabled && _session is not null;
         SaveAsButton.IsEnabled = isEnabled && _session is not null;
@@ -6356,6 +6657,7 @@ public sealed partial class MainWindow : Window, IDisposable
             UndoButton.IsEnabled = false;
             RedoButton.IsEnabled = false;
             SetRowActionsEnabled(canInsert: false, canMutateSelection: false);
+            RowDetailsButton.IsEnabled = false;
             return;
         }
 
@@ -6367,6 +6669,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 _selectedRow?.Identity is not null;
             SetRowActionsEnabled(canInsert, canMutateSelection);
         }
+        UpdatePresentedRow();
     }
 
     private void SetRowActionsEnabled(bool canInsert, bool canMutateSelection)
@@ -6393,20 +6696,25 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         TablesList.IsEnabled = isEnabled;
         TableTabs.IsEnabled = isEnabled;
-        CurrentTableSearchBox.IsEnabled = isEnabled;
-        FiltersButton.IsEnabled = isEnabled;
-        SortButton.IsEnabled = isEnabled;
-        PageSizeBox.IsEnabled = isEnabled;
-        TableGrid.SetHeaderSortingEnabled(isEnabled);
+        bool hasTable = TableTabs.SelectedItem is TabViewItem { Tag: TableTabContext };
+        bool enabled = isEnabled && hasTable;
+        CurrentTableSearchBox.IsEnabled = enabled;
+        FiltersButton.IsEnabled = enabled;
+        SortButton.IsEnabled = enabled;
+        PageSizeBox.IsEnabled = enabled;
+        RefreshTableButton.IsEnabled = enabled;
+        ResetColumnLayoutButton.IsEnabled = enabled;
+        TableGrid.SetHeaderSortingEnabled(enabled);
         if (isEnabled && TableTabs.SelectedItem is TabViewItem tab &&
             tab.Tag is TableTabContext context)
         {
             UpdateTabChrome(tab, context);
         }
-        else if (!isEnabled)
+        else
         {
             PreviousPageButton.IsEnabled = false;
             NextPageButton.IsEnabled = false;
+            ResetTableQueryButton.IsEnabled = false;
         }
     }
 
@@ -6421,6 +6729,12 @@ public sealed partial class MainWindow : Window, IDisposable
             TableTabs.SelectedItem as TabViewItem,
             _session?.IsDirty == true ? ShellOperationState.Dirty : ShellOperationState.Ready);
         _activeTableLoad = request;
+        UpdateRecoveryCommands();
+        ResetTableQueryButton.IsEnabled = false;
+        RefreshTableButton.IsEnabled = false;
+        ResetColumnLayoutButton.IsEnabled = false;
+        PageSizeBox.IsEnabled = false;
+        RowDetailsButton.IsEnabled = false;
         if (showLoadingSurface)
         {
             ShowTableLoading(request, tableName);
@@ -6582,6 +6896,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void FinishTableLoadPresentation(ShellOperationState returnState)
     {
+        string status = ViewModel.Status;
         SetTableLoadingSurface(isVisible: false);
         ViewModel.State = returnState;
         if (_operationLease is null)
@@ -6594,9 +6909,12 @@ public sealed partial class MainWindow : Window, IDisposable
             selected.Tag is TableTabContext context &&
             _gridBindingSession.IsBoundTo(selected))
         {
-            SetTableGridPresented(isPresented: true);
+            PresentTableRows(context);
             UpdateCountAndPagingChrome(selected, context);
         }
+        SetTableQueryControlsEnabled(_operationLease is null);
+        UpdatePresentedRow();
+        ViewModel.Status = status;
     }
 
     private void SetTableLoadingSurface(bool isVisible)
@@ -6696,7 +7014,11 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            // The workspace service will expose any dirty working session at the next startup.
+            // Any remaining data is available for recovery after the lease is released.
+        }
+        finally
+        {
+            _workspaceService.ReleaseSession(session.SessionId);
         }
     }
 
@@ -6758,6 +7080,7 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         PcmCdbEditor.Application.CdbConversionException conversion =>
             $"{conversion.Failure.Message} {fallback}",
+        UnsafeRowMutationException refusal => refusal.Message,
         UnauthorizedAccessException => $"Access was denied. {fallback}",
         IOException => $"A file operation failed. {fallback}",
         SqliteException => $"The working database rejected the operation. {fallback}",
@@ -6777,19 +7100,33 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         if (exception is InvalidOperationException januaryGate &&
             januaryGate.Message.StartsWith(
-                "The season-stage repair is available only on January 1;",
+                "The season-stage repair is available only on January 1.",
                 StringComparison.Ordinal))
         {
-            message = "The January 1 season-stage repair is available only when the in-game date is January 1.";
+            message = januaryGate.Message;
             return true;
         }
 
         if (exception is InvalidOperationException novemberGate &&
             novemberGate.Message.StartsWith(
-                "Country quotas can be maintained only during November;",
+                "Country quotas can be maintained only during November.",
                 StringComparison.Ordinal))
         {
-            message = "World and European country quotas are available only when the in-game date is in November.";
+            message = novemberGate.Message;
+            return true;
+        }
+
+        if (exception is InvalidDataException && exception.Message is
+            "No usable UCI point scales were found." or
+            "No positive current-season UCI points could be calculated. No quotas were changed." or
+            "A championship-points scale has incomplete classification metadata." or
+            "A championship-points scale has an empty classification key." or
+            "Championship-points scales contain a duplicate classification key." or
+            "A championship-points scale has unbalanced parentheses." or
+            "A championship-points scale contains an invalid award token." or
+            "A championship-points scale is empty.")
+        {
+            message = exception.Message;
             return true;
         }
 
@@ -6810,18 +7147,21 @@ public sealed partial class MainWindow : Window, IDisposable
         int Number,
         string ColumnName,
         FilterOperator Operator,
-        string Value);
+        string Value,
+        QueryValueTarget Target = QueryValueTarget.StoredValue);
 
     private sealed record TableFilterDefinition
     {
         public TableFilterDefinition(
             IEnumerable<FilterRuleDraft> quickRules,
             IEnumerable<FilterRuleDraft> advancedRules,
-            string advancedExpression)
+            string advancedExpression,
+            FilterCondition? referenceFilter = null)
         {
             QuickRules = quickRules.ToArray();
             AdvancedRules = advancedRules.ToArray();
             AdvancedExpression = advancedExpression ?? string.Empty;
+            ReferenceFilter = referenceFilter;
         }
 
         public static TableFilterDefinition Empty { get; } = new([], [], string.Empty);
@@ -6832,7 +7172,8 @@ public sealed partial class MainWindow : Window, IDisposable
 
         public string AdvancedExpression { get; }
 
-        public int RuleCount => QuickRules.Length + AdvancedRules.Length;
+        public FilterCondition? ReferenceFilter { get; }
+
     }
 
     private sealed record TableFilterDialogOutcome(
@@ -6864,13 +7205,16 @@ public sealed partial class MainWindow : Window, IDisposable
 
         public Button RemoveButton { get; } = removeButton;
 
-        public FilterRuleDraft ToDraft(int number) => new(
-            number,
-            ColumnPicker.SelectedItem as string ?? string.Empty,
-            OperatorPicker.SelectedItem is FilterOperatorChoice choice
-                ? choice.Operator
-                : FilterOperator.Equals,
-            ValueBox.Text);
+        public FilterRuleDraft ToDraft(int number)
+        {
+            var column = (TableQueryColumnOption)ColumnPicker.SelectedItem;
+            return new FilterRuleDraft(
+                number,
+                column.ColumnName,
+                OperatorPicker.SelectedItem is FilterOperatorChoice choice ? choice.Operator : FilterOperator.Equals,
+                ValueBox.Text,
+                column.Target);
+        }
     }
 
     private sealed class SortRuleEditor(

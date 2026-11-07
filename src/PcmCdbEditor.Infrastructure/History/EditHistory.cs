@@ -21,14 +21,15 @@ public sealed class EditHistory : IEditHistory
     private Guid _currentStateId = Guid.NewGuid();
     private Guid _savedStateId;
     private bool _recoveredInterruptedReplay;
+    private bool _historyUncertain;
 
-    public EditHistory(string? snapshotPath = null)
+    public EditHistory(string? snapshotPath = null, bool recovering = false)
     {
         _snapshotPath = string.IsNullOrWhiteSpace(snapshotPath) ? null : Path.GetFullPath(snapshotPath);
         _savedStateId = _currentStateId;
         if (_snapshotPath is not null)
         {
-            LoadSnapshot();
+            LoadSnapshot(recovering);
         }
     }
 
@@ -43,10 +44,24 @@ public sealed class EditHistory : IEditHistory
                     _redo.Count > 0,
                     _undo.Count,
                     _redo.Count,
-                    _currentStateId != _savedStateId,
+                    _historyUncertain || _currentStateId != _savedStateId,
                     _pending is not null,
-                    _recoveredInterruptedReplay);
+                    _recoveredInterruptedReplay,
+                    _historyUncertain);
             }
+        }
+    }
+
+    public EditHistorySnapshot GetSnapshot()
+    {
+        lock (_gate)
+        {
+            return EditHistorySnapshot.FromTimeline(
+                State,
+                _currentStateId,
+                _savedStateId,
+                _undo.Select(static entry => (entry.Operation, entry.BeforeStateId)),
+                _redo.Select(static entry => (entry.Operation, entry.AfterStateId)));
         }
     }
 
@@ -158,13 +173,32 @@ public sealed class EditHistory : IEditHistory
         }
     }
 
-    public void MarkSavedBaseline()
+    public void MarkSavedBaseline() => MarkSavedBaseline(retireUncertainHistory: false);
+
+    public void MarkSavedBaseline(bool retireUncertainHistory)
     {
         lock (_gate)
         {
-            EnsureNoPendingReplay();
+            if (!retireUncertainHistory)
+            {
+                EnsureNoPendingReplay();
+            }
+            if (retireUncertainHistory || _historyUncertain)
+            {
+                HistoryDocument baseline = HistoryDocument.CreateEmpty();
+                Persist(baseline);
+                _undo.Clear();
+                _redo.Clear();
+                _currentStateId = baseline.CurrentStateId;
+                _pending = null;
+                _recoveredInterruptedReplay = false;
+            }
+            else if (_snapshotPath is not null)
+            {
+                Persist(CaptureDocument() with { SavedStateId = _currentStateId });
+            }
             _savedStateId = _currentStateId;
-            Persist();
+            _historyUncertain = false;
         }
     }
 
@@ -190,7 +224,16 @@ public sealed class EditHistory : IEditHistory
         HistoryEntry entry = source.Pop();
         var replay = new EditHistoryReplay(entry.Operation, direction, entry.Guards);
         _pending = new PendingReplay(entry, replay);
-        Persist();
+        try
+        {
+            Persist();
+        }
+        catch
+        {
+            _pending = null;
+            source.Push(entry);
+            throw;
+        }
         return replay;
     }
 
@@ -229,16 +272,38 @@ public sealed class EditHistory : IEditHistory
         }
 
         _pending = null;
-        Persist();
+        try
+        {
+            Persist();
+        }
+        catch
+        {
+            if (direction == EditReplayDirection.Undo)
+            {
+                _undo.Pop();
+            }
+            else
+            {
+                _redo.Pop();
+            }
+            _pending = pending;
+            throw;
+        }
     }
 
-    private void LoadSnapshot()
+    private void LoadSnapshot(bool recovering)
     {
         try
         {
+            bool snapshotExisted = File.Exists(_snapshotPath);
+            bool missingOrInvalid = false;
             HistoryDocument document = AtomicJsonFile.ReadOrCreateAsync(
                     _snapshotPath!,
-                    HistoryDocument.CreateEmpty,
+                    () =>
+                    {
+                        missingOrInvalid = true;
+                        return HistoryDocument.CreateEmpty();
+                    },
                     CancellationToken.None)
                 .GetAwaiter()
                 .GetResult();
@@ -254,10 +319,16 @@ public sealed class EditHistory : IEditHistory
 
             _currentStateId = document.CurrentStateId;
             _savedStateId = document.SavedStateId;
+            _historyUncertain = document.HistoryUncertain ||
+                (missingOrInvalid && (recovering || snapshotExisted));
             RestoreStack(_undo, document.Undo);
             RestoreStack(_redo, document.Redo);
             if (document.Pending is not null)
             {
+                if (!Enum.IsDefined(document.Pending.Direction))
+                {
+                    throw new InvalidDataException("The interrupted replay direction is invalid.");
+                }
                 HistoryEntry interrupted = document.Pending.Entry.ToEntry();
                 if (document.Pending.Direction == EditReplayDirection.Undo)
                 {
@@ -269,20 +340,52 @@ public sealed class EditHistory : IEditHistory
                 }
 
                 _recoveredInterruptedReplay = true;
+                _historyUncertain = true;
+            }
+
+            ValidateStackStates();
+            if (_historyUncertain)
+            {
                 Persist();
             }
         }
         catch (Exception exception) when (exception is InvalidDataException
                                           or InvalidOperationException
                                           or ArgumentException
-                                          or FormatException)
+                                          or FormatException
+                                          or NullReferenceException)
         {
             _undo.Clear();
             _redo.Clear();
             _pending = null;
             _currentStateId = Guid.NewGuid();
             _savedStateId = _currentStateId;
+            _historyUncertain = true;
             PreserveInvalidSnapshot();
+            Persist();
+        }
+    }
+
+    private void ValidateStackStates()
+    {
+        Guid cursor = _currentStateId;
+        foreach (HistoryEntry entry in _undo)
+        {
+            if (entry.AfterStateId != cursor || entry.BeforeStateId == entry.AfterStateId)
+            {
+                throw new InvalidDataException("The undo history state markers are inconsistent.");
+            }
+            cursor = entry.BeforeStateId;
+        }
+
+        cursor = _currentStateId;
+        foreach (HistoryEntry entry in _redo)
+        {
+            if (entry.BeforeStateId != cursor || entry.BeforeStateId == entry.AfterStateId)
+            {
+                throw new InvalidDataException("The redo history state markers are inconsistent.");
+            }
+            cursor = entry.AfterStateId;
         }
     }
 
@@ -294,24 +397,27 @@ public sealed class EditHistory : IEditHistory
         }
     }
 
-    private void Persist()
+    private void Persist(HistoryDocument? document = null)
     {
         if (_snapshotPath is null)
         {
             return;
         }
 
-        var document = new HistoryDocument(
+        AtomicJsonFile.WriteAsync(_snapshotPath, document ?? CaptureDocument(), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    private HistoryDocument CaptureDocument() =>
+        new(
             HistoryDocument.CurrentVersion,
             _currentStateId,
             _savedStateId,
             _undo.Select(HistoryEntryEnvelope.From).ToArray(),
             _redo.Select(HistoryEntryEnvelope.From).ToArray(),
-            _pending is null ? null : PendingEnvelope.From(_pending));
-        AtomicJsonFile.WriteAsync(_snapshotPath, document, CancellationToken.None)
-            .GetAwaiter()
-            .GetResult();
-    }
+            _pending is null ? null : PendingEnvelope.From(_pending),
+            _historyUncertain);
 
     private void PreserveInvalidSnapshot()
     {
@@ -398,7 +504,8 @@ public sealed class EditHistory : IEditHistory
         Guid SavedStateId,
         IReadOnlyList<HistoryEntryEnvelope> Undo,
         IReadOnlyList<HistoryEntryEnvelope> Redo,
-        PendingEnvelope? Pending)
+        PendingEnvelope? Pending,
+        bool HistoryUncertain = false)
     {
         public const int CurrentVersion = 2;
 

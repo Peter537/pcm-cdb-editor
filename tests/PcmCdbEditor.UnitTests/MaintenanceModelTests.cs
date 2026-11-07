@@ -113,6 +113,10 @@ public sealed class MaintenanceModelTests
         {
             new(11, "Ronde van Vlaanderen", "Bel · Cwt majeures")
         };
+        var abilityDefinitions = new List<RiderAbilityDefinition>
+        {
+            new("plain", "Plain", "charac_i_plain", "limit_i_plain")
+        };
         var riderValues = new Dictionary<string, SqliteValue>
         {
             ["gene_sz_firstname"] = SqliteValue.Text("Created")
@@ -132,8 +136,10 @@ public sealed class MaintenanceModelTests
             ["Current Mountain is above its entered Limit."],
             favoriteRaces,
             [KeyValuePair.Create("IDcyclist", SqliteValue.Integer(8))],
-            [KeyValuePair.Create("IDcontract_cyclist", SqliteValue.Integer(21))]);
+            [KeyValuePair.Create("IDcontract_cyclist", SqliteValue.Integer(21))],
+            abilityDefinitions: abilityDefinitions);
         favoriteRaces.Clear();
+        abilityDefinitions.Clear();
 
         Assert.AreEqual(70, input.Abilities[0].Current);
         CollectionAssert.AreEqual(new long[] { 11, 43, 25 }, input.FavoriteRaceIds.ToArray());
@@ -142,6 +148,7 @@ public sealed class MaintenanceModelTests
         Assert.AreEqual(21L, preview.ContractValues["IDcontract_cyclist"].IntegerValue);
         CollectionAssert.AreEqual(MountainOnly, preview.MissingLimitKeys.ToArray());
         Assert.HasCount(1, preview.FavoriteRaces);
+        Assert.AreEqual("Plain", Assert.ContainsSingle(preview.AbilityDefinitions).Label);
     }
 
     [TestMethod]

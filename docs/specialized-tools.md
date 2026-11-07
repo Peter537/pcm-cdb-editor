@@ -11,7 +11,7 @@ Each tool checks its schema and date requirements and shows what it will change.
 - `GAM_config` date-gated tools require exactly one row and one non-null `gene_i_date` value in `yyyyMMdd` form.
 - A preview token covers the relevant input rows and lookup/ranking data. Apply rejects a token that no longer matches.
 - Applying changes also requires the mutation target to be an ordinary table that the catalog marks editable from a stable declared-primary-key or `rowid` identity, so the app can capture complete target-row Undo history. A same-named view may pass the initial name/column check, but the tool cannot apply changes to it.
-- Mutation targets reject user-defined operations whose trigger or delete/cascade side effects cannot be represented by Undo. January repair runs the same reversible-delete preflight before removing rows. Rider creation rejects INSERT triggers and delete behavior that would make later Undo incomplete.
+- Mutation targets reject operations whose side effects cannot be represented by Undo. Rider recovery and country quotas check UPDATE triggers and inbound side-effecting UPDATE actions on the affected keys. January repair and rider creation check INSERT and DELETE triggers, inbound side-effecting DELETE actions, and `AUTOINCREMENT` allocation counters before changing rows.
 - Empty input, no matching rows, or an already-matching update set is a reported no-op.
 - Generic table browsing remains available when any specialized capability gate fails.
 
@@ -31,14 +31,14 @@ Catalog-editable ordinary table `DYN_cyclist_fitness` with:
 
 There is no date gate. Recovery has two target modes:
 
-- **Entire team** requires readable `DYN_cyclist(IDcyclist, fkIDteam)` and `DYN_team(IDteam)`. Team choices load once per open session, include empty teams, and resolve the current `DYN_cyclist.fkIDteam` roster during preview. Apply rejects a changed roster.
+- **Entire team** requires readable `DYN_cyclist(IDcyclist, fkIDteam)` and `DYN_team(IDteam)`. Team choices include empty teams and refresh after edits to the working database. Preview resolves the current `DYN_cyclist.fkIDteam` roster. Apply rejects a removed team or changed roster.
 - **Rider IDs** accepts positive IDs separated by commas, semicolons, or whitespace, then normalizes ordering and duplicates. This mode remains available when the optional rider/team lookup schema is absent.
 
-**Use selected rows** copies distinct integer `IDcyclist` or `fkIDcyclist` values from the current grid selection into the manual field. Selecting rows by itself does not clear or overwrite typed IDs. IDs not present in `DYN_cyclist_fitness.IDcyclist` are retained as missing IDs in the immutable preview and are not updated.
+**Use selected rows** copies distinct integer `IDcyclist` or `fkIDcyclist` values from checked grid rows into the manual field. Typed IDs stay in the field until you edit them or use the copy command. The preview lists riders with missing fitness rows separately.
 
 ### Preview and update
 
-The **Rider recovery preset** summary shows the resolved roster, found fitness rows, rows needing changes, and missing IDs. It lists old and new values for found riders whose values would change. The preset sets:
+The **Rider recovery preset** summary shows the resolved roster, found fitness rows, rows needing changes, and missing IDs. Team and rider names appear alongside IDs when the database supplies them. The review lists old and new values for each row that will change. The preset uses these values.
 
 | Column | Value |
 | --- | ---: |
@@ -49,7 +49,7 @@ The **Rider recovery preset** summary shows the resolved roster, found fitness r
 | `value_f_freshness` | 100 |
 | `value_f_prepa` | 99 |
 
-An empty team, no found fitness rows, or rows already at the preset is a no-op. The app applies the exact previewed ID set in one transaction.
+A missing team, empty roster, missing fitness rows, and rows that already match the preset have distinct messages. A preview with no changes offers **Close**. Apply changes only the previewed fitness rows in one transaction.
 
 ## Create Rider
 
@@ -97,7 +97,7 @@ Abilities require one Current value for each row below. Current and entered Limi
 | Hill | `charac_i_hill` | `limit_i_hill` |
 | Baroudeur | `charac_i_baroudeur` | `limit_i_baroudeur` |
 
-Current and Limit have separate bulk-entry actions. A blank Limit is stored as SQLite `NULL`. Review lists every blank Limit and requires acknowledgement that the game's handling of those values is unverified.
+Current and Limit have separate bulk-entry actions. A blank Limit is SQLite `NULL` in the working copy. The CDB converter can reopen that value as integer zero, as verified on a copied career. Review lists every blank Limit and requires acknowledgement of the conversion behavior and the unverified in-game outcome.
 
 Contract requires a role, positive wage, and end year no earlier than the year in `GAM_config.gene_i_date`. Roles are displayed with their stored `iRole` codes:
 
@@ -115,6 +115,8 @@ The selected team is reused for rider team, contract current team, and previous 
 
 ### Clean defaults and review
 
+The preference field is omitted when its optional column is absent. When present, its effective default or Advanced override must be an existing preset, or NULL if the column permits it. Integer and NULL literal defaults are supported; expressions and incompatible or composite preference relationships produce a specific capability limitation. An unavailable default can be replaced by an existing preset in Advanced before preview.
+
 The workflow does not read or clone a source rider. It allocates cyclist and contract identities with checked `MAX + 1`, links both new rows, and sets `fkIDyear_progression` to the new cyclist ID. It resolves cyclist state to the unique `FREE` row and uses these explicit baseline exceptions:
 
 | Field | Clean value |
@@ -123,19 +125,21 @@ The workflow does not read or clone a source rider. It allocates cyclist and con
 | `gene_i_date_last_breakaway` | 101 |
 | `fkIDworkplan` | 1 |
 | `gene_i_ptmap` | 25343 |
-| `fkIDcontract_preference_preset` | 4 |
+| `fkIDcontract_preference_preset` | 4 without a database default; otherwise its supported literal default |
 | `iContract_fidelity` | 3 |
 | `value_f_potentiel` | 3.0, editable in Abilities |
 
-Known race, stage, injury, staff, training-camp, leader, retirement, shortlist, nomination, withdrawal, result, victory, and historical counters use neutral zero/empty values. Optional scalar text uses an empty string, and empty list text uses `()`. Favorite-race IDs are an explicit exception because Profile controls their ordered list. `value_f_current_ability` starts as the arithmetic mean of the 14 Current fields and remains editable in Advanced; the app does not claim that this reproduces the game's internal formula.
+Known race, stage, injury, staff, training-camp, leader, retirement, shortlist, nomination, withdrawal, result, victory, and historical counters use neutral zero/empty values. Optional scalar text uses an empty string, and empty list text uses `()`. Profile controls the ordered favorite-race list. Abilities shows the editor's automatic `value_f_current_ability` calculation, the arithmetic mean of the 14 Current fields. Use **Override current ability** to enter a different value and **Use calculated value** to restore the calculation. **Copy Current to Limits** fills every Limit from its corresponding Current field, and **Clear Limits** removes those values.
 
-Review shows identity/profile/contract summaries, the game display name, potential, ordered favorite-race names and IDs, every ability, generated IDs, warnings, and both rows. An expandable technical section exposes every typed insert value without presenting storage-class controls in the normal workflow. The immutable preview token covers schema, save date, FREE state, selected lookup-row and favorite-race revisions, both maxima, target-ID absence, defaults, overrides, role, abilities, potential, ordered favorite IDs and their serialized text, blank Limits and acknowledgement, and the complete insert maps. The Create command becomes available only after preview releases its operation lease, the preview belongs to the current session, and any blank-Limit acknowledgement is satisfied.
+Review shows identity, profile, contract, the game display name, potential, ordered favorite races, each ability, and both generated IDs. It identifies whether Current ability is calculated or overridden. An expandable technical section exposes every typed insert value. The immutable preview token covers schema, save date, FREE state, selected lookup revisions, ID allocation, and both insert maps. If any Limits are blank, acknowledge them on Review before creating. Acknowledgement confirms the reviewed values without rebuilding the preview.
 
 ### Apply, Undo, and scope
 
 Apply recomputes the preview within one deferred-foreign-key transaction, inserts the contract and rider, reads both complete typed rows back, and commits only if every check succeeds. Collision, changed schema/save/lookup/maxima, overflow, cancellation, INSERT trigger, unsafe delete behavior, SQLite rejection, or read-back mismatch rolls back both inserts.
 
-History stores one maintenance operation ordered as contract then rider. Undo reverses that order, deleting rider before contract; Redo restores both in a deferred-foreign-key transaction. Creation produces no fitness, season, pro-cyclist, history, result, ranking, transfer, or other related rows.
+History stores one maintenance operation ordered as contract then rider. Undo deletes the rider before the contract. Redo restores both in a deferred-foreign-key transaction. Creation produces no fitness, season, pro-cyclist, history, result, ranking, transfer, or other related rows.
+
+After creation, the receipt shows the rider name and both IDs. Use **View rider** or **View contract** to open the matching record, **Save CDB** to save to the current destination, or **Create another** to start a fresh draft. After Undo, the receipt shows that the creation is undone and disables its record and save actions until Redo.
 
 ## January 1 season-stage repair
 
@@ -148,7 +152,7 @@ The tool is enabled only on January 1 of the parsed game year.
 
 ### Preview and update
 
-The **January 1 season-stage repair** summary shows the parsed database date and the total number of rows that will be deleted from `DYN_result_season_stage`; it does not display every row. The snapshot token nevertheless covers all target rows. After confirmation, the app first rejects DELETE triggers and inbound `CASCADE`, `SET NULL`, or `SET DEFAULT` behavior that Undo cannot restore, then deletes every row in one transaction. An empty table is a no-op. A changed snapshot token blocks apply; partial deletion is forbidden.
+The **January 1 season-stage repair** summary shows the parsed game date and the total number of rows to delete from `DYN_result_season_stage`. The snapshot token covers every target row. After confirmation, the app rejects schema side effects that Undo cannot restore, then deletes the rows in one transaction. An empty table offers **Close**. A changed snapshot token blocks apply.
 
 ## World and European country quotas
 
@@ -226,7 +230,7 @@ For the European ranking, the app first filters countries whose joined continent
 | 11-18 | 6 | 2 |
 | otherwise | 0 | 0 |
 
-Zero total positive points across all countries is a hard error; no quotas are changed. Otherwise the immutable preview retains every calculated country row, including raw/canonical code, display name, points, World and European ranks, and old/new four-field values. An already matching database is a no-op.
+The tool requires at least one country with positive calculated points. The immutable preview retains each calculated row's country ID, raw and canonical codes, available name, points, World and European ranks, and old and new quota values. If every quota already matches, the preview offers **Close** and keeps the qualifier views available.
 
 The read-only preview has three views:
 

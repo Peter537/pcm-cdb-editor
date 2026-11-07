@@ -18,7 +18,8 @@ internal static class AtomicJsonFile
     public static async Task<T> ReadOrCreateAsync<T>(
         string path,
         Func<T> defaultFactory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool quarantineCorruptFile = true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         ArgumentNullException.ThrowIfNull(defaultFactory);
@@ -28,7 +29,7 @@ internal static class AtomicJsonFile
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await ReadOrCreateCoreAsync(fullPath, defaultFactory, cancellationToken)
+            return await ReadOrCreateCoreAsync(fullPath, defaultFactory, cancellationToken, quarantineCorruptFile)
                 .ConfigureAwait(false);
         }
         finally
@@ -82,7 +83,8 @@ internal static class AtomicJsonFile
     private static async Task<T> ReadOrCreateCoreAsync<T>(
         string fullPath,
         Func<T> defaultFactory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool quarantineCorruptFile = true)
     {
         if (!File.Exists(fullPath))
         {
@@ -104,7 +106,10 @@ internal static class AtomicJsonFile
         }
         catch (JsonException)
         {
-            PreserveCorruptFile(fullPath);
+            if (quarantineCorruptFile)
+            {
+                PreserveCorruptFile(fullPath);
+            }
             return defaultFactory();
         }
     }

@@ -143,7 +143,7 @@ public sealed class CountryQuotaPreviewDialogSourceTests
         Assert.IsTrue(decision > dialogCreation);
         Assert.IsTrue(writeAhead > decision, "Cancel must return before mutation write-ahead begins.");
         Assert.IsTrue(apply > writeAhead, "Apply must receive the original preview after confirmation.");
-        StringAssert.Contains(handler, "if (dialog.ChangeCount > 0)", StringComparison.Ordinal);
+        StringAssert.Contains(handler, "|| dialog.ChangeCount == 0)", StringComparison.Ordinal);
         Assert.IsFalse(handler.Contains("quotaChanges.Select", StringComparison.Ordinal));
 
         string dialog = File.ReadAllText(GetAppSourcePath("CountryQuotaPreviewDialog.xaml.cs"));

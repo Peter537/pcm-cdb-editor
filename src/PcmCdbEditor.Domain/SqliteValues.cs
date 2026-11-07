@@ -127,13 +127,34 @@ public readonly record struct RowRevision
     public override string ToString() => Value;
 }
 
+public enum RelationshipResolution
+{
+    Resolved,
+    MissingTarget,
+    AmbiguousKey,
+    LabelUnavailable,
+    UnknownRelationship,
+    AmbiguousRelationship,
+    CompositeRelationship,
+    TargetUnavailable
+}
+
+public sealed record RelatedValue(RelationshipResolution Resolution, string? Label = null);
+
 public sealed class TypedRow
 {
-    public TypedRow(RowIdentity? identity, IEnumerable<KeyValuePair<string, SqliteValue>> values)
+    private static readonly IReadOnlyDictionary<string, RelatedValue> NoRelatedValues =
+        ModelCollections.FreezeDictionary<RelatedValue>(null);
+
+    public TypedRow(
+        RowIdentity? identity,
+        IEnumerable<KeyValuePair<string, SqliteValue>> values,
+        IEnumerable<KeyValuePair<string, RelatedValue>>? relatedValues = null)
     {
         Identity = identity;
         Values = ModelCollections.FreezeDictionary(values);
         Revision = RowRevision.Compute(Values);
+        RelatedValues = relatedValues is null ? NoRelatedValues : ModelCollections.FreezeDictionary(relatedValues);
     }
 
     /// <summary>
@@ -143,6 +164,8 @@ public sealed class TypedRow
     public RowIdentity? Identity { get; }
 
     public IReadOnlyDictionary<string, SqliteValue> Values { get; }
+
+    public IReadOnlyDictionary<string, RelatedValue> RelatedValues { get; }
 
     public RowRevision Revision { get; }
 }

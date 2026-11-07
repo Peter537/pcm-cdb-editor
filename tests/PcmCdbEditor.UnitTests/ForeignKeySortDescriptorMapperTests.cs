@@ -7,359 +7,164 @@ namespace PcmCdbEditor.UnitTests;
 [TestClass]
 public sealed class ForeignKeySortDescriptorMapperTests
 {
-    private static readonly string[] DisplayModeDescriptorNames =
-        ["ID", "fkIDcountry", "fkIDcountry__display", "label", "fkIDambiguous"];
-
-    private static readonly string[] RawModeDescriptorNames =
-        ["ID", "fkIDcountry", "label", "fkIDambiguous"];
-
     [TestMethod]
-    public void DisplayModesOfferDistinctRawAndDisplayedSortChoices()
+    public void LabelOptionAndPhysicalDisplaySuffixColumnRemainDistinct()
     {
-        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
+        (DatabaseSchemaCatalog catalog, TableSchema source) = CreateCatalog();
 
-        TableSortOption[] names = ForeignKeySortDescriptorMapper.GetOptions(
-            catalog,
-            table,
-            ForeignKeyDisplayMode.ResolvedName);
-        TableSortOption[] rawAndNames = ForeignKeySortDescriptorMapper.GetOptions(
-            catalog,
-            table,
-            ForeignKeyDisplayMode.RawAndName);
-
-        CollectionAssert.AreEqual(
-            DisplayModeDescriptorNames,
-            names.Select(static option => option.DescriptorColumnName).ToArray());
-        Assert.AreEqual("fkIDcountry (raw value)", names[1].Label);
-        Assert.AreEqual("fkIDcountry (displayed name)", names[2].Label);
-        Assert.AreEqual("fkIDcountry (displayed raw value and name)", rawAndNames[2].Label);
-        Assert.IsFalse(names.Any(static option =>
-            option.DescriptorColumnName.Equals("fkIDambiguous__display", StringComparison.Ordinal)));
-    }
-
-    [TestMethod]
-    public void RawModeOffersOnlyPhysicalColumnsAndRejectsDisplayedDescriptors()
-    {
-        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
-
-        TableSortOption[] options = ForeignKeySortDescriptorMapper.GetOptions(
-            catalog,
-            table,
-            ForeignKeyDisplayMode.RawValue);
-        SortDescriptor[] restored = ForeignKeySortDescriptorMapper.Restore(
-            catalog,
-            table,
-            ForeignKeyDisplayMode.RawValue,
-            [
-                new SortDescriptor("fkIDcountry__display", SortDirection.Ascending),
-                new SortDescriptor("FKIDCOUNTRY", SortDirection.Descending),
-            ]);
-
-        CollectionAssert.AreEqual(
-            RawModeDescriptorNames,
-            options.Select(static option => option.DescriptorColumnName).ToArray());
-        Assert.AreEqual("fkIDcountry", options[1].Label);
-        CollectionAssert.AreEqual(
-            new[] { new SortDescriptor("fkIDcountry", SortDirection.Descending) },
-            restored);
-    }
-
-    [TestMethod]
-    public void RestoreCanonicalizesValidMultiSortAndDropsInvalidOrDuplicateEntries()
-    {
-        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
-
-        SortDescriptor[] restored = ForeignKeySortDescriptorMapper.Restore(
-            catalog,
-            table,
-            ForeignKeyDisplayMode.RawAndName,
-            [
-                new SortDescriptor("FKIDCOUNTRY__DISPLAY", SortDirection.Descending),
-                new SortDescriptor("fkidcountry", SortDirection.Ascending),
-                new SortDescriptor("LABEL", SortDirection.Descending),
-                new SortDescriptor("label", SortDirection.Ascending),
-                new SortDescriptor("unknown__display", SortDirection.Ascending),
-                new SortDescriptor("ID", (SortDirection)99),
-            ]);
+        TableQueryColumnOption[] options = ForeignKeySortDescriptorMapper.GetOptions(catalog, source);
 
         CollectionAssert.AreEqual(
             new[]
             {
-                new SortDescriptor("fkIDcountry__display", SortDirection.Descending),
-                new SortDescriptor("fkIDcountry", SortDirection.Ascending),
-                new SortDescriptor("label", SortDirection.Descending),
+                ("ID", QueryValueTarget.StoredValue),
+                ("fkIDcountry", QueryValueTarget.StoredValue),
+                ("fkIDcountry", QueryValueTarget.RelatedLabel),
+                ("fkIDcountry__display", QueryValueTarget.StoredValue),
+                ("fkIDambiguous", QueryValueTarget.StoredValue),
+                ("fkIDcomposite", QueryValueTarget.StoredValue),
+            },
+            options.Select(static option => (option.ColumnName, option.Target)).ToArray());
+        Assert.AreEqual(SqliteAffinity.Integer, options[1].Affinity);
+        Assert.AreEqual(SqliteAffinity.Text, options[2].Affinity);
+    }
+
+    [TestMethod]
+    public void RestorePreservesBothTargetsAndDropsUnsupportedOrDuplicateSorts()
+    {
+        (DatabaseSchemaCatalog catalog, TableSchema source) = CreateCatalog();
+
+        SortDescriptor[] restored = ForeignKeySortDescriptorMapper.Restore(catalog, source,
+        [
+            new("FKIDCOUNTRY", SortDirection.Ascending, QueryValueTarget.RelatedLabel),
+            new("fkIDcountry", SortDirection.Descending),
+            new("fkIDcountry", SortDirection.Descending, QueryValueTarget.RelatedLabel),
+            new("fkIDcountry__display", SortDirection.Ascending),
+            new("fkIDambiguous", SortDirection.Ascending, QueryValueTarget.RelatedLabel),
+            new("fkIDcomposite", SortDirection.Ascending, QueryValueTarget.RelatedLabel),
+            new("hidden", SortDirection.Ascending),
+            new("missing", SortDirection.Ascending),
+            new("ID", (SortDirection)99),
+            new("ID", SortDirection.Ascending, (QueryValueTarget)99),
+        ]);
+
+        CollectionAssert.AreEqual(
+            new SortDescriptor[]
+            {
+                new("fkIDcountry", SortDirection.Ascending, QueryValueTarget.RelatedLabel),
+                new("fkIDcountry", SortDirection.Descending),
+                new("fkIDcountry__display", SortDirection.Ascending),
             },
             restored);
     }
 
     [TestMethod]
-    [DataRow(
-        ForeignKeyDisplayMode.ResolvedName,
-        "fkIDcountry",
-        "fkIDcountry__display")]
-    [DataRow(
-        ForeignKeyDisplayMode.RawAndName,
-        "FKIDCOUNTRY",
-        "fkIDcountry__display")]
-    [DataRow(ForeignKeyDisplayMode.RawValue, "fkIDcountry", "fkIDcountry")]
-    [DataRow(ForeignKeyDisplayMode.ResolvedName, "fkIDambiguous", "fkIDambiguous")]
-    [DataRow(ForeignKeyDisplayMode.ResolvedName, "LABEL", "label")]
-    public void PlanHeaderClickUsesTheDescriptorRepresentedByTheVisibleHeader(
-        ForeignKeyDisplayMode displayMode,
-        string headerColumnName,
-        string expectedDescriptorColumnName)
+    [DataRow(ForeignKeyDisplayMode.RawValue, QueryValueTarget.StoredValue)]
+    [DataRow(ForeignKeyDisplayMode.ResolvedName, QueryValueTarget.RelatedLabel)]
+    [DataRow(ForeignKeyDisplayMode.RawAndName, QueryValueTarget.RelatedLabel)]
+    public void HeaderUsesModeForNewIntentAndTogglesOnlyThatTarget(
+        ForeignKeyDisplayMode mode,
+        QueryValueTarget target)
     {
-        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
-
-        SortDescriptor[] planned = ForeignKeySortDescriptorMapper.PlanHeaderClick(
-            catalog,
-            table,
-            displayMode,
-            descriptors: null,
-            headerColumnName);
-
-        CollectionAssert.AreEqual(
-            new[]
-            {
-                new SortDescriptor(
-                    expectedDescriptorColumnName,
-                    SortDirection.Descending),
-            },
-            planned);
-    }
-
-    [TestMethod]
-    public void PlanHeaderClickPromotesAndTogglesOnlyTheResolvedDescriptor()
-    {
-        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
+        (DatabaseSchemaCatalog catalog, TableSchema source) = CreateCatalog();
+        QueryValueTarget other = target == QueryValueTarget.RelatedLabel
+            ? QueryValueTarget.StoredValue
+            : QueryValueTarget.RelatedLabel;
         SortDescriptor[] initial =
         [
-            new SortDescriptor("ID", SortDirection.Ascending),
-            new SortDescriptor("FKIDCOUNTRY__DISPLAY", SortDirection.Ascending),
-            new SortDescriptor("fkIDcountry__display", SortDirection.Descending),
-            new SortDescriptor("fkIDambiguous", SortDirection.Ascending),
+            new("fkIDcountry", SortDirection.Descending, other),
+            new("ID", SortDirection.Ascending),
         ];
 
         SortDescriptor[] descending = ForeignKeySortDescriptorMapper.PlanHeaderClick(
-            catalog,
-            table,
-            ForeignKeyDisplayMode.ResolvedName,
-            initial,
-            "fkIDcountry");
+            catalog, source, mode, initial, "FKIDCOUNTRY");
         SortDescriptor[] ascending = ForeignKeySortDescriptorMapper.PlanHeaderClick(
-            catalog,
-            table,
-            ForeignKeyDisplayMode.ResolvedName,
-            descending,
-            "FKIDCOUNTRY");
-        SortDescriptor[] descendingAgain = ForeignKeySortDescriptorMapper.PlanHeaderClick(
-            catalog,
-            table,
-            ForeignKeyDisplayMode.ResolvedName,
-            ascending,
-            "fkIDcountry");
+            catalog, source, mode, descending, "fkIDcountry");
 
         CollectionAssert.AreEqual(
-            new[]
-            {
-                new SortDescriptor("fkIDcountry__display", SortDirection.Descending),
-                new SortDescriptor("ID", SortDirection.Ascending),
-                new SortDescriptor("fkIDambiguous", SortDirection.Ascending),
-            },
+            (SortDescriptor[])[new("fkIDcountry", SortDirection.Descending, target), .. initial],
             descending);
         CollectionAssert.AreEqual(
-            new[]
-            {
-                new SortDescriptor("fkIDcountry__display", SortDirection.Ascending),
-                new SortDescriptor("ID", SortDirection.Ascending),
-                new SortDescriptor("fkIDambiguous", SortDirection.Ascending),
-            },
+            (SortDescriptor[])[new("fkIDcountry", SortDirection.Ascending, target), .. initial],
             ascending);
-        CollectionAssert.AreEqual(
-            new[]
-            {
-                new SortDescriptor("fkIDcountry__display", SortDirection.Descending),
-                new SortDescriptor("ID", SortDirection.Ascending),
-                new SortDescriptor("fkIDambiguous", SortDirection.Ascending),
-            },
-            descendingAgain);
     }
 
     [TestMethod]
-    [DataRow(null)]
-    [DataRow("")]
-    [DataRow("unknown")]
-    [DataRow("hidden")]
-    public void PlanHeaderClickLeavesSortsUnchangedForInvalidOrHiddenHeaders(
-        string? headerColumnName)
+    public void CommittedLabelIntentHasPhysicalHeaderAndAccurateSummary()
     {
-        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
-        SortDescriptor[] current =
-        [
-            new SortDescriptor("label", SortDirection.Ascending),
-            new SortDescriptor("ID", SortDirection.Descending),
-        ];
-
-        SortDescriptor[] planned = ForeignKeySortDescriptorMapper.PlanHeaderClick(
-            catalog,
-            table,
-            ForeignKeyDisplayMode.ResolvedName,
-            current,
-            headerColumnName);
-
-        CollectionAssert.AreEqual(current, planned);
-    }
-
-    [TestMethod]
-    [DataRow(
-        ForeignKeyDisplayMode.ResolvedName,
-        "FKIDCOUNTRY__DISPLAY",
-        SortDirection.Ascending,
-        "fkIDcountry")]
-    [DataRow(
-        ForeignKeyDisplayMode.RawAndName,
-        "fkIDcountry__display",
-        SortDirection.Descending,
-        "fkIDcountry")]
-    [DataRow(
-        ForeignKeyDisplayMode.ResolvedName,
-        "FKIDCOUNTRY",
-        SortDirection.Descending,
-        "fkIDcountry")]
-    [DataRow(
-        ForeignKeyDisplayMode.RawValue,
-        "LABEL",
-        SortDirection.Ascending,
-        "label")]
-    public void GetPrimaryHeaderIndicatorMapsValidPrimarySortsToPhysicalHeaders(
-        ForeignKeyDisplayMode displayMode,
-        string descriptorColumnName,
-        SortDirection direction,
-        string expectedHeaderColumnName)
-    {
-        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
-
-        TableHeaderSortIndicator? indicator =
-            ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(
-                catalog,
-                table,
-                displayMode,
-                [new SortDescriptor(descriptorColumnName, direction)]);
+        (DatabaseSchemaCatalog catalog, TableSchema source) = CreateCatalog();
+        SortDescriptor[] sorts = [new("fkIDcountry", SortDirection.Ascending, QueryValueTarget.RelatedLabel)];
 
         Assert.AreEqual(
-            new TableHeaderSortIndicator(expectedHeaderColumnName, direction),
-            indicator);
+            new TableHeaderSortIndicator("fkIDcountry", SortDirection.Ascending),
+            ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(catalog, source, sorts));
+        Assert.AreEqual(
+            "fkIDcountry (related name), ascending",
+            ForeignKeySortDescriptorMapper.Describe(sorts[0]));
     }
 
     [TestMethod]
-    [DataRow(ForeignKeyDisplayMode.RawValue, "fkIDcountry__display", 0)]
-    [DataRow(ForeignKeyDisplayMode.ResolvedName, "hidden", 1)]
-    [DataRow(ForeignKeyDisplayMode.ResolvedName, "unknown", 0)]
-    [DataRow(ForeignKeyDisplayMode.ResolvedName, "label", 99)]
-    public void GetPrimaryHeaderIndicatorRejectsInvalidOrHiddenPrimarySorts(
-        ForeignKeyDisplayMode displayMode,
-        string descriptorColumnName,
-        int directionValue)
+    public void UnsupportedRelationshipHeadersSortRawAndUnknownHeadersLeaveSortsAlone()
     {
-        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
+        (DatabaseSchemaCatalog catalog, TableSchema source) = CreateCatalog();
+        SortDescriptor[] initial = [new("ID", SortDirection.Ascending)];
 
-        TableHeaderSortIndicator? indicator =
-            ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(
-                catalog,
-                table,
-                displayMode,
-                [new SortDescriptor(descriptorColumnName, (SortDirection)directionValue)]);
-
-        Assert.IsNull(indicator);
+        CollectionAssert.AreEqual(
+            initial,
+            ForeignKeySortDescriptorMapper.PlanHeaderClick(
+                catalog, source, ForeignKeyDisplayMode.RawAndName, initial, "hidden"));
+        CollectionAssert.AreEqual(
+            (SortDescriptor[])[new("fkIDcomposite", SortDirection.Descending), .. initial],
+            ForeignKeySortDescriptorMapper.PlanHeaderClick(
+                catalog, source, ForeignKeyDisplayMode.RawAndName, initial, "fkIDcomposite"));
     }
 
     [TestMethod]
-    public void GetPrimaryHeaderIndicatorDoesNotPromoteALaterValidSort()
+    [DataRow("missing")]
+    [DataRow("hidden")]
+    public void PrimaryHeaderIndicatorDoesNotPromoteASecondarySort(string primaryColumn)
     {
-        (DatabaseSchemaCatalog catalog, TableSchema table) = CreateCatalog();
-
-        TableHeaderSortIndicator? indicator =
-            ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(
-                catalog,
-                table,
-                ForeignKeyDisplayMode.ResolvedName,
-                [
-                    new SortDescriptor("unknown", SortDirection.Descending),
-                    new SortDescriptor("label", SortDirection.Ascending),
-                ]);
-
-        Assert.IsNull(indicator);
+        (DatabaseSchemaCatalog catalog, TableSchema source) = CreateCatalog();
+        Assert.IsNull(ForeignKeySortDescriptorMapper.GetPrimaryHeaderIndicator(catalog, source,
+        [
+            new(primaryColumn, SortDirection.Descending),
+            new("ID", SortDirection.Ascending),
+        ]));
     }
 
     private static (DatabaseSchemaCatalog Catalog, TableSchema Source) CreateCatalog()
     {
-        var source = new TableSchema(
+        var source = Table(
             "source",
-            TableObjectKind.Table,
             [
-                Column(0, "ID"),
-                Column(1, "fkIDcountry"),
-                Column(2, "label"),
-                Column(3, "fkIDambiguous"),
-                Column(4, "hidden", isHidden: true),
+                Column(0, "ID"), Column(1, "fkIDcountry"), Column(2, "fkIDcountry__display"),
+                Column(3, "fkIDambiguous"), Column(4, "fkIDcomposite"), Column(5, "hidden", isHidden: true),
             ],
             [
-                new ForeignKeyRelation(
-                    "fkIDcountry",
-                    "country",
-                    "IDcountry",
-                    "name",
-                    true,
-                    "declared"),
-                new ForeignKeyRelation(
-                    "fkIDambiguous",
-                    "country",
-                    "IDcountry",
-                    "name",
-                    false,
-                    "inferred"),
-                new ForeignKeyRelation(
-                    "fkIDambiguous",
-                    "alternate_country",
-                    "IDcountry",
-                    "name",
-                    false,
-                    "inferred"),
-            ],
-            new StableIdentityDefinition(StableIdentityKind.DeclaredPrimaryKey, ["ID"]),
-            TableEditCapability.Editable,
-            estimatedRowCount: null,
-            isWithoutRowId: false);
-        var country = new TableSchema(
-            "country",
-            TableObjectKind.Table,
-            [Column(0, "IDcountry"), Column(1, "name")],
-            [],
-            new StableIdentityDefinition(StableIdentityKind.DeclaredPrimaryKey, ["IDcountry"]),
-            TableEditCapability.Editable,
-            estimatedRowCount: null,
-            isWithoutRowId: false);
-        var alternateCountry = new TableSchema(
-            "alternate_country",
-            TableObjectKind.Table,
-            [Column(0, "IDcountry"), Column(1, "name")],
-            [],
-            new StableIdentityDefinition(StableIdentityKind.DeclaredPrimaryKey, ["IDcountry"]),
-            TableEditCapability.Editable,
-            estimatedRowCount: null,
-            isWithoutRowId: false);
-
-        return (new DatabaseSchemaCatalog("fk-sort-schema", [source, country, alternateCountry]), source);
+                new("fkIDcountry", "country", "IDcountry", "name", true, "declared"),
+                new("fkIDambiguous", "country", "IDcountry", "name", false, "inferred"),
+                new("fkIDambiguous", "alternate_country", "IDcountry", "name", false, "inferred"),
+                new("fkIDcomposite", "country", "IDcountry", "name", true, "declared", IsComposite: true),
+            ]);
+        var country = Table("country", [Column(0, "IDcountry"), Column(1, "name", SqliteAffinity.Text)], []);
+        var alternate = Table("alternate_country", country.Columns, []);
+        return (new DatabaseSchemaCatalog("fk-sort-schema", [source, country, alternate]), source);
     }
 
-    private static ColumnSchema Column(int ordinal, string name, bool isHidden = false) => new(
-        ordinal,
-        name,
-        "INTEGER",
-        SqliteAffinity.Integer,
-        IsNullable: false,
-        DefaultExpression: null,
-        PrimaryKeyOrdinal: ordinal == 0 ? 1 : 0,
-        IsGenerated: false,
-        IsHidden: isHidden);
+    private static TableSchema Table(
+        string name,
+        IReadOnlyList<ColumnSchema> columns,
+        IReadOnlyList<ForeignKeyRelation> relationships) => new(
+        name, TableObjectKind.Table, columns, relationships,
+        new StableIdentityDefinition(StableIdentityKind.DeclaredPrimaryKey, [columns[0].Name]),
+        TableEditCapability.Editable, estimatedRowCount: null, isWithoutRowId: false);
+
+    private static ColumnSchema Column(
+        int ordinal,
+        string name,
+        SqliteAffinity affinity = SqliteAffinity.Integer,
+        bool isHidden = false) => new(
+        ordinal, name, affinity == SqliteAffinity.Text ? "TEXT" : "INTEGER", affinity,
+        IsNullable: false, DefaultExpression: null, PrimaryKeyOrdinal: ordinal == 0 ? 1 : 0,
+        IsGenerated: false, IsHidden: isHidden);
 }

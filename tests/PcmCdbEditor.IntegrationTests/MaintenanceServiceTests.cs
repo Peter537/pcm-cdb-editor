@@ -1,6 +1,7 @@
 using System.Data;
 using Microsoft.Data.Sqlite;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
 using PcmCdbEditor.Infrastructure.Maintenance;
 
@@ -114,13 +115,13 @@ public sealed class MaintenanceServiceTests
     [TestMethod]
     public async Task RiderRecoveryRollsBackEveryRowWhenAnUpdateFails()
     {
-        await using var database = await CreateRiderDatabaseAsync().ConfigureAwait(false);
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            RiderSchema.Replace("value_f_FIT REAL", "value_f_FIT REAL CHECK (IDcyclist <> 2 OR value_f_FIT < 90)",
+                StringComparison.Ordinal),
+            "INSERT INTO DYN_cyclist_fitness VALUES(1,10,1,5,50,20,30),(2,11,2,6,51,21,31)")
+            .ConfigureAwait(false);
         var service = new RiderRecoveryService();
         RiderRecoveryPreview preview = await service.PreviewAsync(database.Path, [1, 2], CancellationToken.None)
-            .ConfigureAwait(false);
-        await database.ExecuteAsync(
-            "CREATE TRIGGER reject_second_rider BEFORE UPDATE ON DYN_cyclist_fitness " +
-            "WHEN OLD.IDcyclist=2 BEGIN SELECT RAISE(ABORT,'synthetic failure'); END")
             .ConfigureAwait(false);
 
         await Assert.ThrowsExactlyAsync<SqliteException>(() =>
@@ -132,15 +133,38 @@ public sealed class MaintenanceServiceTests
     }
 
     [TestMethod]
+    public async Task RiderRecoveryAbortsAConflictWithAnUnreviewedFitnessRow()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            RiderSchema.Replace("value_f_FIT REAL", "value_f_FIT REAL UNIQUE ON CONFLICT REPLACE",
+                StringComparison.Ordinal),
+            "INSERT INTO DYN_cyclist_fitness VALUES(1,10,1,5,50,20,30),(2,99,0,0,0,100,99)")
+            .ConfigureAwait(false);
+        var service = new RiderRecoveryService();
+        RiderRecoveryPreview preview = await service.PreviewAsync(database.Path, [1], CancellationToken.None)
+            .ConfigureAwait(false);
+
+        await Assert.ThrowsExactlyAsync<SqliteException>(() =>
+            service.ApplyAsync(database.Path, preview, CancellationToken.None)).ConfigureAwait(false);
+
+        Assert.AreEqual(10D, await database.ScalarAsync<double>(
+            "SELECT value_f_FIT FROM DYN_cyclist_fitness WHERE IDcyclist=1").ConfigureAwait(false));
+        Assert.AreEqual(99D, await database.ScalarAsync<double>(
+            "SELECT value_f_FIT FROM DYN_cyclist_fitness WHERE IDcyclist=2").ConfigureAwait(false));
+    }
+
+    [TestMethod]
     public async Task RiderRecoverySupportsTeamRostersAndExplicitMissingIds()
     {
         await using var database = await SqliteTestDatabase.CreateAsync(
             RiderSchema,
             "INSERT INTO DYN_cyclist_fitness VALUES(1,10,1,5,50,20,30),(2,11,2,6,51,21,31)",
-            "CREATE TABLE DYN_team(IDteam INTEGER PRIMARY KEY, gene_sz_name TEXT); " +
-            "INSERT INTO DYN_team VALUES(10,'Alpha Team'),(20,'Empty Team')",
-            "CREATE TABLE DYN_cyclist(IDcyclist INTEGER PRIMARY KEY, fkIDteam INTEGER); " +
-            "INSERT INTO DYN_cyclist VALUES(1,10),(2,10),(3,10)")
+            "CREATE TABLE DYN_team(IDteam INTEGER PRIMARY KEY, gene_sz_name TEXT, gene_sz_shortname TEXT); " +
+            "INSERT INTO DYN_team VALUES(10,'Alpha Team',NULL),(20,' ', 'Empty Team')",
+            "CREATE TABLE DYN_cyclist(IDcyclist INTEGER PRIMARY KEY, fkIDteam INTEGER, " +
+            "gene_sz_firstname TEXT, gene_sz_lastname TEXT, gene_sz_firstlastname TEXT); " +
+            "INSERT INTO DYN_cyclist VALUES(1,10,'Alice','Rider','Game alias'),(2,10,NULL,NULL,NULL)," +
+            "(3,10,' ',' ','Reserve Rider')")
             .ConfigureAwait(false);
         var service = new RiderRecoveryService();
 
@@ -150,7 +174,9 @@ public sealed class MaintenanceServiceTests
         RiderTeamOption alpha = teams.Single(team => team.TeamId == 10);
         Assert.AreEqual("Alpha Team", alpha.DisplayName);
         Assert.AreEqual(3L, alpha.RiderCount);
-        Assert.AreEqual(0L, teams.Single(team => team.TeamId == 20).RiderCount);
+        RiderTeamOption empty = teams.Single(team => team.TeamId == 20);
+        Assert.AreEqual(0L, empty.RiderCount);
+        Assert.AreEqual("Empty Team", empty.DisplayName);
 
         RiderRecoveryPreview teamPreview = await service.PreviewAsync(
             database.Path,
@@ -160,6 +186,10 @@ public sealed class MaintenanceServiceTests
         CollectionAssert.AreEqual(new long[] { 1, 2 }, teamPreview.FoundCyclistIds.ToArray());
         CollectionAssert.AreEqual(new long[] { 3 }, teamPreview.MissingCyclistIds.ToArray());
         Assert.AreEqual(2, teamPreview.RowsNeedingChanges);
+        Assert.AreEqual("Alice Rider", teamPreview.RiderNames[1]);
+        Assert.IsFalse(teamPreview.RiderNames.ContainsKey(2));
+        Assert.AreEqual("Reserve Rider", teamPreview.RiderNames[3]);
+        Assert.IsNull(teamPreview.NoChangeSummary);
 
         RiderRecoveryPreview explicitPreview = await service.PreviewAsync(
             database.Path,
@@ -167,6 +197,39 @@ public sealed class MaintenanceServiceTests
             CancellationToken.None).ConfigureAwait(false);
         CollectionAssert.AreEqual(new long[] { 2, 99 }, explicitPreview.CyclistIds.ToArray());
         CollectionAssert.AreEqual(new long[] { 99 }, explicitPreview.MissingCyclistIds.ToArray());
+    }
+
+    [TestMethod]
+    public async Task RiderRecoveryReportsNoChangeOutcomesWithoutTreatingMissingRowsAsRecovered()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            RiderSchema,
+            "INSERT INTO DYN_cyclist_fitness VALUES(1,99,0,0,0,100,99),(4,10,1,5,50,20,30)",
+            "CREATE TABLE DYN_team(IDteam INTEGER PRIMARY KEY); INSERT INTO DYN_team VALUES(10),(20),(30)",
+            "CREATE TABLE DYN_cyclist(IDcyclist INTEGER PRIMARY KEY, fkIDteam INTEGER); " +
+            "INSERT INTO DYN_cyclist VALUES(1,30),(2,10),(3,30),(4,99)")
+            .ConfigureAwait(false);
+        var service = new RiderRecoveryService();
+        foreach (var (teamId, reason) in new[]
+        {
+            (10L, "None of the resolved riders has a fitness row."),
+            (20L, "The selected team has no riders."),
+            (30L, "Some riders have no fitness row. The rows found need no changes."),
+            (99L, "The selected team is no longer in the working database."),
+        })
+        {
+            RiderRecoveryPreview preview = await service.PreviewAsync(
+                database.Path, RiderRecoveryTarget.ForTeam(teamId), CancellationToken.None).ConfigureAwait(false);
+            Assert.AreEqual(reason, preview.NoChangeSummary);
+            MaintenanceApplyResult result = await service.ApplyAsync(
+                database.Path, preview, CancellationToken.None).ConfigureAwait(false);
+            Assert.AreEqual(0, result.AffectedRows);
+            Assert.AreEqual(reason, result.Summary);
+            Assert.IsNull(result.HistoryOperation);
+        }
+
+        Assert.AreEqual(10D, await database.ScalarAsync<double>(
+            "SELECT value_f_FIT FROM DYN_cyclist_fitness WHERE IDcyclist=4").ConfigureAwait(false));
     }
 
     [TestMethod]
@@ -309,7 +372,7 @@ public sealed class MaintenanceServiceTests
             "WHEN OLD.IDresult_season_stage=2 BEGIN SELECT RAISE(ABORT,'synthetic failure'); END")
             .ConfigureAwait(false);
 
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+        await Assert.ThrowsExactlyAsync<UnsafeRowMutationException>(() =>
             service.ApplyAsync(database.Path, preview, CancellationToken.None)).ConfigureAwait(false);
         Assert.AreEqual(2L, await database.ScalarAsync<long>(
             "SELECT COUNT(*) FROM DYN_result_season_stage").ConfigureAwait(false));
@@ -332,7 +395,7 @@ public sealed class MaintenanceServiceTests
             database.Path,
             CancellationToken.None).ConfigureAwait(false);
 
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+        await Assert.ThrowsExactlyAsync<UnsafeRowMutationException>(() =>
             service.ApplyAsync(database.Path, preview, CancellationToken.None)).ConfigureAwait(false);
         Assert.AreEqual(1L, await database.ScalarAsync<long>(
             "SELECT COUNT(*) FROM DYN_result_season_stage").ConfigureAwait(false));
@@ -445,12 +508,8 @@ public sealed class MaintenanceServiceTests
         Assert.AreEqual(7L, await staleDatabase.ScalarAsync<long>(
             "SELECT gene_i_num_cyclist_WC FROM STA_country WHERE IDcountry=1").ConfigureAwait(false));
 
-        await using var rollbackDatabase = await CreateQuotaDatabaseAsync().ConfigureAwait(false);
+        await using var rollbackDatabase = await CreateQuotaDatabaseAsync(rejectSecondQuotaReset: true).ConfigureAwait(false);
         CountryQuotaPreview rollback = await service.PreviewAsync(rollbackDatabase.Path, CancellationToken.None)
-            .ConfigureAwait(false);
-        await rollbackDatabase.ExecuteAsync(
-            "CREATE TRIGGER reject_second_country BEFORE UPDATE ON STA_country " +
-            "WHEN OLD.IDcountry=2 BEGIN SELECT RAISE(ABORT,'synthetic failure'); END")
             .ConfigureAwait(false);
         await Assert.ThrowsExactlyAsync<SqliteException>(() =>
             service.ApplyAsync(rollbackDatabase.Path, rollback, CancellationToken.None)).ConfigureAwait(false);
@@ -458,6 +517,56 @@ public sealed class MaintenanceServiceTests
             "SELECT gene_i_num_cyclist_WC FROM STA_country WHERE IDcountry=1").ConfigureAwait(false));
         Assert.AreEqual(8L, await rollbackDatabase.ScalarAsync<long>(
             "SELECT gene_i_num_cyclist_WC FROM STA_country WHERE IDcountry=2").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    public async Task MaintenanceUpdatesRefuseUnrecordedTriggerSideEffects()
+    {
+        await using var riderDatabase = await CreateRiderDatabaseAsync().ConfigureAwait(false);
+        var riderService = new RiderRecoveryService();
+        RiderRecoveryPreview riderPreview = await riderService.PreviewAsync(riderDatabase.Path, [1], CancellationToken.None)
+            .ConfigureAwait(false);
+        await riderDatabase.ExecuteAsync(
+            "CREATE TABLE audit(value INTEGER); " +
+            "CREATE TRIGGER audit_rider AFTER UPDATE ON DYN_cyclist_fitness BEGIN INSERT INTO audit VALUES(1); END")
+            .ConfigureAwait(false);
+        await Assert.ThrowsExactlyAsync<UnsafeRowMutationException>(() =>
+            riderService.ApplyAsync(riderDatabase.Path, riderPreview, CancellationToken.None)).ConfigureAwait(false);
+        Assert.AreEqual(0L, await riderDatabase.ScalarAsync<long>("SELECT COUNT(*) FROM audit").ConfigureAwait(false));
+        Assert.AreEqual(10D, await riderDatabase.ScalarAsync<double>(
+            "SELECT value_f_FIT FROM DYN_cyclist_fitness WHERE IDcyclist=1").ConfigureAwait(false));
+
+        await using var quotaDatabase = await CreateQuotaDatabaseAsync().ConfigureAwait(false);
+        var quotaService = new CountryQuotaMaintenanceService();
+        CountryQuotaPreview quotaPreview = await quotaService.PreviewAsync(quotaDatabase.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        await quotaDatabase.ExecuteAsync(
+            "CREATE TABLE audit(value INTEGER); " +
+            "CREATE TRIGGER audit_country AFTER UPDATE ON STA_country BEGIN INSERT INTO audit VALUES(1); END")
+            .ConfigureAwait(false);
+        await Assert.ThrowsExactlyAsync<UnsafeRowMutationException>(() =>
+            quotaService.ApplyAsync(quotaDatabase.Path, quotaPreview, CancellationToken.None)).ConfigureAwait(false);
+        Assert.AreEqual(0L, await quotaDatabase.ScalarAsync<long>("SELECT COUNT(*) FROM audit").ConfigureAwait(false));
+        Assert.AreEqual(0L, await quotaDatabase.ScalarAsync<long>(
+            "SELECT gene_i_num_cyclist_WC FROM STA_country WHERE IDcountry=1").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    public async Task CountryQuotaPreviewRetainsOptionalNamesWithoutChangingTheCalculation()
+    {
+        await using var database = await CreateQuotaDatabaseAsync().ConfigureAwait(false);
+        var service = new CountryQuotaMaintenanceService();
+        CountryQuotaPreview baseline = await service.PreviewAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        await database.ExecuteAsync(
+            "ALTER TABLE STA_country ADD COLUMN gene_sz_name TEXT; " +
+            "UPDATE STA_country SET gene_sz_name = CASE IDcountry WHEN 1 THEN ' Sample Country ' ELSE ' ' END")
+            .ConfigureAwait(false);
+        CountryQuotaPreview named = await service.PreviewAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.AreEqual(baseline.SnapshotToken, named.SnapshotToken);
+        Assert.AreEqual("Sample Country", named.Changes.Single(row => row.CountryId == 1).CountryName);
+        Assert.IsNull(named.Changes.Single(row => row.CountryId == 2).CountryName);
     }
 
     [TestMethod]
@@ -547,7 +656,7 @@ public sealed class MaintenanceServiceTests
             "INSERT INTO DYN_result_season_stage VALUES(1,'a'),(2,'b')")
             .ConfigureAwait(false);
 
-    private static async Task<SqliteTestDatabase> CreateQuotaDatabaseAsync() =>
+    private static async Task<SqliteTestDatabase> CreateQuotaDatabaseAsync(bool rejectSecondQuotaReset = false) =>
         await SqliteTestDatabase.CreateAsync(CreateQuotaStatements(
         [
             "INSERT INTO STA_continent VALUES(1,'  Europa  '),(2,'Other')",
@@ -561,7 +670,7 @@ public sealed class MaintenanceServiceTests
             "INSERT INTO STA_classification_source VALUES(1,'RACE_FINAL'),(2,'STAGE')",
             "INSERT INTO STA_classification_type VALUES(1,'TIME')",
             "INSERT INTO STA_race_bonus VALUES(1,1,1,'(10,5)'),(1,2,1,'(4,2)')"
-        ])).ConfigureAwait(false);
+        ], rejectSecondQuotaReset)).ConfigureAwait(false);
 
     private static async Task<SqliteTestDatabase> CreateQuotaBandDatabaseAsync()
     {
@@ -629,7 +738,9 @@ public sealed class MaintenanceServiceTests
         ])).ConfigureAwait(false);
     }
 
-    private static string[] CreateQuotaStatements(IEnumerable<string> dataStatements) =>
+    private static string[] CreateQuotaStatements(
+        IEnumerable<string> dataStatements,
+        bool rejectSecondQuotaReset = false) =>
     [
         "CREATE TABLE GAM_config(gene_i_date TEXT); INSERT INTO GAM_config VALUES('20271115')",
         @"CREATE TABLE DYN_result_season(
@@ -639,10 +750,11 @@ public sealed class MaintenanceServiceTests
         "CREATE TABLE DYN_result_season_stage(IDresult_season_stage INTEGER,gene_b_isFinalStage INTEGER,gene_b_isTTT INTEGER)",
         "CREATE TABLE DYN_cyclist(IDcyclist INTEGER,fkIDregion INTEGER)",
         "CREATE TABLE STA_region(IDregion INTEGER,fkIDcountry INTEGER)",
-        @"CREATE TABLE STA_country(
+        $@"CREATE TABLE STA_country(
           IDcountry INTEGER PRIMARY KEY,CONSTANT TEXT,fkIDcontinent INTEGER,
           gene_i_num_cyclist_WC INTEGER,gene_i_num_cyclist_WC_ITT INTEGER,
-          gene_i_num_cyclist_EC INTEGER,gene_i_num_cyclist_EC_ITT INTEGER)",
+          gene_i_num_cyclist_EC INTEGER,gene_i_num_cyclist_EC_ITT INTEGER
+          {(rejectSecondQuotaReset ? ", CHECK (IDcountry <> 2 OR gene_i_num_cyclist_WC > 0)" : string.Empty)})",
         "CREATE TABLE STA_continent(IDcontinent INTEGER,CONSTANT TEXT)",
         "CREATE TABLE STA_stage(IDstage INTEGER,fkIDrace INTEGER,gene_i_stage_number INTEGER)",
         "CREATE TABLE STA_race(IDrace INTEGER,fkIDrace_class INTEGER)",

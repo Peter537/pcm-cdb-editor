@@ -23,7 +23,17 @@ public enum FilterGroupOperator
 
 public abstract record FilterExpression;
 
-public sealed record FilterCondition(string ColumnName, FilterOperator Operator, SqliteValue Value) : FilterExpression;
+public enum QueryValueTarget
+{
+    StoredValue,
+    RelatedLabel
+}
+
+public sealed record FilterCondition(
+    string ColumnName,
+    FilterOperator Operator,
+    SqliteValue Value,
+    QueryValueTarget Target = QueryValueTarget.StoredValue) : FilterExpression;
 
 public sealed record FilterGroup : FilterExpression
 {
@@ -50,7 +60,10 @@ public enum SortDirection
     Descending
 }
 
-public sealed record SortDescriptor(string ColumnName, SortDirection Direction);
+public sealed record SortDescriptor(
+    string ColumnName,
+    SortDirection Direction,
+    QueryValueTarget Target = QueryValueTarget.StoredValue);
 
 public enum ForeignKeyDisplayMode
 {

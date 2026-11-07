@@ -82,6 +82,87 @@ public sealed class EditHistoryTests
     }
 
     [TestMethod]
+    public void SnapshotTracksSavedStateAcrossUndoAndDropsAnAbandonedBranch()
+    {
+        var history = new InMemoryEditHistory();
+        var first = Operation("first", 1);
+        var saved = Operation("saved", 2);
+        history.Record(first);
+        Assert.AreEqual(0, history.GetSnapshot().SavedAppliedCount);
+        history.Record(saved);
+        history.MarkSavedBaseline();
+
+        EditHistorySnapshot original = history.GetSnapshot();
+        Assert.AreEqual(2, original.SavedAppliedCount);
+        Assert.AreSame(saved, original.NextUndo);
+        Assert.IsNull(original.NextRedo);
+        Assert.ThrowsExactly<NotSupportedException>(() => ((IList<EditOperation>)original.Applied).Clear());
+
+        EditHistoryReplay pending = history.TakeUndoReplay();
+        EditHistorySnapshot inFlight = history.GetSnapshot();
+        Assert.IsTrue(inFlight.State.HasPendingReplay);
+        Assert.IsNull(inFlight.SavedAppliedCount);
+        Assert.IsNull(inFlight.NextUndo);
+        Assert.IsNull(inFlight.NextRedo);
+
+        history.CompleteUndo(pending, []);
+        EditHistorySnapshot beforeSave = history.GetSnapshot();
+        Assert.AreEqual(2, beforeSave.SavedAppliedCount);
+        Assert.AreSame(first, beforeSave.NextUndo);
+        Assert.AreSame(saved, beforeSave.NextRedo);
+
+        var branched = Operation("branched", 3);
+        history.Record(branched);
+        EditHistorySnapshot branch = history.GetSnapshot();
+        Assert.IsTrue(branch.State.IsDirty);
+        Assert.IsNull(branch.SavedAppliedCount);
+        Assert.AreSame(branched, branch.NextUndo);
+        Assert.IsNull(branch.NextRedo);
+        Assert.AreSame(saved, original.NextUndo);
+        Assert.AreSame(saved, beforeSave.NextRedo);
+    }
+
+    [TestMethod]
+    public void InspectionPreservesTypedValuesAndActualTablesForOneBatchRowAtATime()
+    {
+        RowIdentity rider = RowIdentity.FromPrimaryKey(
+            [new RowIdentityComponent("IDcyclist", SqliteValue.Integer(7))]);
+        RowIdentity contract = RowIdentity.FromRowId(9);
+        var maintenance = new MaintenanceEditOperation(
+            Guid.NewGuid(), "DYN_cyclist", DateTimeOffset.UnixEpoch,
+            MaintenanceToolKind.RiderCreation, "Create rider and contract",
+            [
+                new MaintenanceRowChange("DYN_contract_cyclist", contract, null,
+                    [KeyValuePair.Create("fkIDcyclist", SqliteValue.Integer(7))]),
+                new MaintenanceRowChange("DYN_cyclist", rider,
+                    [
+                        KeyValuePair.Create("same", SqliteValue.Integer(7)),
+                        KeyValuePair.Create("note", SqliteValue.Null)
+                    ],
+                    [
+                        KeyValuePair.Create("same", SqliteValue.Integer(7)),
+                        KeyValuePair.Create("note", SqliteValue.Text("NULL"))
+                    ])
+            ]);
+
+        Assert.AreEqual("Create rider and contract", EditHistoryInspection.Describe(maintenance));
+        Assert.AreEqual(2, EditHistoryInspection.GetRowCount(maintenance));
+        EditHistoryRow first = EditHistoryInspection.GetRow(maintenance, 0);
+        Assert.AreEqual("DYN_contract_cyclist", first.TableName);
+        Assert.AreEqual(contract, first.Identity);
+        Assert.IsNull(first.BeforeValues);
+        Assert.AreEqual(SqliteValue.Integer(7), first.AfterValues!["fkIDcyclist"]);
+
+        EditHistoryRow second = EditHistoryInspection.GetRow(maintenance, 1);
+        Assert.AreEqual("DYN_cyclist", second.TableName);
+        Assert.AreEqual(rider, second.Identity);
+        Assert.AreEqual("note", Assert.ContainsSingle(second.ChangedColumns));
+        Assert.AreEqual(SqliteValue.Null, second.BeforeValues!["note"]);
+        Assert.AreEqual(SqliteValue.Text("NULL"), second.AfterValues!["note"]);
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => EditHistoryInspection.GetRow(maintenance, 2));
+    }
+
+    [TestMethod]
     public void InsertionOperationSupportsDatabaseAssignedIdentityAndFreezesValues()
     {
         var values = new Dictionary<string, SqliteValue>

@@ -31,12 +31,17 @@ public sealed class HistoryAndSettingsTests
                 Guid.NewGuid(), "DYN_data", DateTimeOffset.UtcNow, row.Values, row.Identity!);
             history.Record(delete);
             history.Record(insert);
+            history.MarkSavedBaseline();
             var pending = history.TakeUndo();
             history.CompleteUndo(pending);
 
             var reloaded = new EditHistory(path);
-            Assert.AreEqual(1, reloaded.State.UndoCount);
-            Assert.AreEqual(1, reloaded.State.RedoCount);
+            EditHistorySnapshot snapshot = reloaded.GetSnapshot();
+            Assert.AreEqual(1, snapshot.State.UndoCount);
+            Assert.AreEqual(1, snapshot.State.RedoCount);
+            Assert.AreEqual(2, snapshot.SavedAppliedCount);
+            Assert.AreEqual(delete.OperationId, snapshot.NextUndo?.OperationId);
+            Assert.AreEqual(insert.OperationId, snapshot.NextRedo?.OperationId);
             var restoredDelete = Assert.IsInstanceOfType<RowDeletionOperation>(reloaded.TakeUndo());
             Assert.AreEqual("payload", restoredDelete.DeletedRow.Values["value"].TextValue);
             reloaded.RestoreFailedUndo(restoredDelete);
@@ -52,6 +57,70 @@ public sealed class HistoryAndSettingsTests
                 Directory.Delete(directory, recursive: true);
             }
         }
+    }
+
+    [TestMethod]
+    public async Task SavingAfterCommittedInterruptedUndoRetiresTheAmbiguousTimeline()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE data(ID INTEGER PRIMARY KEY, value TEXT)",
+            "INSERT INTO data VALUES(1,'before')").ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        var store = new SqliteTableDataStore();
+        TypedRow before = (await store.QueryAsync(database.Path, catalog,
+            new TableQuery("data", new PageRequest(0, 10)), CancellationToken.None).ConfigureAwait(false)).Rows.Single();
+        var update = new CellUpdateOperation(Guid.NewGuid(), "data", DateTimeOffset.UtcNow, before.Identity!, "value",
+            SqliteValue.Text("before"), SqliteValue.Text("after"), before.Revision);
+        EditResult edited = await store.UpdateCellAsync(database.Path, catalog, update, CancellationToken.None).ConfigureAwait(false);
+        string historyPath = Path.Combine(database.Directory, "interrupted-history.json");
+        var history = new EditHistory(historyPath);
+        history.Record(update, [RowReplayGuard.Present("data", edited.CurrentRow!)]);
+        var replayer = new SqliteEditOperationReplayer();
+        await replayer.ReplayAsync(database.Path, catalog, history.TakeUndoReplay(), CancellationToken.None).ConfigureAwait(false);
+
+        var recovered = new EditHistory(historyPath, recovering: true);
+        Assert.IsTrue(recovered.GetSnapshot().State.HistoryUncertain);
+        Assert.AreEqual("before", await database.ScalarAsync<string>("SELECT value FROM data WHERE ID=1").ConfigureAwait(false));
+        recovered.MarkSavedBaseline();
+
+        EditHistorySnapshot saved = new EditHistory(historyPath).GetSnapshot();
+        Assert.IsFalse(saved.State.IsDirty);
+        Assert.IsFalse(saved.State.HistoryUncertain);
+        Assert.AreEqual(0, saved.SavedAppliedCount);
+        Assert.IsEmpty(saved.Applied);
+        Assert.IsEmpty(saved.Undone);
+        Assert.IsNull(saved.NextUndo);
+    }
+
+    [TestMethod]
+    public async Task RetiringStrandedReplayRequiresDurableBaselineBeforeClearingPendingState()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync("CREATE TABLE data(ID INTEGER PRIMARY KEY)")
+            .ConfigureAwait(false);
+        string historyPath = Path.Combine(database.Directory, "stranded-history.json");
+        var history = new EditHistory(historyPath);
+        var operation = new RowInsertionOperation(Guid.NewGuid(), "data", DateTimeOffset.UtcNow,
+            [KeyValuePair.Create("ID", SqliteValue.Integer(1))], RowIdentity.FromRowId(1));
+        history.Record(operation);
+        _ = history.TakeUndoReplay();
+        using (File.Open(historyPath, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            try
+            {
+                history.MarkSavedBaseline(retireUncertainHistory: true);
+                Assert.Fail("A locked history destination cannot accept the new baseline.");
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                Assert.IsTrue(history.State.HasPendingReplay);
+                Assert.IsTrue(history.State.IsDirty);
+            }
+        }
+
+        history.MarkSavedBaseline(retireUncertainHistory: true);
+        Assert.IsFalse(history.State.HasPendingReplay);
+        Assert.IsFalse(history.State.IsDirty);
+        Assert.IsFalse(new EditHistory(historyPath).State.CanUndo);
     }
 
     [TestMethod]

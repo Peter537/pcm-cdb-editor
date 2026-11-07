@@ -9,6 +9,11 @@ namespace PcmCdbEditor.Infrastructure.Sqlite;
 public sealed class SqliteTableCatalog : ITableCatalog
 {
     private static readonly string[] InferredTablePrefixes = ["DYN_", "STA_", "GAM_", "INF_"];
+    private static readonly string[] RecognizedDisplayColumns =
+    [
+        "gene_sz_name", "gene_sz_full_name", "gene_sz_race_name", "gene_sz_firstlastname",
+        "gene_sz_firstname", "gene_sz_lastname", "value_sz_name", "name", "gene_sz_code", "CONSTANT"
+    ];
     private readonly Dictionary<string, string> _configuredDisplayColumns;
 
     public SqliteTableCatalog(IReadOnlyDictionary<string, string>? configuredDisplayColumns = null)
@@ -49,7 +54,7 @@ public sealed class SqliteTableCatalog : ITableCatalog
             var identity = ResolveIdentity(item, columns);
             var editCapability = item.Kind == TableObjectKind.View
                 ? TableEditCapability.ReadOnlyView
-                : item.IsVirtual
+                : item.IsVirtualOrShadow
                     ? TableEditCapability.UnsupportedSchema
                 : identity.Kind == StableIdentityKind.None
                     ? TableEditCapability.MissingStableIdentity
@@ -85,26 +90,22 @@ public sealed class SqliteTableCatalog : ITableCatalog
         var objects = new List<SchemaObject>();
         await using var command = connection.CreateCommand();
         command.CommandText = @"
-SELECT name, type, COALESCE(sql, '')
-FROM sqlite_schema
-WHERE type IN ('table', 'view')
+SELECT name, type, wr
+FROM pragma_table_list
+WHERE schema = 'main'
   AND name NOT LIKE 'sqlite_%'
 ORDER BY name COLLATE NOCASE, name";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var name = reader.GetString(0);
-            var kind = reader.GetString(1).Equals("view", StringComparison.OrdinalIgnoreCase)
-                ? TableObjectKind.View
-                : TableObjectKind.Table;
-            var sql = reader.GetString(2);
+            var type = reader.GetString(1);
+            var kind = type == "view" ? TableObjectKind.View : TableObjectKind.Table;
             objects.Add(new SchemaObject(
                 name,
                 kind,
-                kind == TableObjectKind.Table
-                && sql.Contains("WITHOUT ROWID", StringComparison.OrdinalIgnoreCase),
-                kind == TableObjectKind.Table
-                && sql.TrimStart().StartsWith("CREATE VIRTUAL TABLE", StringComparison.OrdinalIgnoreCase)));
+                reader.GetInt32(2) != 0,
+                type is "virtual" or "shadow"));
         }
 
         return objects;
@@ -144,7 +145,7 @@ ORDER BY name COLLATE NOCASE, name";
         string tableName,
         CancellationToken cancellationToken)
     {
-        var relationships = new List<ForeignKeyRelation>();
+        var parts = new List<(int ConstraintId, ForeignKeyRelation Relation)>();
         await using var command = connection.CreateCommand();
         command.CommandText = $"PRAGMA foreign_key_list({SqliteSupport.QuoteIdentifier(tableName)})";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -155,13 +156,23 @@ ORDER BY name COLLATE NOCASE, name";
                 continue;
             }
 
-            relationships.Add(new ForeignKeyRelation(
+            parts.Add((reader.GetInt32(0), new ForeignKeyRelation(
                 reader.GetString(3),
                 reader.GetString(2),
                 reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
                 DisplayColumn: null,
                 IsDeclared: true,
-                Confidence: "declared"));
+                Confidence: "declared")));
+        }
+
+        var relationships = new List<ForeignKeyRelation>(parts.Count);
+        foreach (var constraint in parts.GroupBy(static part => part.ConstraintId))
+        {
+            bool isComposite = constraint.Count() > 1;
+            foreach (var part in constraint)
+            {
+                relationships.Add(isComposite ? part.Relation with { IsComposite = true } : part.Relation);
+            }
         }
 
         return relationships;
@@ -171,7 +182,7 @@ ORDER BY name COLLATE NOCASE, name";
         SchemaObject schemaObject,
         IReadOnlyList<ColumnSchema> columns)
     {
-        if (schemaObject.Kind == TableObjectKind.View || schemaObject.IsVirtual)
+        if (schemaObject.Kind == TableObjectKind.View || schemaObject.IsVirtualOrShadow)
         {
             return new StableIdentityDefinition(StableIdentityKind.None);
         }
@@ -209,7 +220,7 @@ ORDER BY name COLLATE NOCASE, name";
         for (var index = 0; index < source.Relationships.Count; index++)
         {
             var relationship = source.Relationships[index];
-            if (!tablesByName.TryGetValue(relationship.TargetTable, out var target))
+            if (relationship.IsComposite || !tablesByName.TryGetValue(relationship.TargetTable, out var target))
             {
                 continue;
             }
@@ -229,15 +240,19 @@ ORDER BY name COLLATE NOCASE, name";
                 targetColumn = primaryKey[0].Name;
             }
 
-            if (!target.Columns.Any(column => column.Name.Equals(targetColumn, StringComparison.OrdinalIgnoreCase)))
+            if (FindVisibleColumn(target, targetColumn) is not { } targetKey)
             {
                 continue;
             }
 
+            var (displayColumn, additionalDisplayColumn) = ResolveDisplayColumns(target);
             source.Relationships[index] = relationship with
             {
-                TargetColumn = targetColumn,
-                DisplayColumn = ResolveDisplayColumn(target.Object.Name, target.Columns)
+                SourceColumn = FindVisibleColumn(source, relationship.SourceColumn)?.Name ?? relationship.SourceColumn,
+                TargetTable = target.Object.Name,
+                TargetColumn = targetKey.Name,
+                DisplayColumn = displayColumn,
+                AdditionalDisplayColumn = additionalDisplayColumn
             };
         }
     }
@@ -251,7 +266,7 @@ ORDER BY name COLLATE NOCASE, name";
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var column in source.Columns)
         {
-            if (declaredColumns.Contains(column.Name)
+            if (column.IsHidden || declaredColumns.Contains(column.Name)
                 || !column.Name.StartsWith("fkID", StringComparison.OrdinalIgnoreCase)
                 || column.Name.Length <= 4)
             {
@@ -261,78 +276,95 @@ ORDER BY name COLLATE NOCASE, name";
             var suffix = column.Name[4..];
             if (source.Object.Name.Equals("DYN_result_season", StringComparison.OrdinalIgnoreCase)
                 && column.Name.Equals("fkIDresult_season_team", StringComparison.OrdinalIgnoreCase)
-                && tablesByName.TryGetValue("DYN_result_season_team", out var configuredTarget))
+                && tablesByName.TryGetValue("DYN_result_season_team", out var configuredTarget)
+                && FindVisibleColumn(configuredTarget, "IDresult_season_team") is { } configuredKey)
             {
-                var configuredColumn = configuredTarget.Columns.FirstOrDefault(candidate =>
-                    candidate.Name.Equals("IDresult_season_team", StringComparison.OrdinalIgnoreCase));
-                if (configuredColumn is not null)
-                {
-                    source.Relationships.Add(new ForeignKeyRelation(
-                        column.Name,
-                        configuredTarget.Object.Name,
-                        configuredColumn.Name,
-                        ResolveDisplayColumn(configuredTarget.Object.Name, configuredTarget.Columns),
-                        IsDeclared: false,
-                        Confidence: "configured"));
-                    continue;
-                }
-            }
-
-            var candidates = tablesByName.Values
-                .Where(candidate => InferredTablePrefixes.Any(prefix =>
-                    candidate.Object.Name.Equals($"{prefix}{suffix}", StringComparison.OrdinalIgnoreCase)))
-                .Select(candidate => (Table: candidate, Target: candidate.Columns.FirstOrDefault(target =>
-                    target.Name.Equals($"ID{suffix}", StringComparison.OrdinalIgnoreCase))))
-                .Where(static candidate => candidate.Target is not null)
-                .ToArray();
-            if (candidates.Length != 1)
-            {
+                source.Relationships.Add(CreateInferredRelation(column, configuredTarget, configuredKey, "configured"));
                 continue;
             }
 
-            source.Relationships.Add(new ForeignKeyRelation(
-                column.Name,
-                candidates[0].Table.Object.Name,
-                candidates[0].Target!.Name,
-                ResolveDisplayColumn(candidates[0].Table.Object.Name, candidates[0].Table.Columns),
-                IsDeclared: false,
-                Confidence: "conservative-name-match"));
+            var candidates = FindNameMatches(suffix, tablesByName).ToList();
+            string confidence = "conservative-name-match";
+            if (source.Object.Name.Equals("DYN_contract_cyclist", StringComparison.OrdinalIgnoreCase)
+                && column.Name.Equals("fkIDprevteam", StringComparison.OrdinalIgnoreCase)
+                && column.Affinity == SqliteAffinity.Integer
+                && tablesByName.TryGetValue("DYN_team", out var team)
+                && FindVisibleColumn(team, "IDteam") is { Affinity: SqliteAffinity.Integer })
+            {
+                candidates.AddRange(FindNameMatches("team", tablesByName));
+                confidence = "configured";
+            }
+
+            if (candidates.Count == 1)
+            {
+                var (target, key) = candidates[0];
+                source.Relationships.Add(CreateInferredRelation(column, target, key, confidence));
+                continue;
+            }
+
+            foreach (var (target, key) in candidates)
+            {
+                source.Relationships.Add(new ForeignKeyRelation(
+                    column.Name, target.Object.Name, key.Name, DisplayColumn: null,
+                    IsDeclared: false, Confidence: "ambiguous-name-match"));
+            }
         }
     }
 
-    private string? ResolveDisplayColumn(string tableName, IReadOnlyList<ColumnSchema> columns)
+    private static IEnumerable<(TableBuilder Table, ColumnSchema Key)> FindNameMatches(
+        string suffix,
+        IReadOnlyDictionary<string, TableBuilder> tablesByName)
     {
-        if (_configuredDisplayColumns.TryGetValue(tableName, out var configured))
+        foreach (string prefix in InferredTablePrefixes)
         {
-            var configuredMatch = columns.FirstOrDefault(column =>
-                column.Name.Equals(configured, StringComparison.OrdinalIgnoreCase));
-            if (configuredMatch is not null)
+            if (tablesByName.TryGetValue($"{prefix}{suffix}", out var target)
+                && FindVisibleColumn(target, $"ID{suffix}") is { } key)
             {
-                return configuredMatch.Name;
+                yield return (target, key);
             }
         }
-
-        foreach (var candidate in new[]
-                 {
-                     "gene_sz_name",
-                     "gene_sz_full_name",
-                     "gene_sz_firstname",
-                     "gene_sz_lastname",
-                     "value_sz_name",
-                     "name",
-                     "gene_sz_code",
-                     "CONSTANT"
-                 })
-        {
-            var match = columns.FirstOrDefault(column => column.Name.Equals(candidate, StringComparison.OrdinalIgnoreCase));
-            if (match is not null)
-            {
-                return match.Name;
-            }
-        }
-
-        return columns.FirstOrDefault(static column => column.Affinity == SqliteAffinity.Text)?.Name;
     }
+
+    private ForeignKeyRelation CreateInferredRelation(
+        ColumnSchema source,
+        TableBuilder target,
+        ColumnSchema key,
+        string confidence)
+    {
+        var (displayColumn, additionalDisplayColumn) = ResolveDisplayColumns(target);
+        return new ForeignKeyRelation(
+            source.Name, target.Object.Name, key.Name, displayColumn,
+            IsDeclared: false, Confidence: confidence, AdditionalDisplayColumn: additionalDisplayColumn);
+    }
+
+    private (string? Primary, string? Additional) ResolveDisplayColumns(TableBuilder target)
+    {
+        if (_configuredDisplayColumns.TryGetValue(target.Object.Name, out var configured)
+            && FindVisibleColumn(target, configured) is { } configuredLabel)
+        {
+            return (configuredLabel.Name, null);
+        }
+
+        if (target.Object.Name.Equals("DYN_cyclist", StringComparison.OrdinalIgnoreCase)
+            && FindVisibleColumn(target, "gene_sz_firstname") is { } firstName
+            && FindVisibleColumn(target, "gene_sz_lastname") is { } lastName)
+        {
+            return (firstName.Name, lastName.Name);
+        }
+
+        foreach (string candidate in RecognizedDisplayColumns)
+        {
+            if (FindVisibleColumn(target, candidate) is { } match)
+            {
+                return (match.Name, null);
+            }
+        }
+
+        return (null, null);
+    }
+
+    private static ColumnSchema? FindVisibleColumn(TableBuilder table, string name) =>
+        table.Columns.FirstOrDefault(column => !column.IsHidden && column.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
 
     private static SqliteAffinity ResolveAffinity(string declaredType)
     {
@@ -387,7 +419,7 @@ ORDER BY name COLLATE NOCASE, name";
         string Name,
         TableObjectKind Kind,
         bool IsWithoutRowId,
-        bool IsVirtual);
+        bool IsVirtualOrShadow);
 
     private sealed class TableBuilder(
         SchemaObject schemaObject,

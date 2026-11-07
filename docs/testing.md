@@ -6,13 +6,15 @@ The automated suites use synthetic fixtures by default, so they do not require o
 
 Complete the locked restore and Release/x64 build in [Getting started](getting-started.md) before using the `--no-build --no-restore` commands below.
 
+For live checks, launch the editor with `PCM_CDB_EDITOR_DATA_ROOT` set in that process's environment to an absolute directory under the disposable run. The editor puts its settings, sessions, and backups there. Pass a run-owned CDB copy on the command line. A regular launch uses the existing local application-data location.
+
 ## Unit tests
 
 ```powershell
 dotnet test tests/PcmCdbEditor.UnitTests/PcmCdbEditor.UnitTests.csproj --configuration Release --no-build --no-restore --disable-build-servers -m:1
 ```
 
-The unit suite covers domain and view-model state, row identity and typed SQLite values, filter parsing and query composition, bounded paging, complete-result coordination, finite preference normalization, per-tab **All rows** lifetime and display state, header-sort transitions and foreign-key descriptor mapping, Undo/Redo models, maintenance review projections, rider-ID normalization, inline-edit staging and bind-generation invalidation, Create Rider input/range/role/lookup models, live Unicode-aware game-name generation and overrides, potential validation, ordered favorite-list validation and serialization, busy-to-ready command availability, architecture boundaries, mutation write-ahead behavior, and source-level wizard, UI, accessibility, and TableView adapter contracts.
+The unit suite covers domain and view-model state, typed SQLite values, filter and query models, paging coordination, finite preferences, sort descriptors, edit history, write-ahead state, and maintenance projections. Source-level checks cover the shell's per-tab **All rows** wiring, wizard commands, save-state presentation, accessibility metadata, and TableView adapter contracts. Use the native checks below for the resulting UI behavior.
 
 The source-level TableView checks verify event deferral, committed primary-indicator wiring, bind-generation guards, the selection-scroll completion barrier, and viewport restoration through `TableView.HorizontalOffsetProperty`. They do not run the WinUI layout engine. A passing unit suite therefore does not prove rendered header and row alignment or crash-free header sorting.
 
@@ -22,7 +24,7 @@ The source-level TableView checks verify event deferral, committed primary-indic
 dotnet test tests/PcmCdbEditor.IntegrationTests/PcmCdbEditor.IntegrationTests.csproj --configuration Release --no-build --no-restore --disable-build-servers -m:1
 ```
 
-The integration suite uses generated SQLite databases and fake converter processes to exercise schema discovery, typed querying and mutation, delete and trigger safety, history and column-layout settings persistence, ignored legacy sort entries, workspace open/save/recovery behavior, converter bounds and cancellation, maintenance services, and paging responsiveness.
+The integration suite uses generated SQLite databases and fake converter processes to exercise schema discovery, relationship lookup and typed keys, guarded mutation and replay, history and layout persistence, save conflicts and backup handoff, recovery ownership and cleanup, converter bounds and cancellation, maintenance, and paging responsiveness.
 
 Paging fixtures cover bounded `PageRequest` behavior, 100/250/500 persistence, complete all-row results at 0, 499, 500, 501, 1,201, and more than 10,000 rows, search, filters, database sorting, views, and every foreign-key display mode. Caller cancellation, reset, invalidation, disposal, and late-result tests verify that a failed, cancelled, or superseded all-row load never partially binds or replaces the previous completed view. Million-row tests retain bounded finite-paging performance coverage and check prompt all-row cancellation rather than full materialization.
 
@@ -50,22 +52,34 @@ The opt-in test writes ignored output under `local-smoke/proof-<id>`. That direc
 
 ## Manual Windows and accessibility checks
 
-Source tests can check XAML names, automation IDs, and focus-management code, but they cannot check the rendered WinUI experience. Before treating a local build as a release candidate, manually check at least:
+Source tests can check XAML names, automation IDs, and focus-management code, but they cannot check the rendered WinUI experience. Use the existing screen configuration and an isolated app data root for disposable preference checks. Before treating a local build as a release candidate, manually check at least:
 
 - keyboard-only navigation through the shell, table tabs, filters, row editor, maintenance dialogs, preferences, and save prompts;
 - visible focus and focus restoration after completed, cancelled, superseded, and failed operations;
-- Narrator announcements and accessible names for navigation, toolbar commands, loading/cancellation state, dialogs, tables, and validation errors;
-- system, light, and dark themes; compact and comfortable density; **100 rows**, **250 rows**, **500 rows**, and **All rows** in that picker order; display scaling; and high-contrast behavior;
+- accessible names, help text, and control states for navigation, toolbar commands, loading and cancellation, dialogs, tables, and validation errors;
+- **100 rows**, **250 rows**, **500 rows**, and **All rows (slower)** in that picker order;
 - the **Rows to show** accessible description, including the warning that **All rows** loads every matching row and may require substantial time and memory, while retaining the `TablePageSize` automation ID;
 - finite-choice persistence and 500-row round-tripping; **All rows** retention across search, filters, sorting, edits, Undo/Redo, refreshes, foreign-key display changes, and tab switching; close/reopen and new-editor reset to the last finite preference; unrelated preference saves; and an explicit finite-preference change on the selected tab;
 - **All rows** status text and exact count, visible disabled **Previous** and **Next** controls, cancellation and failure rollback, and responsive behavior on a large disposable table;
-- normal successful open at wide and narrow window widths and 200% text scaling: **Working copy ready** appears in the Open/Save command row without a persistent extra row, the complete safety explanation is available through both its tooltip and Narrator/automation help rather than pointer hover alone, command overflow remains usable in system, light, and dark themes and high contrast, and progress, recovery, save-result, warning, and error messages remain full-width and announced;
-- open, edit, Undo/Redo, **Save**, **Save as**, backup, dirty-close, and interrupted-session recovery flows on disposable copies.
+- the completed query summary, **Refresh**, **Reset query**, and **Reset column layout**, including cancellation and the distinction between an empty table and zero query matches;
+- current-cell inspection with a different row checked, typed values and long text in **Row details**, identity-less view and nullable-key rows across tabs, and clamping after the final finite page loses its last match;
+- normal successful open at wide and narrow window widths, including persistent **Saved** or **Unsaved changes** status, incomplete history help, selectable paths in **Save details**, command overflow, and wrapped operation, recovery, and error messages;
+- multi-field Edit/Insert drafts after invalid numbers, NULL restrictions, and SQLite constraint rejection; error focus and correction, exact single commit/Undo, separate uncreated rider-draft decisions after Save and cancelled close/replacement, and incomplete history remaining unsaved after recovery and subsequent Undo;
+- open, edit, Undo/Redo, **Save**, **Save as**, backup, dirty-close, and interrupted-session recovery flows on disposable copies;
+- **Changes** before and after a typed edit, Undo, Redo, and Save. Compare the field's storage class and values with the working row. Verify the next actions and saved baseline when undoing past a save or abandoning a redo branch;
+- external destination changes on a run-owned CDB. Verify that **Cancel** preserves both the destination bytes and the unsaved working copy. Exercise **Save as** and explicit overwrite. Verify both paths in **Save details** and compare the backup with the displaced file;
+- restart with multiple recoverable sessions. Select by path and timestamp, cancel a discard, resume the intended session, and verify incomplete history remains visible until an explicit save. Confirm clean-session cleanup preserves recoverable sessions and backups. Check **Recent databases** in the empty workspace and command overflow;
 - double-click, Enter, and F2 inline edits for Integer, Real, and Text cells; click-away commit, Escape cancellation, invalid input, rapid repeated edits, Undo/Redo, multi-selection, current-column focus, and viewport stability;
-- header sorting on wide and horizontally scrolled tables: first activation descending, repeated activation toggling, another column promoted above preserved secondary priorities, **Sort** dialog parity and clearing, database-wide order across pages, foreign-key display modes, per-open-tab retention, fresh-table and fresh-editor reset, cancellation and failure rollback, busy-state disabling, keyboard and Narrator access through **Sort**, visible primary-arrow direction, and stable header, row, and viewport alignment;
+- immediately after F2 → Enter commits and refreshes a row, select a row by its selector and with Ctrl+A without first pressing Escape; repeat after Undo/Redo and table switching. Selection and the inspector must remain usable, with no hidden next-cell editor left active by the control's Enter continuation;
+- header sorting on wide and horizontally scrolled tables, including first activation descending, repeated activation toggling, preserved secondary priorities, **Sort** dialog parity and clearing, database-wide order across pages, per-tab retention, fresh-table and fresh-editor reset, rollback on cancellation or failure, busy-state disabling, keyboard access through **Sort**, a single primary arrow, and stable header, row, and viewport alignment;
+- related-name search on different copied careers, including finite-page and **All rows** count agreement, stored-key and related-name filters, numeric key and alphabetical name sorts, and committed sort retention across display modes. Use synthetic schemas for missing targets, ambiguous keys, unavailable labels, and composite relationships;
+- relationship selection from a grid cell and **Edit row**, including keyboard search, choosing between duplicate labels, cancelling with Escape, raw entry, nullable keys, and typed-key Undo and Redo. Use synthetic schemas for unusual keys, stale targets, and competing relationships. Verify that a refused change retains the draft;
+- **Open referenced row** and **Return to source**, including a target already open in a tab, a reference to the same table, a read-only source row, and restoration of the source filter, sort, page, selection, and viewport;
 - rider recovery with a long team name, an empty team, manually entered IDs, missing IDs, and **Use selected rows** without automatic input replacement;
-- Create Rider at narrow and wide window sizes: all six steps, long rider/team/region/race names, lookup loading and errors, live game-name generation plus override/reset, keyboard race selection/removal/reordering, optional-empty favorite warning, potential range and increments, observed height/weight guidance, the 14-row matrix and both bulk actions, Current-above-Limit warnings, blank-Limit acknowledgement, collapsed Advanced groups, BLOB omission and non-editability, role labels with codes, allocation review, the preview-busy-to-Ready button transition, stale/error states, apply, Undo, and Redo;
-- Create Rider and the maintenance workflows at 200% text scaling in system, light, and dark themes, including keyboard-only operation, reduced motion, and focus restoration after dialogs.
+- At narrow and wide widths, navigate away during Create Rider preparation and change a draft during preview. Verify that returning retains the draft and that only the current draft can publish a review or move focus.
+- Walk all six Create Rider steps. Exercise game-name override/reset, keyboard favorite-race selection, removal and reordering, observed profile guidance, the 14-row ability matrix, bulk Current and Limit values, Copy Current to Limits, Clear Limits, and Current ability override/reset. Check blank-Limit acknowledgement, invalid-field focus, collapsed Advanced groups, role codes, generated IDs, and reviewed profile values.
+- After creating, inspect both generated rows from the receipt. Check that Undo disables the receipt actions and Redo restores them. Save and reopen the copied career.
+- keyboard-only operation and focus restoration after Create Rider and maintenance dialogs.
 
 Run the nonzero-offset header-sort regression exactly as follows:
 

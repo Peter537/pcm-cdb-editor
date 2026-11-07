@@ -86,6 +86,7 @@ public sealed class GridContentBindingSessionTests
                 ["ID", "DisplayName"]);
 
         Assert.AreSame(second, resolved.CurrentRow);
+        Assert.AreSame(second, resolved.CurrentCellRow);
         Assert.AreEqual("DisplayName", resolved.CurrentColumn);
         CollectionAssert.AreEqual(new[] { second, first }, resolved.SelectedRows.ToArray());
 
@@ -97,6 +98,39 @@ public sealed class GridContentBindingSessionTests
                 ["ID", "DisplayName"]);
         Assert.IsNull(missing.CurrentRow);
         Assert.IsNull(missing.CurrentColumn);
+    }
+
+    [TestMethod]
+    public void ResolveSelectionRestoresCellAndCheckboxRowsIndependently()
+    {
+        RowIdentity selectedIdentity = RowIdentity.FromRowId(1);
+        RowIdentity cellIdentity = RowIdentity.FromRowId(2);
+        var selected = new PresentedRow(selectedIdentity, "selected");
+        var focused = new PresentedRow(cellIdentity, "focused");
+        var saved = new GridSelection(selectedIdentity, "relatedkey", [selectedIdentity])
+        {
+            CurrentCellRow = cellIdentity,
+        };
+
+        GridSelectionResolution<PresentedRow> resolved = GridContentBindingSession.ResolveSelection(
+            saved, [focused, selected], static row => row.Identity, ["ID", "RelatedKey"]);
+        Assert.AreSame(selected, resolved.CurrentRow);
+        Assert.AreSame(focused, resolved.CurrentCellRow);
+        Assert.AreEqual("RelatedKey", resolved.CurrentColumn);
+        CollectionAssert.AreEqual(new[] { selected }, resolved.SelectedRows.ToArray());
+
+        GridSelectionResolution<PresentedRow> focusOnly = GridContentBindingSession.ResolveSelection(
+            saved with { CurrentRow = null, SelectedRows = [] },
+            [focused, selected], static row => row.Identity, ["ID", "RelatedKey"]);
+        Assert.IsNull(focusOnly.CurrentRow);
+        Assert.IsEmpty(focusOnly.SelectedRows);
+        Assert.AreSame(focused, focusOnly.CurrentCellRow);
+
+        GridSelectionResolution<PresentedRow> missingCell = GridContentBindingSession.ResolveSelection(
+            saved, [selected], static row => row.Identity, ["ID", "RelatedKey"]);
+        Assert.AreSame(selected, missingCell.CurrentRow);
+        Assert.IsNull(missingCell.CurrentCellRow);
+        Assert.IsNull(missingCell.CurrentColumn);
     }
 
     private sealed record PresentedRow(RowIdentity? Identity, string Label);

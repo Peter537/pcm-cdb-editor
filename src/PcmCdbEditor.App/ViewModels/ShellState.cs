@@ -26,6 +26,9 @@ public sealed class ShellState : INotifyPropertyChanged
     private bool _isInspectorOpen = true;
     private bool _hasDatabase;
     private bool _isOperationExclusive;
+    private bool _hasUnsavedChanges;
+    private bool _hasHistoryUncertainty;
+    private string _saveDestination = string.Empty;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -79,6 +82,7 @@ public sealed class ShellState : INotifyPropertyChanged
             if (Set(ref _hasDatabase, value))
             {
                 OnPropertyChanged(nameof(IsDatabaseOpen));
+                OnPropertyChanged(nameof(SaveStatus));
             }
         }
     }
@@ -108,6 +112,42 @@ public sealed class ShellState : INotifyPropertyChanged
     public bool IsDatabaseOpen => HasDatabase && !IsBusy && !IsOperationExclusive;
 
     public bool IsDirty => State == ShellOperationState.Dirty;
+
+    public bool HasUnsavedChanges
+    {
+        get => _hasUnsavedChanges;
+        set
+        {
+            if (Set(ref _hasUnsavedChanges, value))
+            {
+                OnPropertyChanged(nameof(SaveStatus));
+            }
+        }
+    }
+
+    public bool HasHistoryUncertainty
+    {
+        get => _hasHistoryUncertainty;
+        set
+        {
+            if (Set(ref _hasHistoryUncertainty, value))
+            {
+                OnPropertyChanged(nameof(SaveStatus));
+            }
+        }
+    }
+
+    public string SaveDestination
+    {
+        get => _saveDestination;
+        set => Set(ref _saveDestination, value);
+    }
+
+    public string SaveStatus => !HasDatabase
+        ? "No database open"
+        : HasHistoryUncertainty
+            ? "Unsaved changes · incomplete history"
+            : HasUnsavedChanges ? "Unsaved changes" : "Saved";
 
     private bool Set<T>(ref T field, T value, [CallerMemberName] string? name = null)
     {

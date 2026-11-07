@@ -14,8 +14,8 @@ I built PCM CDB Editor as a Windows desktop editor for Pro Cycling Manager CDB s
 - Copy-first open, save, backup, and recovery workflows
 - Table browsing with persisted 100-, 250-, or 500-row paging, plus an explicit session-only **All rows** mode, search, filters, session-only multi-column sorting, and lazy finite-page counts
 - Typed inline and full-row editing for safely identified rows, with inline mutations deferred until TableView finishes its commit lifecycle
-- Disk-backed undo and redo across row edits and confirmed maintenance operations
-- Schema-aware foreign-key display and persisted column layouts
+- Disk-backed Undo and Redo across row edits and confirmed maintenance operations, with recorded values and the saved baseline in **Changes**
+- Schema-aware relationship display, search, filtering, sorting, and typed selection, with navigation to referenced rows
 - A dedicated, preview-first **Create Rider** wizard, plus **Rider recovery preset**, **January 1 season-stage repair**, and **World and European country quotas** when their schema and date requirements are met
 
 Finite row choices keep database access bounded and become the global preference. **All rows** instead materializes every row matching the current search and filters in the current sort order, without an artificial cap. It belongs only to the open table tab and can require substantial time and memory; closing that tab discards the choice.
@@ -37,8 +37,8 @@ Read [Getting started](docs/getting-started.md) for the complete development wor
 ## Safety
 
 - SQLiteExporter never receives the original CDB; editing happens inside `%LOCALAPPDATA%\PcmCdbEditor\Sessions`.
-- Save requires the staged CDB to exist and be non-empty, then backs up an existing non-empty destination before replacement.
-- Views and virtual tables are always read-only; ordinary tables without a verified declared primary key or safe `rowid` are also read-only.
+- Save checks the destination and stages a non-empty CDB. When replacing an existing destination, the editor preserves the displaced file as a backup.
+- Views, virtual tables and their internal shadow tables, and ordinary tables without a verified declared primary key or safe `rowid` are read-only.
 - Sessions and backups can contain sensitive game data. Keep an independent backup and do not attach them to public issues.
 
 See [Safety and recovery](docs/safety-and-recovery.md) for lifecycle, failure, and recovery boundaries.

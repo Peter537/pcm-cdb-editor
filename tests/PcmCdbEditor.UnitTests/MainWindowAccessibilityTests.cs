@@ -7,7 +7,7 @@ namespace PcmCdbEditor.UnitTests;
 public sealed class MainWindowAccessibilityTests
 {
     private static readonly string[] ExpectedTableRowDisplayLabels =
-        ["100 rows", "250 rows", "500 rows", "All rows"];
+        ["100 rows", "250 rows", "500 rows", "All rows (slower)"];
 
     private static readonly IReadOnlyDictionary<string, string> CriticalAutomationIds =
         new Dictionary<string, string>(StringComparer.Ordinal)
@@ -75,6 +75,12 @@ public sealed class MainWindowAccessibilityTests
             ["PreviewJanuaryRepairButton"] = "PreviewJanuaryRepairCommand",
             ["PreviewCountryQuotasButton"] = "PreviewCountryQuotasCommand",
             ["CheckRecoveryButton"] = "CheckRecoverySessionsCommand",
+            ["RecoverySessionsList"] = "RecoverableSessionList",
+            ["ResumeRecoveryButton"] = "ResumeRecoverySessionCommand",
+            ["DiscardRecoveryButton"] = "DiscardRecoverySessionCommand",
+            ["CleanCompletedSessionsButton"] = "CleanCompletedSessionsCommand",
+            ["RecentDatabasesButton"] = "ShowRecentDatabasesCommand",
+            ["EmptyStateRecentDatabasesButton"] = "EmptyStateRecentDatabasesCommand",
         };
 
     [TestMethod]
@@ -250,7 +256,7 @@ public sealed class MainWindowAccessibilityTests
         string source = File.ReadAllText(GetMainWindowCodePath());
         StringAssert.Contains(
             source,
-            "if (_riderCreationSessionId == session.SessionId && _riderCreationDraft is not null)",
+            "if (!startAnother && _riderCreationSessionId == session.SessionId && _riderCreationDraft is not null)",
             StringComparison.Ordinal);
         StringAssert.Contains(
             source,
@@ -364,7 +370,7 @@ public sealed class MainWindowAccessibilityTests
     [TestMethod]
     public void WorkingCopyStatusIsCompactAccessibleCommandBarContent()
     {
-        const string workingCopyLabel = "Working copy ready";
+        const string workingCopyLabel = "{x:Bind ViewModel.SaveStatus, Mode=OneWay}";
         const string workingCopyHelp =
             "The original CDB remains untouched until you choose Save.";
         XDocument document = XDocument.Load(GetMainWindowXamlPath());
@@ -419,7 +425,7 @@ public sealed class MainWindowAccessibilityTests
     }
 
     [TestMethod]
-    public void WorkingCopyStatusOnlyReplacesTheRoutineOpenSuccessMessage()
+    public void PersistentSaveStatusRemainsSeparateFromOperationFeedback()
     {
         string source = File.ReadAllText(GetMainWindowCodePath());
         string openPath = GetMethodSource(source, "private async Task OpenPathAsync(string path)");
@@ -444,9 +450,9 @@ public sealed class MainWindowAccessibilityTests
             "The full-width InfoBar must close before the compact status becomes visible.");
         AssertAppearsBefore(
             presentInfoBar,
-            "WorkingCopyStatus.Visibility = Visibility.Collapsed;",
+            "UpdatePersistentSaveState();",
             "OperationInfo.IsOpen = true;",
-            "Generic operation feedback must hide the compact status before opening the InfoBar.");
+            "Operation feedback must preserve the independent saved/unsaved status.");
         StringAssert.Contains(
             resetToNoFile,
             "WorkingCopyStatus.Visibility = Visibility.Collapsed;",
@@ -502,7 +508,7 @@ public sealed class MainWindowAccessibilityTests
             StringComparison.Ordinal);
         StringAssert.Contains(
             settings,
-            "SelectedItem = _preferences.PageSize",
+            "SelectedItem = opening.PageSize",
             StringComparison.Ordinal);
         Assert.IsFalse(
             settings.Contains("ToolbarChoices", StringComparison.Ordinal),
@@ -622,54 +628,22 @@ public sealed class MainWindowAccessibilityTests
         StringAssert.Contains(tabSelectionChanged, "GetRequestedRowDisplay(context)", StringComparison.Ordinal);
         StringAssert.Contains(tabSelectionChanged, "GetRequestedOffset(context)", StringComparison.Ordinal);
 
-        StringAssert.Contains(selectionChanged, "if (!rowDisplay.IsAllRows)", StringComparison.Ordinal);
-        int publishIntentIndex = selectionChanged.IndexOf("tab.Tag = context;", StringComparison.Ordinal);
         int preferenceSaveIndex = selectionChanged.IndexOf(
-            "await _pageSizePreferenceSaveGate.WaitAsync",
+            "await SavePreferencesAsync(",
             StringComparison.Ordinal);
         int queryIndex = selectionChanged.IndexOf(
-            "TableQueryOutcome queryOutcome = await LoadTableQueryAsync(",
+            "await LoadTableQueryAsync(",
+            StringComparison.Ordinal);
+        int completedFinitePageIndex = selectionChanged.IndexOf(
+            "outcome != TableQueryOutcome.Succeeded || rowDisplay.IsAllRows",
             StringComparison.Ordinal);
         Assert.IsTrue(
-            publishIntentIndex >= 0 &&
-            preferenceSaveIndex > publishIntentIndex &&
-            queryIndex > publishIntentIndex,
-            "The tab must publish its requested row display before saving or dispatching a query.");
-        StringAssert.Contains(
-            selectionChanged,
-            "await _pageSizePreferenceSaveGate.WaitAsync(_lifetimeCancellation.Token);",
-            StringComparison.Ordinal);
-        StringAssert.Contains(
-            selectionChanged,
-            "preferencesToSave,",
-            StringComparison.Ordinal);
-        StringAssert.Contains(
-            selectionChanged,
-            "!ReferenceEquals(TableTabs.SelectedItem, tab)",
-            StringComparison.Ordinal);
-        StringAssert.Contains(
-            selectionChanged,
-            "!ReferenceEquals(currentContext.Display, context.Display)",
-            StringComparison.Ordinal);
-        StringAssert.Contains(
-            selectionChanged,
-            "!ReferenceEquals(currentContext.Coordinator, context.Coordinator)",
-            StringComparison.Ordinal);
+            queryIndex >= 0 && completedFinitePageIndex > queryIndex &&
+            preferenceSaveIndex > completedFinitePageIndex,
+            "Only a completed finite page may update the default preference.");
+        Assert.IsFalse(selectionChanged.Contains("PendingRowDisplay =", StringComparison.Ordinal));
         StringAssert.Contains(selectionChanged, "_operationLease is not null", StringComparison.Ordinal);
         StringAssert.Contains(selectionChanged, "_activeTableLoad is not null", StringComparison.Ordinal);
-        StringAssert.Contains(
-            selectionChanged,
-            "PageSizeBox.SelectedIndex != TableRowDisplayOptions.GetToolbarIndex(rowDisplay)",
-            StringComparison.Ordinal);
-        StringAssert.Contains(
-            selectionChanged,
-            "TableQueryOutcome queryOutcome = await LoadTableQueryAsync(",
-            StringComparison.Ordinal);
-        StringAssert.Contains(
-            selectionChanged,
-            "PendingRowDisplay = rowDisplay",
-            StringComparison.Ordinal);
-        StringAssert.Contains(selectionChanged, "IsInvalidated = true", StringComparison.Ordinal);
         StringAssert.Contains(
             searchChanged,
             "tab.Tag is not TableTabContext currentContext",
@@ -710,7 +684,7 @@ public sealed class MainWindowAccessibilityTests
             settings,
             "TryBeginOperation(\"Save preferences\", out CancellationToken cancellationToken)",
             StringComparison.Ordinal);
-        StringAssert.Contains(settings, "SavePreferencesAsync(updatedPreferences, cancellationToken)", StringComparison.Ordinal);
+        StringAssert.Contains(settings, "await SavePreferencesAsync(", StringComparison.Ordinal);
         StringAssert.Contains(
             settings,
             "queryOutcome = await LoadTableQueryAsync(",

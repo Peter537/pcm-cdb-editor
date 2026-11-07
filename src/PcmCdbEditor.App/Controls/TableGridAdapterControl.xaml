@@ -7,7 +7,7 @@
     <tv:TableView
         x:Name="GridControl"
         AutomationProperties.Name="Current table rows"
-        AutomationProperties.HelpText="Use arrow keys to move between cells. Press Enter or F2 to edit an editable cell. Click or tap a column header to make it the primary sort; the first activation sorts descending and later activations toggle direction. Use Sort to edit or clear the full sort order."
+        AutomationProperties.HelpText="Use arrow keys to move between cells. Press F2 to edit. Enter opens a supported relationship picker or commits an inline edit. Click or tap a column header to make it the primary sort. A newly selected sort target starts descending. Repeating the same target toggles direction. Use Sort to edit or clear the full sort order."
         AutoGenerateColumns="False"
         BeginningEdit="GridControl_BeginningEdit"
         CanFilterColumns="False"

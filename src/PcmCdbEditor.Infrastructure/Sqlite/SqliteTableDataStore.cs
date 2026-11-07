@@ -10,6 +10,7 @@ namespace PcmCdbEditor.Infrastructure.Sqlite;
 
 public sealed class SqliteTableDataStore : ITableDataStore
 {
+    private static readonly string[] HiddenRowIdAliases = ["rowid", "_rowid_", "oid"];
     private const int ForeignKeyLookupBatchSize = 400;
     private readonly Action<CommandKind>? _commandObserver;
 
@@ -187,6 +188,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 transaction: null,
                 rows,
                 projection,
+                page is null,
                 commandObserver,
                 cancellationToken)
             .ConfigureAwait(false);
@@ -220,14 +222,14 @@ public sealed class SqliteTableDataStore : ITableDataStore
         CancellationToken cancellationToken)
     {
         var table = RequireTable(catalog, tableName);
-        var builder = new QueryBuilder(table, QueryProjection.Raw);
+        var builder = new QueryBuilder(catalog, table);
         var where = builder.BuildWhere(filter, search: null);
         await using var connection = SqliteSupport.CreateConnection(sqlitePath, SqliteOpenMode.ReadOnly);
         using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
                 connection,
                 cancellationToken)
             .ConfigureAwait(false);
-        return await ExecuteCountAsync(connection, table, where, builder.Parameters, cancellationToken)
+        return await ExecuteCountAsync(connection, table, builder.BuildWithClause(), where, builder.Parameters, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -249,14 +251,14 @@ public sealed class SqliteTableDataStore : ITableDataStore
         ArgumentNullException.ThrowIfNull(catalog);
         ArgumentNullException.ThrowIfNull(query);
         var table = RequireTable(catalog, query.TableName);
-        var builder = new QueryBuilder(table, QueryProjection.Raw);
+        var builder = new QueryBuilder(catalog, table);
         var where = builder.BuildWhere(query.Filter, query.Search);
         await using var connection = SqliteSupport.CreateConnection(sqlitePath, SqliteOpenMode.ReadOnly);
         using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
                 connection,
                 cancellationToken)
             .ConfigureAwait(false);
-        return await ExecuteCountAsync(connection, table, where, builder.Parameters, cancellationToken)
+        return await ExecuteCountAsync(connection, table, builder.BuildWithClause(), where, builder.Parameters, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -278,6 +280,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                     [operation.ColumnName] = operation.NewValue
                 },
                 operation.ExpectedRevision,
+                chosenRelationships: null,
                 cancellationToken),
             cancellationToken);
     }
@@ -297,6 +300,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 operation.Identity,
                 operation.NewValues,
                 operation.ExpectedRevision,
+                operation.ChosenRelationships,
                 cancellationToken),
             cancellationToken);
     }
@@ -324,7 +328,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
         foreach (var column in insertableColumns.Where(column =>
                      !column.IsNullable
                      && column.DefaultExpression is null
-                     && !IsGeneratedIntegerPrimaryKey(table, column)))
+                     && !MayUseRowIdDefault(table, column)))
         {
             if (!values.TryGetValue(column.Name, out var value) || value.Kind == SqliteValueKind.Null)
             {
@@ -341,32 +345,33 @@ public sealed class SqliteTableDataStore : ITableDataStore
         var sqliteTransaction = (SqliteTransaction)transaction;
         try
         {
+            await SqliteMutationSafety.EnsureInsertDeleteAreReversibleAsync(
+                    connection, sqliteTransaction, table.Name, cancellationToken)
+                .ConfigureAwait(false);
             await using var command = connection.CreateCommand();
             command.Transaction = sqliteTransaction;
             if (values.Count == 0)
             {
-                command.CommandText = $"INSERT INTO {SqliteSupport.QuoteIdentifier(table.Name)} DEFAULT VALUES";
+                command.CommandText = $"INSERT OR ABORT INTO main.{SqliteSupport.QuoteIdentifier(table.Name)} DEFAULT VALUES";
             }
             else
             {
                 var selectedColumns = values.Keys.Select(name => RequireColumn(table, name)).ToArray();
-                command.CommandText = $"INSERT INTO {SqliteSupport.QuoteIdentifier(table.Name)} ({string.Join(", ", selectedColumns.Select(column => SqliteSupport.QuoteIdentifier(column.Name)))}) VALUES ({string.Join(", ", selectedColumns.Select((_, index) => $"$v{index}"))})";
+                command.CommandText = $"INSERT OR ABORT INTO main.{SqliteSupport.QuoteIdentifier(table.Name)} ({string.Join(", ", selectedColumns.Select(column => SqliteSupport.QuoteIdentifier(column.Name)))}) VALUES ({string.Join(", ", selectedColumns.Select((_, index) => $"$v{index}"))})";
                 for (var index = 0; index < selectedColumns.Length; index++)
                 {
                     command.Parameters.AddWithValue($"$v{index}", ToDbValue(values[selectedColumns[index].Name]));
                 }
             }
 
-            var affected = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            var insertedIdentity = operation.AssignedIdentity
-                ?? await ResolveInsertedIdentityAsync(
-                        connection,
-                        sqliteTransaction,
-                        table,
-                        values,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-            ValidateIdentity(table, insertedIdentity);
+            RowIdentity insertedIdentity = await ExecuteInsertReturningIdentityAsync(command, table, cancellationToken)
+                .ConfigureAwait(false);
+            if (operation.AssignedIdentity is { } expected && !expected.Equals(insertedIdentity))
+            {
+                throw new UnsafeRowMutationException(
+                    $"SQLite assigned a different row identity in '{table.Name}' than the insertion requested.");
+            }
+
             var current = await ReadRowAsync(
                     connection,
                     sqliteTransaction,
@@ -376,7 +381,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 .ConfigureAwait(false)
                 ?? throw new DBConcurrencyException("The inserted row could not be read back by its assigned identity.");
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return new EditResult(affected, current);
+            return new EditResult(1, current);
         }
         catch
         {
@@ -386,73 +391,59 @@ public sealed class SqliteTableDataStore : ITableDataStore
         }
     }
 
-    private static bool IsGeneratedIntegerPrimaryKey(TableSchema table, ColumnSchema column) =>
-        table.StableIdentity.Kind == StableIdentityKind.DeclaredPrimaryKey
+    private static bool MayUseRowIdDefault(TableSchema table, ColumnSchema column) =>
+        !table.IsWithoutRowId
+        && table.StableIdentity.Kind == StableIdentityKind.DeclaredPrimaryKey
         && table.StableIdentity.Columns.Count == 1
         && column.IsPrimaryKey
-        && column.Affinity == SqliteAffinity.Integer;
+        && column.DeclaredType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase);
 
-    private static async Task<RowIdentity> ResolveInsertedIdentityAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
+    private static async Task<RowIdentity> ExecuteInsertReturningIdentityAsync(
+        SqliteCommand command,
         TableSchema table,
-        IReadOnlyDictionary<string, SqliteValue> values,
         CancellationToken cancellationToken)
     {
-        if (table.StableIdentity.Kind == StableIdentityKind.RowIdFallback)
+        bool useRowId = table.StableIdentity.Kind == StableIdentityKind.RowIdFallback;
+        var columns = table.StableIdentity.Columns;
+        command.CommandText += useRowId
+            ? " RETURNING rowid"
+            : $" RETURNING {string.Join(", ", columns.Select(SqliteSupport.QuoteIdentifier))}";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            return RowIdentity.FromRowId(await ReadLastInsertedRowIdAsync(
-                    connection,
-                    transaction,
-                    cancellationToken)
-                .ConfigureAwait(false));
+            throw new DBConcurrencyException("SQLite did not return an inserted row.");
         }
 
-        if (table.StableIdentity.Kind != StableIdentityKind.DeclaredPrimaryKey)
+        RowIdentity identity;
+        if (useRowId)
         {
-            throw new InvalidOperationException("The inserted row has no discoverable stable identity.");
+            identity = RowIdentity.FromRowId(reader.GetInt64(0));
         }
-
-        var components = new List<RowIdentityComponent>(table.StableIdentity.Columns.Count);
-        foreach (var name in table.StableIdentity.Columns)
+        else
         {
-            if (values.TryGetValue(name, out var value) && value.Kind != SqliteValueKind.Null)
+            var components = new List<RowIdentityComponent>(columns.Count);
+            for (int ordinal = 0; ordinal < columns.Count; ordinal++)
             {
-                components.Add(new RowIdentityComponent(name, value));
-                continue;
+                SqliteValue value = ReadValue(reader, ordinal);
+                if (value.Kind == SqliteValueKind.Null)
+                {
+                    throw new UnsafeRowMutationException(
+                        $"SQLite returned NULL for '{table.Name}.{columns[ordinal]}'. Enter a primary key value so Undo can identify the inserted row.",
+                        columns[ordinal]);
+                }
+
+                components.Add(new RowIdentityComponent(columns[ordinal], value));
             }
 
-            var column = RequireColumn(table, name);
-            if (table.StableIdentity.Columns.Count == 1 && column.Affinity == SqliteAffinity.Integer)
-            {
-                components.Add(new RowIdentityComponent(
-                    name,
-                    SqliteValue.Integer(await ReadLastInsertedRowIdAsync(
-                            connection,
-                            transaction,
-                            cancellationToken)
-                        .ConfigureAwait(false))));
-                continue;
-            }
-
-            throw new InvalidOperationException(
-                "Insert operations for composite or non-integer generated keys require an assigned identity.");
+            identity = RowIdentity.FromPrimaryKey(components);
         }
 
-        return RowIdentity.FromPrimaryKey(components);
-    }
+        if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            throw new DBConcurrencyException("SQLite returned more than one inserted row.");
+        }
 
-    private static async Task<long> ReadLastInsertedRowIdAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
-        CancellationToken cancellationToken)
-    {
-        await using var identityCommand = connection.CreateCommand();
-        identityCommand.Transaction = transaction;
-        identityCommand.CommandText = "SELECT last_insert_rowid()";
-        return Convert.ToInt64(
-            await identityCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
-            CultureInfo.InvariantCulture);
+        return identity;
     }
 
     public Task<EditResult> DeleteRowAsync(
@@ -484,7 +475,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
         var sqliteTransaction = (SqliteTransaction)transaction;
         try
         {
-            await SqliteDeleteSafety.EnsureDeleteIsReversibleAsync(
+            await SqliteMutationSafety.EnsureInsertDeleteAreReversibleAsync(
                     connection,
                     sqliteTransaction,
                     table.Name,
@@ -493,7 +484,6 @@ public sealed class SqliteTableDataStore : ITableDataStore
             var current = await RequireRevisionAsync(
                     connection,
                     sqliteTransaction,
-                    catalog,
                     table,
                     deletionIdentity,
                     operation.DeletedRow.Revision,
@@ -501,7 +491,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 .ConfigureAwait(false);
             await using var command = connection.CreateCommand();
             command.Transaction = sqliteTransaction;
-            command.CommandText = $"DELETE FROM {SqliteSupport.QuoteIdentifier(table.Name)} WHERE {BuildIdentityPredicate(deletionIdentity, command)}";
+            command.CommandText = $"DELETE FROM main.{SqliteSupport.QuoteIdentifier(table.Name)} WHERE {BuildIdentityPredicate(deletionIdentity, command)}";
             var affected = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             if (affected != 1)
             {
@@ -526,6 +516,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
         RowIdentity identity,
         IReadOnlyDictionary<string, SqliteValue> newValues,
         RowRevision expectedRevision,
+        IReadOnlyDictionary<string, RelationshipLookupOption>? chosenRelationships,
         CancellationToken cancellationToken)
     {
         var table = RequireEditableTable(catalog, tableName);
@@ -540,15 +531,42 @@ public sealed class SqliteTableDataStore : ITableDataStore
         var sqliteTransaction = (SqliteTransaction)transaction;
         try
         {
-            await RequireRevisionAsync(
-                    connection,
-                    sqliteTransaction,
-                    catalog,
-                    table,
-                    identity,
-                    expectedRevision,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            bool hasChosenRelationships = chosenRelationships is { Count: > 0 };
+            if (!hasChosenRelationships)
+            {
+                await SqliteMutationSafety.EnsureUpdateIsReversibleAsync(
+                        connection, sqliteTransaction, table.Name, newValues.Keys, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            TypedRow before;
+            try
+            {
+                before = await RequireRevisionAsync(
+                        connection, sqliteTransaction, table, identity, expectedRevision, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (DBConcurrencyException exception) when (chosenRelationships is { Count: > 0 })
+            {
+                throw new UnsafeRowMutationException(exception.Message, chosenRelationships.Keys.First());
+            }
+
+            if (chosenRelationships is { Count: > 0 })
+            {
+                await SqliteRelationshipLookup.ValidateChoicesAsync(
+                    connection, sqliteTransaction, catalog, table.Name, newValues, chosenRelationships,
+                    afterWrite: false, cancellationToken).ConfigureAwait(false);
+
+                if (newValues.All(pair => before.Values[pair.Key] == pair.Value))
+                {
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    return new EditResult(0, before);
+                }
+
+                await SqliteMutationSafety.EnsureUpdateIsReversibleAsync(
+                        connection, sqliteTransaction, table.Name, newValues.Keys, cancellationToken)
+                    .ConfigureAwait(false);
+            }
             await using var command = connection.CreateCommand();
             command.Transaction = sqliteTransaction;
             var assignments = new List<string>();
@@ -561,7 +579,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 command.Parameters.AddWithValue(parameterName, ToDbValue(pair.Value));
             }
 
-            command.CommandText = $"UPDATE {SqliteSupport.QuoteIdentifier(table.Name)} SET {string.Join(", ", assignments)} WHERE {BuildIdentityPredicate(identity, command)}";
+            command.CommandText = $"UPDATE OR ABORT main.{SqliteSupport.QuoteIdentifier(table.Name)} SET {string.Join(", ", assignments)} WHERE {BuildIdentityPredicate(identity, command)}";
             var affected = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             if (affected != 1)
             {
@@ -569,9 +587,17 @@ public sealed class SqliteTableDataStore : ITableDataStore
             }
 
             var current = await ReadRowAsync(connection, sqliteTransaction, table, identity, cancellationToken)
-                .ConfigureAwait(false);
+                .ConfigureAwait(false)
+                ?? throw new DBConcurrencyException("The updated row could not be read back before commit.");
+            if (chosenRelationships is { Count: > 0 })
+            {
+                await SqliteRelationshipLookup.ValidateChoicesAsync(
+                    connection, sqliteTransaction, catalog, table.Name, current.Values, chosenRelationships,
+                    afterWrite: true, cancellationToken).ConfigureAwait(false);
+            }
+
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return new EditResult(affected, current);
+            return new EditResult(current.Revision == before.Revision ? 0 : affected, current);
         }
         catch
         {
@@ -584,7 +610,6 @@ public sealed class SqliteTableDataStore : ITableDataStore
     private static async Task<TypedRow> RequireRevisionAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
-        DatabaseSchemaCatalog catalog,
         TableSchema table,
         RowIdentity identity,
         RowRevision expectedRevision,
@@ -593,56 +618,12 @@ public sealed class SqliteTableDataStore : ITableDataStore
         var current = await ReadRowAsync(connection, transaction, table, identity, cancellationToken)
             .ConfigureAwait(false)
             ?? throw new DBConcurrencyException("The target row no longer exists.");
-        if (current.Revision != expectedRevision
-            && !await MatchesProjectedRevisionAsync(
-                    connection,
-                    transaction,
-                    catalog,
-                    table,
-                    current,
-                    expectedRevision,
-                    cancellationToken)
-                .ConfigureAwait(false))
+        if (current.Revision != expectedRevision)
         {
             throw new DBConcurrencyException("The target row was changed by another operation.");
         }
 
         return current;
-    }
-
-    private static async Task<bool> MatchesProjectedRevisionAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
-        DatabaseSchemaCatalog catalog,
-        TableSchema table,
-        TypedRow current,
-        RowRevision expectedRevision,
-        CancellationToken cancellationToken)
-    {
-        foreach (var mode in new[] { ForeignKeyDisplayMode.ResolvedName, ForeignKeyDisplayMode.RawAndName })
-        {
-            var projection = QueryProjection.Create(catalog, table, mode);
-            if (projection.ResolvedColumns.Length == 0)
-            {
-                continue;
-            }
-
-            TypedRow projected = (await ResolveForeignKeyDisplaysAsync(
-                    connection,
-                    transaction,
-                    [current],
-                    projection,
-                    commandObserver: null,
-                    cancellationToken)
-                .ConfigureAwait(false))[0];
-
-            if (projected.Revision == expectedRevision)
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private static async Task<TypedRow?> ReadRowAsync(
@@ -655,7 +636,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
         var columns = table.Columns.Where(static column => !column.IsHidden).ToArray();
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = $"SELECT {BuildSelectColumns(table, columns)} FROM {SqliteSupport.QuoteIdentifier(table.Name)} WHERE {BuildIdentityPredicate(identity, command)} LIMIT 2";
+        command.CommandText = $"SELECT {BuildSelectColumns(table, columns)} FROM main.{SqliteSupport.QuoteIdentifier(table.Name)} WHERE {BuildIdentityPredicate(identity, command)} LIMIT 2";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -682,32 +663,27 @@ public sealed class SqliteTableDataStore : ITableDataStore
         SqliteTransaction? transaction,
         List<TypedRow> rows,
         QueryProjection projection,
+        bool allRows,
         Action<CommandKind>? commandObserver,
         CancellationToken cancellationToken)
     {
-        if (rows.Count == 0 || projection.ResolvedColumns.Length == 0)
+        if (rows.Count == 0 || projection.Columns.Length == 0)
         {
             return rows;
         }
 
-        var lookups = new Dictionary<ForeignKeyLookupTarget, IReadOnlyDictionary<SqliteValue, ResolvedLookup>>();
-        foreach (IGrouping<ForeignKeyLookupTarget, ResolvedColumn> group in
-                 projection.ResolvedColumns.GroupBy(static resolved => resolved.LookupTarget))
+        var lookups = new Dictionary<ForeignKeyLookupTarget, IReadOnlyDictionary<SqliteValue, RelatedValue>>();
+        foreach (var group in projection.Columns.Where(static column => column.LookupTarget is not null)
+                     .GroupBy(static column => column.LookupTarget!))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            string[] sourceColumns = group
-                .Select(static resolved => resolved.SourceColumn)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            var distinctKeys = new HashSet<SqliteValue>();
-            var keys = new List<SqliteValue>();
-            foreach (string sourceColumn in sourceColumns)
+            var keys = new HashSet<SqliteValue>();
+            foreach (RelationshipColumn column in group)
             {
                 foreach (TypedRow row in rows)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    SqliteValue value = row.Values[sourceColumn];
-                    if (value.Kind != SqliteValueKind.Null && distinctKeys.Add(value))
+                    SqliteValue value = row.Values[column.SourceColumn];
+                    if (value.Kind != SqliteValueKind.Null)
                     {
                         keys.Add(value);
                     }
@@ -715,12 +691,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
             }
 
             lookups[group.Key] = await ReadResolvedLookupsAsync(
-                    connection,
-                    transaction,
-                    group.Key,
-                    keys.ToArray(),
-                    commandObserver,
-                    cancellationToken)
+                    connection, transaction, group.Key, keys.ToArray(), allRows, commandObserver, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -728,31 +699,21 @@ public sealed class SqliteTableDataStore : ITableDataStore
         foreach (TypedRow row in rows)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var values = new Dictionary<string, SqliteValue>(row.Values, StringComparer.OrdinalIgnoreCase);
-            foreach (ResolvedColumn resolved in projection.ResolvedColumns)
+            var relatedValues = new Dictionary<string, RelatedValue>(StringComparer.OrdinalIgnoreCase);
+            foreach (RelationshipColumn column in projection.Columns)
             {
-                SqliteValue source = row.Values[resolved.SourceColumn];
+                SqliteValue source = row.Values[column.SourceColumn];
                 if (source.Kind == SqliteValueKind.Null)
                 {
-                    values[resolved.SyntheticName] = SqliteValue.Null;
                     continue;
                 }
 
-                if (!lookups[resolved.LookupTarget].TryGetValue(source, out ResolvedLookup? lookup)
-                    || lookup is null)
-                {
-                    throw new InvalidDataException("A foreign-key lookup did not return its source key.");
-                }
-
-                string display = lookup.ResolvedName is null
-                    ? lookup.RawText
-                    : projection.Mode == ForeignKeyDisplayMode.RawAndName
-                        ? $"{lookup.RawText} | {lookup.ResolvedName}"
-                        : lookup.ResolvedName;
-                values[resolved.SyntheticName] = SqliteValue.Text(display);
+                relatedValues[column.SourceColumn] = column.LookupTarget is { } target
+                    ? lookups[target][source]
+                    : new RelatedValue(column.Fallback);
             }
 
-            projectedRows.Add(new TypedRow(row.Identity, values));
+            projectedRows.Add(new TypedRow(row.Identity, row.Values, relatedValues));
         }
 
         return projectedRows;
@@ -773,56 +734,51 @@ public sealed class SqliteTableDataStore : ITableDataStore
         return Array.AsReadOnly(snapshot);
     }
 
-    private static async Task<IReadOnlyDictionary<SqliteValue, ResolvedLookup>> ReadResolvedLookupsAsync(
+    private static async Task<IReadOnlyDictionary<SqliteValue, RelatedValue>> ReadResolvedLookupsAsync(
         SqliteConnection connection,
         SqliteTransaction? transaction,
         ForeignKeyLookupTarget target,
         SqliteValue[] keys,
+        bool allRows,
         Action<CommandKind>? commandObserver,
         CancellationToken cancellationToken)
     {
-        var results = new Dictionary<SqliteValue, ResolvedLookup>();
-        for (var batchOffset = 0; batchOffset < keys.Length; batchOffset += ForeignKeyLookupBatchSize)
+        var results = new Dictionary<SqliteValue, RelatedValue>();
+        bool stageKeys = allRows && keys.Length > ForeignKeyLookupBatchSize;
+        if (stageKeys)
+        {
+            await StageLookupKeysAsync(connection, transaction, keys, cancellationToken).ConfigureAwait(false);
+        }
+
+        int queryBatchSize = stageKeys ? keys.Length : ForeignKeyLookupBatchSize;
+        for (var batchOffset = 0; batchOffset < keys.Length; batchOffset += queryBatchSize)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            SqliteValue[] batch = keys
-                .Skip(batchOffset)
-                .Take(ForeignKeyLookupBatchSize)
-                .ToArray();
-            if (batch.Length == 0)
-            {
-                continue;
-            }
-
+            SqliteValue[] batch = stageKeys ? keys : keys.Skip(batchOffset).Take(queryBatchSize).ToArray();
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
-            string valuesSql = string.Join(", ", batch.Select((_, index) => $"({index}, $value{index})"));
-            string targetTable = SqliteSupport.QuoteIdentifier(target.TargetTable);
+            string keySource = stageKeys
+                ? "SELECT \"__ordinal\", \"__value\" FROM temp.\"__pcm_lookup_keys\""
+                : "VALUES " + string.Join(", ", batch.Select((_, index) => $"({index}, $value{index})"));
             string targetColumn = SqliteSupport.QuoteIdentifier(target.TargetColumn);
-            string displayColumn = SqliteSupport.QuoteIdentifier(target.DisplayColumn);
-            command.CommandText = $@"
-WITH ""__pcm_keys""(""__ordinal"", ""__value"") AS (VALUES {valuesSql}),
-""__pcm_resolved"" AS (
-    SELECT {targetColumn} AS ""__pcm_key"",
-           COUNT(*) AS ""__pcm_count"",
-           MAX(CAST({displayColumn} AS TEXT)) AS ""__pcm_name""
-    FROM {targetTable}
-    WHERE {targetColumn} IN (SELECT ""__value"" FROM ""__pcm_keys"")
-    GROUP BY {targetColumn}
-)
-SELECT ""__pcm_keys"".""__ordinal"",
-       CAST(""__pcm_keys"".""__value"" AS TEXT),
-       CASE
-           WHEN ""__pcm_resolved"".""__pcm_count"" = 1
-                AND ""__pcm_resolved"".""__pcm_name"" IS NOT NULL
-           THEN ""__pcm_resolved"".""__pcm_name""
-           ELSE NULL
-       END
-FROM ""__pcm_keys""
-LEFT JOIN ""__pcm_resolved""
-    ON ""__pcm_resolved"".""__pcm_key"" = ""__pcm_keys"".""__value""
-ORDER BY ""__pcm_keys"".""__ordinal""";
-            for (var index = 0; index < batch.Length; index++)
+            command.CommandText = $"""
+                WITH "__pcm_keys"("__ordinal", "__value") AS ({keySource}),
+                "__pcm_resolved" AS (
+                    SELECT {targetColumn} AS "__pcm_key",
+                           COUNT(*) AS "__pcm_count",
+                           MAX({BuildLabelExpression(target)}) AS "__pcm_name"
+                    FROM main.{SqliteSupport.QuoteIdentifier(target.TargetTable)}
+                    WHERE {targetColumn} IN (SELECT +"__value" FROM "__pcm_keys")
+                    GROUP BY {targetColumn}
+                )
+                SELECT "__pcm_keys"."__ordinal", COALESCE("__pcm_resolved"."__pcm_count", 0),
+                       "__pcm_resolved"."__pcm_name"
+                FROM "__pcm_keys"
+                LEFT JOIN "__pcm_resolved"
+                  ON "__pcm_resolved"."__pcm_key" = +"__pcm_keys"."__value"
+                ORDER BY "__pcm_keys"."__ordinal"
+                """;
+            for (var index = 0; !stageKeys && index < batch.Length; index++)
             {
                 command.Parameters.AddWithValue($"$value{index}", ToDbValue(batch[index]));
             }
@@ -832,29 +788,74 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 int ordinal = reader.GetInt32(0);
-                if ((uint)ordinal >= (uint)batch.Length || reader.IsDBNull(1))
+                long count = reader.GetInt64(1);
+                string? label = reader.IsDBNull(2) ? null : reader.GetString(2);
+                RelationshipResolution resolution = count switch
+                {
+                    0 => RelationshipResolution.MissingTarget,
+                    > 1 => RelationshipResolution.AmbiguousKey,
+                    _ when label is null => RelationshipResolution.LabelUnavailable,
+                    _ => RelationshipResolution.Resolved
+                };
+                if ((uint)ordinal >= (uint)batch.Length
+                    || !results.TryAdd(batch[ordinal], new RelatedValue(
+                        resolution, resolution == RelationshipResolution.Resolved ? label : null)))
                 {
                     throw new InvalidDataException("SQLite returned an invalid foreign-key lookup row.");
                 }
-
-                results[batch[ordinal]] = new ResolvedLookup(
-                    reader.GetString(1),
-                    reader.IsDBNull(2) ? null : reader.GetString(2));
             }
+        }
+
+        if (stageKeys)
+        {
+            await using var cleanup = connection.CreateCommand();
+            cleanup.Transaction = transaction;
+            cleanup.CommandText = "DROP TABLE temp.\"__pcm_lookup_keys\"";
+            await cleanup.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
         return results;
     }
 
+    private static async Task StageLookupKeysAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        SqliteValue[] keys,
+        CancellationToken cancellationToken)
+    {
+        // All rows can contain many distinct keys. Staging them in bounded batches
+        // lets SQLite scan an unindexed target once and retain its comparison rules.
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "CREATE TEMP TABLE \"__pcm_lookup_keys\" (\"__ordinal\" INTEGER PRIMARY KEY, \"__value\")";
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        for (int offset = 0; offset < keys.Length; offset += ForeignKeyLookupBatchSize)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int count = Math.Min(ForeignKeyLookupBatchSize, keys.Length - offset);
+            command.Parameters.Clear();
+            var rows = new string[count];
+            for (int index = 0; index < count; index++)
+            {
+                rows[index] = $"({offset + index}, $value{index})";
+                command.Parameters.AddWithValue($"$value{index}", ToDbValue(keys[offset + index]));
+            }
+
+            command.CommandText = $"INSERT INTO temp.\"__pcm_lookup_keys\" VALUES {string.Join(", ", rows)}";
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     private static async Task<long> ExecuteCountAsync(
         SqliteConnection connection,
         TableSchema table,
+        string withClause,
         string where,
         IReadOnlyList<SqlParameterValue> parameters,
         CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT COUNT(*) FROM {SqliteSupport.QuoteIdentifier(table.Name)} AS {QueryProjection.BaseAlias}{where}";
+        command.CommandText = $"{withClause}SELECT COUNT(*) FROM main.{SqliteSupport.QuoteIdentifier(table.Name)} AS {QueryProjection.BaseAlias}{where}";
         AddParameters(command, parameters);
         return Convert.ToInt64(
             await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
@@ -869,14 +870,14 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
         TableSchema table = RequireTable(catalog, query.TableName);
         ColumnSchema[] columns = table.Columns.Where(static column => !column.IsHidden).ToArray();
         QueryProjection projection = QueryProjection.Create(catalog, table, query.ForeignKeyDisplayMode);
-        var builder = new QueryBuilder(table, projection);
+        var builder = new QueryBuilder(catalog, table);
         string where = builder.BuildWhere(query.Filter, query.Search);
         string orderBy = builder.BuildOrderBy(query.Sorts);
-        string joins = builder.BuildJoins();
+        string withClause = builder.BuildWithClause();
         string commandText =
-            $"SELECT {BuildSelectColumns(table, columns, qualify: true)} " +
-            $"FROM {SqliteSupport.QuoteIdentifier(table.Name)} AS {QueryProjection.BaseAlias}" +
-            $"{joins}{where}{orderBy}" +
+            $"{withClause}SELECT {BuildSelectColumns(table, columns, qualify: true)} " +
+            $"FROM main.{SqliteSupport.QuoteIdentifier(table.Name)} AS {QueryProjection.BaseAlias}" +
+            $"{where}{orderBy}" +
             (includePage ? " LIMIT $limit OFFSET $offset" : string.Empty);
         return new RowsQueryPlan(
             table,
@@ -914,7 +915,8 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
             return RowIdentity.FromRowId(reader.GetInt64(rowIdOrdinal));
         }
 
-        if (table.StableIdentity.Kind == StableIdentityKind.DeclaredPrimaryKey)
+        if (table.StableIdentity.Kind == StableIdentityKind.DeclaredPrimaryKey &&
+            table.StableIdentity.Columns.All(name => values[name].Kind != SqliteValueKind.Null))
         {
             return RowIdentity.FromPrimaryKey(table.StableIdentity.Columns.Select(name =>
                 new RowIdentityComponent(name, values[name])));
@@ -1062,25 +1064,11 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
         IReadOnlyList<TypedRow> Rows,
         bool HasMore);
 
-    private sealed record ResolvedLookup(string RawText, string? ResolvedName);
-
-    private sealed class QueryProjection
+    private sealed class QueryProjection(RelationshipColumn[] columns)
     {
         public const string BaseAlias = "\"__pcm_base\"";
 
-        private QueryProjection(
-            ForeignKeyDisplayMode mode,
-            IEnumerable<ResolvedColumn>? resolvedColumns = null)
-        {
-            Mode = mode;
-            ResolvedColumns = resolvedColumns?.ToArray() ?? [];
-        }
-
-        public static QueryProjection Raw { get; } = new(ForeignKeyDisplayMode.RawValue);
-
-        public ForeignKeyDisplayMode Mode { get; }
-
-        public ResolvedColumn[] ResolvedColumns { get; }
+        public RelationshipColumn[] Columns { get; } = columns;
 
         public static QueryProjection Create(
             DatabaseSchemaCatalog catalog,
@@ -1089,86 +1077,95 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
         {
             if (mode == ForeignKeyDisplayMode.RawValue)
             {
-                return Raw;
+                return new QueryProjection([]);
             }
 
-            var relationships = new List<ResolvedColumn>();
-            foreach (var group in table.Relationships.GroupBy(
-                         static relationship => relationship.SourceColumn,
-                         StringComparer.OrdinalIgnoreCase))
+            var columns = new List<RelationshipColumn>();
+            foreach (ColumnSchema column in table.Columns.Where(static column => !column.IsHidden))
             {
-                if (group.Count() != 1)
+                ForeignKeyRelation[] relations = table.Relationships.Where(relation =>
+                    relation.SourceColumn.Equals(column.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
+                if (relations.Length == 0 && !column.Name.StartsWith("fkID", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
 
-                var relationship = group.Single();
-                if (string.IsNullOrWhiteSpace(relationship.TargetColumn)
-                    || string.IsNullOrWhiteSpace(relationship.DisplayColumn)
-                    || !table.Columns.Any(column => column.Name.Equals(
-                        relationship.SourceColumn,
-                        StringComparison.OrdinalIgnoreCase))
-                    || !catalog.TryGetTable(relationship.TargetTable, out TableSchema target))
+                if (RelationshipMetadata.TryGetLabelRelation(catalog, table, column.Name, out var relation))
                 {
+                    columns.Add(new RelationshipColumn(
+                        column.Name, CreateLookupTarget(catalog, relation), RelationshipResolution.Resolved));
                     continue;
                 }
 
-                ColumnSchema? targetColumn = target.Columns.FirstOrDefault(column => column.Name.Equals(
-                        relationship.TargetColumn,
-                        StringComparison.OrdinalIgnoreCase));
-                ColumnSchema? displayColumn = target.Columns.FirstOrDefault(column => column.Name.Equals(
-                        relationship.DisplayColumn,
-                        StringComparison.OrdinalIgnoreCase));
-                if (targetColumn is null || displayColumn is null)
+                RelationshipResolution fallback;
+                if (relations.Length == 0)
                 {
+                    fallback = RelationshipResolution.UnknownRelationship;
+                }
+                else if (relations.Length > 1)
+                {
+                    fallback = RelationshipResolution.AmbiguousRelationship;
+                }
+                else if (relations[0].IsComposite)
+                {
+                    fallback = RelationshipResolution.CompositeRelationship;
+                }
+                else if (!catalog.TryGetTable(relations[0].TargetTable, out TableSchema target)
+                    || !target.Columns.Any(key => !key.IsHidden
+                        && key.Name.Equals(relations[0].TargetColumn, StringComparison.OrdinalIgnoreCase)))
+                {
+                    fallback = RelationshipResolution.TargetUnavailable;
+                }
+                else
+                {
+                    columns.Add(new RelationshipColumn(column.Name,
+                        new ForeignKeyLookupTarget(target.Name,
+                            RequireColumn(target, relations[0].TargetColumn).Name, null, null),
+                        RelationshipResolution.LabelUnavailable));
                     continue;
                 }
 
-                relationships.Add(new ResolvedColumn(
-                    relationship.SourceColumn,
-                    target.Name,
-                    targetColumn.Name,
-                    displayColumn.Name,
-                    $"{relationship.SourceColumn}__display"));
+                columns.Add(new RelationshipColumn(column.Name, null, fallback));
             }
 
-            return new QueryProjection(mode, relationships);
-        }
-
-        public bool TryGet(string name, out ResolvedColumn column)
-        {
-            column = ResolvedColumns.FirstOrDefault(item =>
-                item.SyntheticName.Equals(name, StringComparison.OrdinalIgnoreCase))!;
-            return column is not null;
+            return new QueryProjection(columns.ToArray());
         }
     }
 
-    private sealed record ResolvedColumn(
+    private sealed record RelationshipColumn(
         string SourceColumn,
-        string TargetTable,
-        string TargetColumn,
-        string DisplayColumn,
-        string SyntheticName)
-    {
-        public ForeignKeyLookupTarget LookupTarget { get; } = new(
-            TargetTable,
-            TargetColumn,
-            DisplayColumn);
-    }
+        ForeignKeyLookupTarget? LookupTarget,
+        RelationshipResolution Fallback);
 
     private sealed record ForeignKeyLookupTarget(
         string TargetTable,
         string TargetColumn,
-        string DisplayColumn);
+        string? DisplayColumn,
+        string? AdditionalDisplayColumn);
 
-    private sealed class QueryBuilder(TableSchema table, QueryProjection projection)
+    private static ForeignKeyLookupTarget CreateLookupTarget(DatabaseSchemaCatalog catalog, ForeignKeyRelation relation)
+    {
+        TableSchema target = RequireTable(catalog, relation.TargetTable);
+        return new ForeignKeyLookupTarget(
+            target.Name,
+            RequireColumn(target, relation.TargetColumn).Name,
+            RequireColumn(target, relation.DisplayColumn!).Name,
+            relation.AdditionalDisplayColumn is { } additional ? RequireColumn(target, additional).Name : null);
+    }
+
+    private static string BuildLabelExpression(ForeignKeyLookupTarget target) =>
+        SqliteRelationshipSql.BuildLabelExpression(target.DisplayColumn, target.AdditionalDisplayColumn);
+
+    private sealed class QueryBuilder(DatabaseSchemaCatalog catalog, TableSchema table)
     {
         private readonly List<SqlParameterValue> _parameters = [];
-        private readonly List<string> _joins = [];
+        private readonly List<string> _commonTables = [];
+        private readonly Dictionary<ForeignKeyLookupTarget, string> _lookupNames = [];
+        private readonly Dictionary<string, string> _labels = new(StringComparer.OrdinalIgnoreCase);
 
         public IReadOnlyList<SqlParameterValue> Parameters => _parameters;
 
-        public string BuildJoins() => string.Concat(_joins);
+        public string BuildWithClause() => _commonTables.Count == 0 ? string.Empty : $"WITH {string.Join(", ", _commonTables)} ";
 
         public string BuildWhere(FilterExpression? filter, GlobalSearchRequest? search)
         {
@@ -1180,17 +1177,26 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
 
             if (search is not null && !string.IsNullOrWhiteSpace(search.Text))
             {
-                var eligible = search.EligibleColumns
-                    .Select(name => RequireColumn(table, name))
-                    .Where(static column => column.Affinity != SqliteAffinity.Blob)
-                    .ToArray();
-                if (eligible.Length == 0)
+                var matches = new List<string>();
+                string parameter = Add(SqliteValue.Text($"%{EscapeLike(search.Text)}%"));
+                foreach (string name in search.EligibleColumns.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    ColumnSchema column = RequireColumn(table, name);
+                    string storedValue = $"{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column.Name)}";
+                    matches.Add($"(typeof({storedValue}) <> 'blob' AND CAST({storedValue} AS TEXT) LIKE {parameter} ESCAPE '\\' COLLATE NOCASE)");
+
+                    if (RelationshipMetadata.TryGetLabelRelation(catalog, table, column.Name, out _))
+                    {
+                        matches.Add($"({GetLabelExpression(column)} LIKE {parameter} ESCAPE '\\' COLLATE NOCASE)");
+                    }
+                }
+
+                if (matches.Count == 0)
                 {
                     throw new ArgumentException("Global search needs at least one eligible column.", nameof(search));
                 }
 
-                var searchParameter = Add(SqliteValue.Text($"%{EscapeLike(search.Text)}%"));
-                predicates.Add($"({string.Join(" OR ", eligible.Select(column => $"CAST({QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column.Name)} AS TEXT) LIKE {searchParameter} ESCAPE '\\' COLLATE NOCASE"))})");
+                predicates.Add($"({string.Join(" OR ", matches)})");
             }
 
             return predicates.Count == 0 ? string.Empty : $" WHERE {string.Join(" AND ", predicates)}";
@@ -1199,33 +1205,50 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
         public string BuildOrderBy(IReadOnlyList<SortDescriptor> sorts)
         {
             var descriptors = new List<string>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var sort in sorts)
+            var storedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var labelColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (SortDescriptor sort in sorts)
             {
-                if (projection.TryGet(sort.ColumnName, out var resolved))
+                if (!Enum.IsDefined(sort.Direction) || !Enum.IsDefined(sort.Target))
                 {
-                    if (seen.Add(resolved.SyntheticName))
+                    throw new ArgumentOutOfRangeException(nameof(sorts), "Unsupported sort direction or target.");
+                }
+
+                ColumnSchema column = RequireColumn(table, sort.ColumnName);
+                string expression;
+                if (sort.Target == QueryValueTarget.RelatedLabel)
+                {
+                    if (!labelColumns.Add(column.Name))
                     {
-                        descriptors.Add(
-                            $"{BuildResolvedSortExpression(resolved)} " +
-                            (sort.Direction == SortDirection.Descending ? "DESC" : "ASC"));
+                        continue;
                     }
 
-                    continue;
+                    expression = GetLabelExpression(column);
+                }
+                else
+                {
+                    if (!storedColumns.Add(column.Name))
+                    {
+                        continue;
+                    }
+
+                    expression = $"{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column.Name)}";
                 }
 
-                var column = RequireColumn(table, sort.ColumnName);
-                if (seen.Add(column.Name))
-                {
-                    descriptors.Add($"{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column.Name)} {(sort.Direction == SortDirection.Descending ? "DESC" : "ASC")}");
-                }
+                descriptors.Add($"{expression} {(sort.Direction == SortDirection.Descending ? "DESC" : "ASC")}");
             }
 
             if (table.StableIdentity.Kind == StableIdentityKind.DeclaredPrimaryKey)
             {
-                descriptors.AddRange(table.StableIdentity.Columns
-                    .Where(seen.Add)
+                descriptors.AddRange(table.StableIdentity.Columns.Where(storedColumns.Add)
                     .Select(column => $"{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column)} ASC"));
+                if (!table.IsWithoutRowId &&
+                    HiddenRowIdAliases.FirstOrDefault(alias => !table.Columns.Any(column =>
+                        column.Name.Equals(alias, StringComparison.OrdinalIgnoreCase))) is { } rowIdAlias)
+                {
+                    // Legacy rowid tables can have several NULL primary keys.
+                    descriptors.Add($"{QueryProjection.BaseAlias}.{rowIdAlias} ASC");
+                }
             }
             else if (table.StableIdentity.Kind == StableIdentityKind.RowIdFallback)
             {
@@ -1235,29 +1258,42 @@ ORDER BY ""__pcm_keys"".""__ordinal""";
             return descriptors.Count == 0 ? string.Empty : $" ORDER BY {string.Join(", ", descriptors)}";
         }
 
-        private string BuildResolvedSortExpression(ResolvedColumn resolved)
+        private string GetLabelExpression(ColumnSchema column)
         {
-            string alias = $"\"__pcm_sort_fk_{_joins.Count}\"";
-            string targetTable = SqliteSupport.QuoteIdentifier(resolved.TargetTable);
-            string targetColumn = SqliteSupport.QuoteIdentifier(resolved.TargetColumn);
-            string displayColumn = SqliteSupport.QuoteIdentifier(resolved.DisplayColumn);
-            _joins.Add($@" LEFT JOIN (
-    SELECT {targetColumn} AS ""__pcm_key"",
-           COUNT(*) AS ""__pcm_count"",
-           MAX(CAST({displayColumn} AS TEXT)) AS ""__pcm_name""
-    FROM {targetTable}
-    WHERE {targetColumn} IS NOT NULL
-    GROUP BY {targetColumn}
-) AS {alias}
-ON {alias}.""__pcm_key"" = {QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(resolved.SourceColumn)}");
+            if (_labels.TryGetValue(column.Name, out string? expression))
+            {
+                return expression;
+            }
 
-            string source =
-                $"{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(resolved.SourceColumn)}";
-            string uniqueName =
-                $"{alias}.\"__pcm_count\" = 1 AND {alias}.\"__pcm_name\" IS NOT NULL";
-            return projection.Mode == ForeignKeyDisplayMode.RawAndName
-                ? $"CASE WHEN {source} IS NULL THEN NULL WHEN {uniqueName} THEN CAST({source} AS TEXT) || ' | ' || {alias}.\"__pcm_name\" ELSE CAST({source} AS TEXT) END"
-                : $"CASE WHEN {source} IS NULL THEN NULL WHEN {uniqueName} THEN {alias}.\"__pcm_name\" ELSE CAST({source} AS TEXT) END";
+            if (!RelationshipMetadata.TryGetLabelRelation(catalog, table, column.Name, out var relation))
+            {
+                throw new ArgumentException($"Column '{column.Name}' has no supported related label.");
+            }
+
+            ForeignKeyLookupTarget target = CreateLookupTarget(catalog, relation);
+            if (!_lookupNames.TryGetValue(target, out string? lookupName))
+            {
+                lookupName = $"\"__pcm_relation_{_commonTables.Count}\"";
+                string targetColumn = SqliteSupport.QuoteIdentifier(target.TargetColumn);
+                _commonTables.Add($"""
+                    {lookupName} AS MATERIALIZED (
+                        SELECT {targetColumn} AS "__pcm_key", COUNT(*) AS "__pcm_count",
+                               MAX({BuildLabelExpression(target)}) AS "__pcm_name"
+                        FROM main.{SqliteSupport.QuoteIdentifier(target.TargetTable)}
+                        WHERE {targetColumn} IS NOT NULL
+                        GROUP BY {targetColumn}
+                    )
+                    """);
+                _lookupNames.Add(target, lookupName);
+            }
+
+            expression = $"""
+                (SELECT CASE WHEN "__pcm_count" = 1 THEN "__pcm_name" END
+                 FROM {lookupName}
+                 WHERE "__pcm_key" = +{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column.Name)}) COLLATE NOCASE
+                """;
+            _labels.Add(column.Name, expression);
+            return expression;
         }
 
         private string BuildFilter(FilterExpression expression)
@@ -1265,15 +1301,23 @@ ON {alias}.""__pcm_key"" = {QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdent
             return expression switch
             {
                 FilterCondition condition => BuildCondition(condition),
-                FilterGroup group => $"({string.Join(group.Operator == FilterGroupOperator.And ? " AND " : " OR ", group.Children.Select(BuildFilter))})",
+                FilterGroup group when Enum.IsDefined(group.Operator) =>
+                    $"({string.Join(group.Operator == FilterGroupOperator.And ? " AND " : " OR ", group.Children.Select(BuildFilter))})",
                 _ => throw new ArgumentException("Unsupported filter expression type.", nameof(expression))
             };
         }
 
         private string BuildCondition(FilterCondition condition)
         {
+            if (!Enum.IsDefined(condition.Target) || !Enum.IsDefined(condition.Operator))
+            {
+                throw new ArgumentOutOfRangeException(nameof(condition), "Unsupported filter operator or target.");
+            }
+
             var column = RequireColumn(table, condition.ColumnName);
-            var identifier = $"{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column.Name)}";
+            var identifier = condition.Target == QueryValueTarget.RelatedLabel
+                ? GetLabelExpression(column)
+                : $"{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column.Name)}";
             if (condition.Operator == FilterOperator.IsNull)
             {
                 return $"{identifier} IS NULL";
@@ -1284,7 +1328,13 @@ ON {alias}.""__pcm_key"" = {QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdent
                 return $"{identifier} IS NOT NULL";
             }
 
-            if (condition.Operator is FilterOperator.GreaterThan
+            if (condition.Target == QueryValueTarget.RelatedLabel && condition.Value.Kind != SqliteValueKind.Text)
+            {
+                throw new ArgumentException("Related-label comparisons require a text value.", nameof(condition));
+            }
+
+            if (condition.Target == QueryValueTarget.StoredValue
+                && condition.Operator is FilterOperator.GreaterThan
                     or FilterOperator.GreaterThanOrEqual
                     or FilterOperator.LessThan
                     or FilterOperator.LessThanOrEqual
