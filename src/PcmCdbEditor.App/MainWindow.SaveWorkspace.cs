@@ -155,12 +155,23 @@ public sealed partial class MainWindow
                 return historyBaselineSaved;
             }
         }
+        catch (WorkspaceSaveHandoffException exception)
+        {
+            _session = exception.Session;
+            RestoreSessionState();
+            string displaced = exception.Backup is { } backup
+                ? $"Recorded backup path {backup}."
+                : "The original was restored at its destination.";
+            PresentWarning("Save handoff incomplete",
+                $"Destination: {exception.Destination}\n{displaced}\nStaged CDB: {exception.Stage}");
+            return false;
+        }
         catch (WorkspaceSaveCommitException exception)
         {
             await AdoptCommittedSaveAfterMetadataFailureAsync(exception.CommittedSave, saveAs, retireHistory);
             return _session?.IsDirty == false;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (Exception exception) when (IsWorkspaceCancellation(exception, cancellationToken))
         {
             RestoreSessionState();
             if (!_lifetimeCancellation.IsCancellationRequested)

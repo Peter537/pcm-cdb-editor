@@ -5,6 +5,7 @@ using System.Text;
 using Microsoft.Data.Sqlite;
 using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
+using static PcmCdbEditor.Application.SchemaIdentifierValidator;
 
 namespace PcmCdbEditor.Infrastructure.Sqlite;
 
@@ -60,7 +61,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
             slice.Request,
             total,
             slice.Rows,
-            slice.Request.Offset + slice.Rows.Count < total);
+            slice.HasMore);
     }
 
     public Task<TableSlice> QueryRowsAsync(
@@ -173,7 +174,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                     break;
                 }
 
-                var values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+                var values = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
                 for (var ordinal = 0; ordinal < columns.Length; ordinal++)
                 {
                     values[columns[ordinal].Name] = ReadValue(reader, ordinal);
@@ -275,7 +276,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 catalog,
                 operation.TableName,
                 operation.Identity,
-                new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase)
+                new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance)
                 {
                     [operation.ColumnName] = operation.NewValue
                 },
@@ -396,7 +397,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
         && table.StableIdentity.Kind == StableIdentityKind.DeclaredPrimaryKey
         && table.StableIdentity.Columns.Count == 1
         && column.IsPrimaryKey
-        && column.DeclaredType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase);
+        && SqliteIdentifierComparer.Instance.Equals(column.DeclaredType, "INTEGER");
 
     private static async Task<RowIdentity> ExecuteInsertReturningIdentityAsync(
         SqliteCommand command,
@@ -643,7 +644,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
             return null;
         }
 
-        var values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        var values = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
         for (var ordinal = 0; ordinal < columns.Length; ordinal++)
         {
             values[columns[ordinal].Name] = ReadValue(reader, ordinal);
@@ -699,7 +700,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
         foreach (TypedRow row in rows)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var relatedValues = new Dictionary<string, RelatedValue>(StringComparer.OrdinalIgnoreCase);
+            var relatedValues = new Dictionary<string, RelatedValue>(SqliteIdentifierComparer.Instance);
             foreach (RelationshipColumn column in projection.Columns)
             {
                 SqliteValue source = row.Values[column.SourceColumn];
@@ -955,7 +956,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
             || identity.Kind != RowIdentityKind.DeclaredPrimaryKey
             || !table.StableIdentity.Columns.SequenceEqual(
                 identity.Components.Select(static component => component.ColumnName),
-                StringComparer.OrdinalIgnoreCase))
+                SqliteIdentifierComparer.Instance))
         {
             throw new InvalidOperationException("The supplied row identity does not match the discovered stable identity.");
         }
@@ -1000,24 +1001,6 @@ public sealed class SqliteTableDataStore : ITableDataStore
         }
 
         return table;
-    }
-
-    private static TableSchema RequireTable(DatabaseSchemaCatalog catalog, string tableName)
-    {
-        ArgumentNullException.ThrowIfNull(catalog);
-        ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
-        return catalog.TryGetTable(tableName, out var table)
-            ? table
-            : throw new ArgumentException($"Table '{tableName}' is not present in the discovered schema.", nameof(tableName));
-    }
-
-    private static ColumnSchema RequireColumn(TableSchema table, string columnName)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(columnName);
-        return table.Columns.FirstOrDefault(column => column.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase))
-            ?? throw new ArgumentException(
-                $"Column '{columnName}' is not present in table '{table.Name}'.",
-                nameof(columnName));
     }
 
     private static SqliteValue ReadValue(SqliteDataReader reader, int ordinal)
@@ -1084,7 +1067,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
             foreach (ColumnSchema column in table.Columns.Where(static column => !column.IsHidden))
             {
                 ForeignKeyRelation[] relations = table.Relationships.Where(relation =>
-                    relation.SourceColumn.Equals(column.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
+                    SqliteIdentifierComparer.Instance.Equals(relation.SourceColumn, column.Name)).ToArray();
                 if (relations.Length == 0 && !column.Name.StartsWith("fkID", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
@@ -1112,7 +1095,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 }
                 else if (!catalog.TryGetTable(relations[0].TargetTable, out TableSchema target)
                     || !target.Columns.Any(key => !key.IsHidden
-                        && key.Name.Equals(relations[0].TargetColumn, StringComparison.OrdinalIgnoreCase)))
+                        && SqliteIdentifierComparer.Instance.Equals(key.Name, relations[0].TargetColumn)))
                 {
                     fallback = RelationshipResolution.TargetUnavailable;
                 }
@@ -1161,7 +1144,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
         private readonly List<SqlParameterValue> _parameters = [];
         private readonly List<string> _commonTables = [];
         private readonly Dictionary<ForeignKeyLookupTarget, string> _lookupNames = [];
-        private readonly Dictionary<string, string> _labels = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> _labels = new(SqliteIdentifierComparer.Instance);
 
         public IReadOnlyList<SqlParameterValue> Parameters => _parameters;
 
@@ -1172,14 +1155,15 @@ public sealed class SqliteTableDataStore : ITableDataStore
             var predicates = new List<string>();
             if (filter is not null)
             {
+                FilterExpressionLimits.Validate(filter);
                 predicates.Add(BuildFilter(filter));
             }
 
             if (search is not null && !string.IsNullOrWhiteSpace(search.Text))
             {
                 var matches = new List<string>();
-                string parameter = Add(SqliteValue.Text($"%{EscapeLike(search.Text)}%"));
-                foreach (string name in search.EligibleColumns.Distinct(StringComparer.OrdinalIgnoreCase))
+                string parameter = Add(SqliteValue.Text($"%{SqliteSupport.EscapeLikeLiteral(search.Text)}%"));
+                foreach (string name in search.EligibleColumns.Distinct(SqliteIdentifierComparer.Instance))
                 {
                     ColumnSchema column = RequireColumn(table, name);
                     string storedValue = $"{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column.Name)}";
@@ -1205,8 +1189,8 @@ public sealed class SqliteTableDataStore : ITableDataStore
         public string BuildOrderBy(IReadOnlyList<SortDescriptor> sorts)
         {
             var descriptors = new List<string>();
-            var storedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var labelColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var storedColumns = new HashSet<string>(SqliteIdentifierComparer.Instance);
+            var labelColumns = new HashSet<string>(SqliteIdentifierComparer.Instance);
             foreach (SortDescriptor sort in sorts)
             {
                 if (!Enum.IsDefined(sort.Direction) || !Enum.IsDefined(sort.Target))
@@ -1244,7 +1228,7 @@ public sealed class SqliteTableDataStore : ITableDataStore
                     .Select(column => $"{QueryProjection.BaseAlias}.{SqliteSupport.QuoteIdentifier(column)} ASC"));
                 if (!table.IsWithoutRowId &&
                     HiddenRowIdAliases.FirstOrDefault(alias => !table.Columns.Any(column =>
-                        column.Name.Equals(alias, StringComparison.OrdinalIgnoreCase))) is { } rowIdAlias)
+                        SqliteIdentifierComparer.Instance.Equals(column.Name, alias))) is { } rowIdAlias)
                 {
                     // Legacy rowid tables can have several NULL primary keys.
                     descriptors.Add($"{QueryProjection.BaseAlias}.{rowIdAlias} ASC");
@@ -1348,9 +1332,9 @@ public sealed class SqliteTableDataStore : ITableDataStore
                 ? SqliteValue.Text(condition.Value.Kind == SqliteValueKind.Text
                     ? condition.Operator switch
                     {
-                        FilterOperator.Contains => $"%{EscapeLike(condition.Value.TextValue ?? string.Empty)}%",
-                        FilterOperator.StartsWith => $"{EscapeLike(condition.Value.TextValue ?? string.Empty)}%",
-                        _ => $"%{EscapeLike(condition.Value.TextValue ?? string.Empty)}"
+                        FilterOperator.Contains => $"%{SqliteSupport.EscapeLikeLiteral(condition.Value.TextValue ?? string.Empty)}%",
+                        FilterOperator.StartsWith => $"{SqliteSupport.EscapeLikeLiteral(condition.Value.TextValue ?? string.Empty)}%",
+                        _ => $"%{SqliteSupport.EscapeLikeLiteral(condition.Value.TextValue ?? string.Empty)}"
                     }
                     : throw new ArgumentException("LIKE filters require text values."))
                 : condition.Value;
@@ -1376,9 +1360,5 @@ public sealed class SqliteTableDataStore : ITableDataStore
             return name;
         }
 
-        private static string EscapeLike(string value) => value
-            .Replace("\\", "\\\\", StringComparison.Ordinal)
-            .Replace("%", "\\%", StringComparison.Ordinal)
-            .Replace("_", "\\_", StringComparison.Ordinal);
     }
 }

@@ -70,6 +70,40 @@ public sealed class MutationWriteAheadTests
         Assert.IsFalse(workspace.ObservedToken.CanBeCanceled);
     }
 
+    [TestMethod]
+    public async Task ACommittedMutationKeepsItsMarkerUntilHistoryIsDurable()
+    {
+        var workspace = new RecordingWorkspaceService();
+        var writeAhead = new MutationWriteAhead(workspace);
+        EditorSessionState prepared = await writeAhead.PrepareAsync(CreateSession()).ConfigureAwait(false);
+        using var releaseHistory = new ManualResetEventSlim();
+        var enteredHistory = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<EditorSessionState> completing = writeAhead.CompleteCommittedAsync(prepared, () =>
+        {
+            enteredHistory.SetResult();
+            if (!releaseHistory.Wait(TimeSpan.FromSeconds(5)))
+            {
+                throw new TimeoutException("The test did not release history persistence.");
+            }
+        });
+        try
+        {
+            await enteredHistory.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            Assert.IsTrue(workspace.LastState!.MutationPending);
+            Assert.IsFalse(completing.IsCompleted);
+        }
+        finally
+        {
+            releaseHistory.Set();
+        }
+        Assert.IsFalse((await completing.ConfigureAwait(false)).MutationPending);
+
+        prepared = await writeAhead.PrepareAsync(CreateSession()).ConfigureAwait(false);
+        await Assert.ThrowsExactlyAsync<IOException>(() => writeAhead.CompleteCommittedAsync(prepared,
+            () => throw new IOException("Injected history write failure."))).ConfigureAwait(false);
+        Assert.IsTrue(workspace.LastState!.MutationPending);
+    }
+
     private static EditorSessionState CreateSession()
     {
         var root = Path.Combine(Path.GetTempPath(), "PcmCdbEditorTests", "write-ahead");
@@ -97,6 +131,8 @@ public sealed class MutationWriteAheadTests
 
         public CancellationToken ObservedToken { get; private set; }
 
+        public EditorSessionState? LastState { get; private set; }
+
         public Task<EditorSessionState> MarkDirtyAsync(
             EditorSessionState session,
             CancellationToken cancellationToken)
@@ -108,7 +144,8 @@ public sealed class MutationWriteAheadTests
             }
 
             MarkDirtyCompleted = true;
-            return Task.FromResult(session with { IsDirty = !ReturnCleanSession });
+            LastState = session with { IsDirty = !ReturnCleanSession };
+            return Task.FromResult(LastState);
         }
 
         public Task<EditorSessionState> OpenAsync(
@@ -135,7 +172,10 @@ public sealed class MutationWriteAheadTests
             CancellationToken cancellationToken,
             SaveDestinationSnapshot? confirmedDestination = null) => throw new NotSupportedException();
 
-        public Task CloseAsync(
+        public Task<EditorSessionState> PersistSavedBaselineAsync(
+            EditorSessionState session, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<WorkspaceCloseResult> CloseAsync(
             EditorSessionState session,
             bool discardDirtySession,
             CancellationToken cancellationToken) => throw new NotSupportedException();
@@ -145,7 +185,7 @@ public sealed class MutationWriteAheadTests
         public Task<IReadOnlyList<RecoverableSession>> GetRecoverableSessionsAsync(
             CancellationToken cancellationToken) => throw new NotSupportedException();
 
-        public Task DiscardRecoverableSessionAsync(
+        public Task<WorkspaceCloseResult> DiscardRecoverableSessionAsync(
             Guid sessionId,
             DateTimeOffset expectedUpdatedAtUtc,
             CancellationToken cancellationToken) => throw new NotSupportedException();

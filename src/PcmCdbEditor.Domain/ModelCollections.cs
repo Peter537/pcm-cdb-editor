@@ -12,7 +12,7 @@ internal static class ModelCollections
     public static ReadOnlyDictionary<string, TValue> FreezeDictionary<TValue>(
         IEnumerable<KeyValuePair<string, TValue>>? values)
     {
-        var copy = new Dictionary<string, TValue>(StringComparer.OrdinalIgnoreCase);
+        var copy = new Dictionary<string, TValue>(SqliteIdentifierComparer.Instance);
         foreach (var pair in values ?? [])
         {
             if (string.IsNullOrWhiteSpace(pair.Key) || pair.Key.Contains('\0', StringComparison.Ordinal))

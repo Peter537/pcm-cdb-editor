@@ -19,8 +19,8 @@ public sealed class SqliteTableCatalog : ITableCatalog
     public SqliteTableCatalog(IReadOnlyDictionary<string, string>? configuredDisplayColumns = null)
     {
         _configuredDisplayColumns = configuredDisplayColumns is null
-            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            : new Dictionary<string, string>(configuredDisplayColumns, StringComparer.OrdinalIgnoreCase);
+            ? new Dictionary<string, string>(SqliteIdentifierComparer.Instance)
+            : new Dictionary<string, string>(configuredDisplayColumns, SqliteIdentifierComparer.Instance);
     }
 
     public Task<DatabaseSchemaCatalog> DiscoverAsync(
@@ -62,7 +62,7 @@ public sealed class SqliteTableCatalog : ITableCatalog
             mutable.Add(new TableBuilder(item, columns, declaredRelationships, identity, editCapability));
         }
 
-        var tablesByName = mutable.ToDictionary(static item => item.Object.Name, StringComparer.OrdinalIgnoreCase);
+        var tablesByName = mutable.ToDictionary(static item => item.Object.Name, SqliteIdentifierComparer.Instance);
         foreach (var table in mutable)
         {
             ResolveDeclaredRelationships(table, tablesByName);
@@ -93,7 +93,7 @@ public sealed class SqliteTableCatalog : ITableCatalog
 SELECT name, type, wr
 FROM pragma_table_list
 WHERE schema = 'main'
-  AND name NOT LIKE 'sqlite_%'
+  AND name NOT LIKE 'sqlite!_%' ESCAPE '!'
 ORDER BY name COLLATE NOCASE, name";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -202,7 +202,7 @@ ORDER BY name COLLATE NOCASE, name";
         // shadows the hidden value and can contain duplicate or NULL values, so treating
         // it as an identity could update or delete more than one physical row.
         bool hasShadowingRowIdColumn = columns.Any(static column =>
-            column.Name.Equals("rowid", StringComparison.OrdinalIgnoreCase));
+            SqliteIdentifierComparer.Instance.Equals(column.Name, "rowid"));
         if (schemaObject.Kind == TableObjectKind.Table
             && !schemaObject.IsWithoutRowId
             && !hasShadowingRowIdColumn)
@@ -263,7 +263,7 @@ ORDER BY name COLLATE NOCASE, name";
     {
         var declaredColumns = source.Relationships
             .Select(static relationship => relationship.SourceColumn)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            .ToHashSet(SqliteIdentifierComparer.Instance);
         foreach (var column in source.Columns)
         {
             if (column.IsHidden || declaredColumns.Contains(column.Name)
@@ -274,8 +274,8 @@ ORDER BY name COLLATE NOCASE, name";
             }
 
             var suffix = column.Name[4..];
-            if (source.Object.Name.Equals("DYN_result_season", StringComparison.OrdinalIgnoreCase)
-                && column.Name.Equals("fkIDresult_season_team", StringComparison.OrdinalIgnoreCase)
+            if (SqliteIdentifierComparer.Instance.Equals(source.Object.Name, "DYN_result_season")
+                && SqliteIdentifierComparer.Instance.Equals(column.Name, "fkIDresult_season_team")
                 && tablesByName.TryGetValue("DYN_result_season_team", out var configuredTarget)
                 && FindVisibleColumn(configuredTarget, "IDresult_season_team") is { } configuredKey)
             {
@@ -285,8 +285,8 @@ ORDER BY name COLLATE NOCASE, name";
 
             var candidates = FindNameMatches(suffix, tablesByName).ToList();
             string confidence = "conservative-name-match";
-            if (source.Object.Name.Equals("DYN_contract_cyclist", StringComparison.OrdinalIgnoreCase)
-                && column.Name.Equals("fkIDprevteam", StringComparison.OrdinalIgnoreCase)
+            if (SqliteIdentifierComparer.Instance.Equals(source.Object.Name, "DYN_contract_cyclist")
+                && SqliteIdentifierComparer.Instance.Equals(column.Name, "fkIDprevteam")
                 && column.Affinity == SqliteAffinity.Integer
                 && tablesByName.TryGetValue("DYN_team", out var team)
                 && FindVisibleColumn(team, "IDteam") is { Affinity: SqliteAffinity.Integer })
@@ -345,7 +345,7 @@ ORDER BY name COLLATE NOCASE, name";
             return (configuredLabel.Name, null);
         }
 
-        if (target.Object.Name.Equals("DYN_cyclist", StringComparison.OrdinalIgnoreCase)
+        if (SqliteIdentifierComparer.Instance.Equals(target.Object.Name, "DYN_cyclist")
             && FindVisibleColumn(target, "gene_sz_firstname") is { } firstName
             && FindVisibleColumn(target, "gene_sz_lastname") is { } lastName)
         {
@@ -364,7 +364,7 @@ ORDER BY name COLLATE NOCASE, name";
     }
 
     private static ColumnSchema? FindVisibleColumn(TableBuilder table, string name) =>
-        table.Columns.FirstOrDefault(column => !column.IsHidden && column.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        table.Columns.FirstOrDefault(column => !column.IsHidden && SqliteIdentifierComparer.Instance.Equals(column.Name, name));
 
     private static SqliteAffinity ResolveAffinity(string declaredType)
     {

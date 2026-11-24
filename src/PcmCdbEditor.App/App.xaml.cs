@@ -44,6 +44,7 @@ public partial class App : Microsoft.UI.Xaml.Application
             workspaceService,
             tableCatalog,
             tableDataStore,
+            new PcmCdbEditor.Infrastructure.History.SqliteEditOperationReplayer(),
             new SqliteRelationshipLookup(),
             riderRecoveryService,
             riderCreationService,

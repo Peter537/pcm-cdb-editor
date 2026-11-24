@@ -54,7 +54,10 @@ public sealed record WorkspaceSaveResult(EditorSessionState Session, string? Bac
     public bool DestinationChangedAtCommit { get; init; }
 }
 
-public sealed record RecoverableSession(EditorSessionState Session, string Description);
+public sealed record WorkspaceCloseResult(string? RemainingDirectory);
+
+public sealed record RecoverableSession(
+    EditorSessionState Session, string Description, bool RequiresJournalRecovery = false);
 
 public interface IWorkspaceService
 {
@@ -77,14 +80,17 @@ public interface IWorkspaceService
 
     Task<EditorSessionState> MarkDirtyAsync(EditorSessionState session, CancellationToken cancellationToken);
 
-    Task CloseAsync(EditorSessionState session, bool discardDirtySession, CancellationToken cancellationToken);
+    Task<EditorSessionState> PersistSavedBaselineAsync(
+        EditorSessionState session, CancellationToken cancellationToken);
+
+    Task<WorkspaceCloseResult> CloseAsync(EditorSessionState session, bool discardDirtySession, CancellationToken cancellationToken);
 
     /// <summary>Releases this editor's ownership while keeping the working files available for recovery.</summary>
     void ReleaseSession(Guid sessionId);
 
     Task<IReadOnlyList<RecoverableSession>> GetRecoverableSessionsAsync(CancellationToken cancellationToken);
 
-    Task DiscardRecoverableSessionAsync(Guid sessionId, DateTimeOffset expectedUpdatedAtUtc, CancellationToken cancellationToken);
+    Task<WorkspaceCloseResult> DiscardRecoverableSessionAsync(Guid sessionId, DateTimeOffset expectedUpdatedAtUtc, CancellationToken cancellationToken);
 
     Task CleanCompletedSessionsAsync(CancellationToken cancellationToken);
 }
@@ -188,6 +194,9 @@ public interface ISettingsStore
     Task<EditorPreferences> LoadPreferencesAsync(CancellationToken cancellationToken);
 
     Task SavePreferencesAsync(EditorPreferences preferences, CancellationToken cancellationToken);
+    Task<EditorPreferences> UpdatePreferencesAsync(
+        Func<EditorPreferences, EditorPreferences> update,
+        CancellationToken cancellationToken);
 
     Task<TableViewState?> LoadTableViewStateAsync(string schemaSignature, string tableName, CancellationToken cancellationToken);
 
@@ -213,7 +222,7 @@ public sealed record GridSelection(RowIdentity? CurrentRow, string? CurrentColum
     public (int Index, TypedRow Row)? ReadOnlyCell { get; init; }
 }
 
-public sealed record GridViewport(RowIdentity? FirstVisibleRow, int HorizontalOffset)
+public sealed record GridViewport(RowIdentity? FirstVisibleRow, double HorizontalOffset)
 {
     public (int Index, TypedRow Row)? ReadOnlyFirstRow { get; init; }
 }
@@ -228,11 +237,7 @@ public interface ITableGridAdapter
 
     GridViewport CaptureViewport();
 
-    void Bind(
-        TableSchema schema,
-        IReadOnlyList<TypedRow> rows,
-        TableViewState? state,
-        ForeignKeyDisplayMode displayMode);
+    void Bind(GridPagePresentation page, TableViewState? state);
 
     void RestoreSelection(GridSelection selection);
 

@@ -44,7 +44,7 @@ public sealed class RowIdentity : IEquatable<RowIdentity>
             throw new ArgumentException("A row identity needs at least one component.", nameof(components));
         }
 
-        if (Components.Select(component => component.ColumnName).Distinct(StringComparer.OrdinalIgnoreCase).Count() != Components.Count)
+        if (Components.Select(component => component.ColumnName).Distinct(SqliteIdentifierComparer.Instance).Count() != Components.Count)
         {
             throw new ArgumentException("A row identity cannot repeat a column.", nameof(components));
         }
@@ -77,7 +77,12 @@ public sealed class RowIdentity : IEquatable<RowIdentity>
         foreach (var component in Components)
         {
             value.Append('|');
-            value.Append(component.ColumnName);
+            value.Append(component.ColumnName.Length);
+            value.Append(':');
+            foreach (char character in component.ColumnName)
+            {
+                value.Append(SqliteIdentifierComparer.Fold(character));
+            }
             value.Append('=');
             value.Append(component.Value.ToCanonicalText());
         }

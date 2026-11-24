@@ -69,7 +69,7 @@ internal static class FakeConverterProgram
             return 0;
         }
 
-        if (mode == "spawn-child")
+        if (mode == "spawn-child" || mode == "exit-after-child")
         {
             WriteProcessId(root, "parent.pid");
             Process child = Process.Start(new ProcessStartInfo
@@ -87,7 +87,25 @@ internal static class FakeConverterProgram
 
             Console.Out.WriteLine("child started");
             Console.Out.Flush();
-            Thread.Sleep(Timeout.Infinite);
+            if (mode == "spawn-child")
+            {
+                Thread.Sleep(Timeout.Infinite);
+            }
+            else
+            {
+                // Allow deterministic observation that the descendant is alive before exit.
+                var deadline = Stopwatch.StartNew();
+                while (!File.Exists(Path.Combine(root, "child.pid")) && deadline.ElapsedMilliseconds < 2000)
+                {
+                    Thread.Sleep(10);
+                }
+            }
+            return 0;
+        }
+
+        if (mode == "copy-snapshot")
+        {
+            File.Copy(arguments[2] + ".sqlite", outputPath);
             return 0;
         }
 

@@ -197,7 +197,7 @@ public sealed class TableGridAdapterSourceTests
     }
 
     [TestMethod]
-    public void ViewportRestoreDefersPastTheBindAndUsesTableViewHorizontalOffset()
+    public void ViewportRestoreDefersPastTheBindAndUsesTheSharedHorizontalPosition()
     {
         string source = File.ReadAllText(GetAdapterSourcePath());
         int viewportStart = source.IndexOf(
@@ -247,17 +247,8 @@ public sealed class TableGridAdapterSourceTests
             "GridControl.ScrollIntoView(first);",
             StringComparison.Ordinal);
         int horizontalRestore = viewportBody.IndexOf(
-            "GridControl.SetValue(",
+            "GridControl.SetHorizontalPosition(viewport.HorizontalOffset);",
             StringComparison.Ordinal);
-        int horizontalOffsetProperty = viewportBody.IndexOf(
-            "WinUI.TableView.TableView.HorizontalOffsetProperty",
-            StringComparison.Ordinal);
-        int horizontalOffsetValue = horizontalOffsetProperty < 0
-            ? -1
-            : viewportBody.IndexOf(
-                "viewport.HorizontalOffset",
-                horizontalOffsetProperty,
-                StringComparison.Ordinal);
 
         Assert.IsTrue(generationCapture >= 0, "Deferred restoration must capture the current bind generation.");
         Assert.IsTrue(enqueue > generationCapture, "Viewport restoration must be deferred until rows are realized.");
@@ -282,15 +273,7 @@ public sealed class TableGridAdapterSourceTests
         Assert.IsTrue(
             horizontalRestore > verticalRestore,
             "Horizontal offset restoration must follow the vertical ScrollIntoView operation.");
-        Assert.IsTrue(
-            horizontalOffsetProperty > horizontalRestore && horizontalOffsetValue > horizontalOffsetProperty,
-            "The adapter must restore TableView's horizontal-offset dependency property.");
-        Assert.IsFalse(
-            source.Contains("FindDescendantScrollViewer", StringComparison.Ordinal),
-            "Viewport restoration must not target an arbitrary descendant ScrollViewer.");
-        Assert.IsFalse(
-            viewportBody.Contains("ChangeView(", StringComparison.Ordinal),
-            "TableView horizontal position must not be restored through ScrollViewer.ChangeView.");
+        StringAssert.Contains(source, "new GridViewport(first.Identity, GridControl.HorizontalOffset)", StringComparison.Ordinal);
     }
 
     [TestMethod]
@@ -315,7 +298,7 @@ public sealed class TableGridAdapterSourceTests
         int neutralizeForBind = bindBody.IndexOf(
             "NeutralizeHorizontalOffsetForColumnTopologyChange();",
             StringComparison.Ordinal);
-        int replaceRows = bindBody.IndexOf("_rowSource.Replace(", StringComparison.Ordinal);
+        int replaceRows = bindBody.IndexOf("_rows = page.Rows;", StringComparison.Ordinal);
         int detachRows = bindBody.IndexOf("GridControl.ItemsSource = null;", StringComparison.Ordinal);
         int rebuildColumns = bindBody.IndexOf("RebuildColumns(", StringComparison.Ordinal);
         Assert.IsTrue(captureViewport >= 0, "The outgoing viewport must be captured before rebinding.");
@@ -336,11 +319,7 @@ public sealed class TableGridAdapterSourceTests
             neutralizeForClear >= 0 && clearRows > neutralizeForClear && clearColumns > clearRows,
             "Clearing the grid must neutralize the horizontal offset before removing its topology.");
 
-        StringAssert.Contains(
-            clearBody,
-            "WinUI.TableView.TableView.HorizontalOffsetProperty",
-            StringComparison.Ordinal);
-        StringAssert.Contains(clearBody, "0d", StringComparison.Ordinal);
+        StringAssert.Contains(clearBody, "GridControl.SetHorizontalPosition(0);", StringComparison.Ordinal);
     }
 
     [TestMethod]

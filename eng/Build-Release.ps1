@@ -3,24 +3,22 @@ param(
     [ValidateSet('0.1.0')]
     [string] $Version = '0.1.0',
 
-    [string] $OutputRoot
+    [string] $OutputRoot,
+
+    [switch] $RequireCleanSource
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$solutionPath = Join-Path $repositoryRoot 'PcmCdbEditor.slnx'
-$appProjectPath = Join-Path $repositoryRoot 'src\PcmCdbEditor.App\PcmCdbEditor.App.csproj'
-$unitTestsPath = Join-Path $repositoryRoot 'tests\PcmCdbEditor.UnitTests\PcmCdbEditor.UnitTests.csproj'
-$integrationTestsPath = Join-Path $repositoryRoot 'tests\PcmCdbEditor.IntegrationTests\PcmCdbEditor.IntegrationTests.csproj'
-$nugetConfigPath = Join-Path $repositoryRoot 'NuGet.Config'
-$installerScriptPath = Join-Path $repositoryRoot 'installer\PcmCdbEditor.iss'
-$verifyScriptPath = Join-Path $PSScriptRoot 'Verify-Release.ps1'
+$sourceCheckout = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 
-$requiredSdkVersion = '10.0.303'
-$runtimeFrameworkVersion = '10.0.11'
+$requiredSdkVersion = '10.0.403'
+$runtimeFrameworkVersion = '10.0.15'
+. (Join-Path $PSScriptRoot 'Release-RuntimePolicy.ps1')
+. (Join-Path $PSScriptRoot 'Release-Filesystem.ps1')
+. (Join-Path $PSScriptRoot 'Release-Source.ps1')
 $runtimeIdentifier = 'win-x64'
 $innoVersion = '7.1.0'
 $innoReleaseTag = 'is-7_1_0'
@@ -30,83 +28,6 @@ $innoInstallerSha256 = '0362A383ED217D4C4239B5933866DD96D3EB2102737DA92F80F6057A
 $exporterSha256 = '5F1F3F72C5BF5537E74DE1A0FC732B1CBDF191E6CA3A3E9A12F18BBE15C1951D'
 $exporterReadmeSha256 = 'CF05919B2BDB7873F4CAFAA98126F2143195BFF1D0A937EF55B00E164EF7DED6'
 $sbomToolManifestSha256 = '2935CC70C9DB2DD0C8D97B3978DA236929BB3CD1531BE5B59525B54EE0A72CB8'
-
-function Assert-DescendantPath {
-    param(
-        [Parameter(Mandatory = $true)][string] $Child,
-        [Parameter(Mandatory = $true)][string] $Parent,
-        [Parameter(Mandatory = $true)][string] $Purpose
-    )
-
-    $childFullPath = [System.IO.Path]::GetFullPath($Child)
-    $parentFullPath = [System.IO.Path]::GetFullPath($Parent).TrimEnd('\', '/')
-    $prefix = "$parentFullPath$([System.IO.Path]::DirectorySeparatorChar)"
-    if (-not $childFullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "$Purpose must be below $parentFullPath; resolved path was $childFullPath."
-    }
-}
-
-function Assert-NoReparsePointInDirectoryChain {
-    param(
-        [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)][string] $Root,
-        [Parameter(Mandatory = $true)][string] $Purpose
-    )
-
-    $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
-    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
-    $rootPrefix = "$rootFull$([System.IO.Path]::DirectorySeparatorChar)"
-    if (-not $pathFull.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -and
-        -not $pathFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "$Purpose escaped its approved root: $pathFull"
-    }
-
-    $current = $pathFull
-    while ($true) {
-        if ([System.IO.Directory]::Exists($current)) {
-            $directory = New-Object System.IO.DirectoryInfo($current)
-            if (($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "$Purpose must not traverse a reparse point: $current"
-            }
-        }
-
-        if ($current.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-            break
-        }
-
-        $parent = [System.IO.Path]::GetDirectoryName($current)
-        if ([string]::IsNullOrWhiteSpace($parent) -or $parent.Equals($current, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "$Purpose could not be resolved safely below $rootFull."
-        }
-        $current = $parent.TrimEnd('\', '/')
-    }
-}
-
-function Assert-NoReparsePointInDirectoryTree {
-    param(
-        [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)][string] $Purpose
-    )
-
-    $root = New-Object System.IO.DirectoryInfo([System.IO.Path]::GetFullPath($Path))
-    if (-not $root.Exists) {
-        throw "$Purpose directory does not exist: $($root.FullName)"
-    }
-
-    $pending = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
-    $pending.Push($root)
-    while ($pending.Count -gt 0) {
-        $directory = $pending.Pop()
-        foreach ($entry in $directory.EnumerateFileSystemInfos()) {
-            if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "$Purpose must not contain a reparse point: $($entry.FullName)"
-            }
-            if (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
-                $pending.Push((New-Object System.IO.DirectoryInfo($entry.FullName)))
-            }
-        }
-    }
-}
 
 function Invoke-Checked {
     param(
@@ -196,126 +117,6 @@ function Get-RelativePath {
     [System.Uri] $targetUri = $targetFullPath
     $relativeUri = $baseUri.MakeRelativeUri($targetUri)
     return [System.Uri]::UnescapeDataString($relativeUri.ToString()).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
-}
-
-function Get-StringSha256 {
-    param([Parameter(Mandatory = $true)][string] $Value)
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
-    $algorithm = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        return [System.BitConverter]::ToString($algorithm.ComputeHash($bytes)).Replace('-', '')
-    }
-    finally {
-        $algorithm.Dispose()
-    }
-}
-
-function Get-SourceManifestFiles {
-    $sourceDirectories = @(
-        '.config',
-        'docs',
-        'eng',
-        'installer',
-        'src',
-        'tests',
-        'third_party'
-    )
-    $sourceRootFiles = @(
-        '.editorconfig',
-        '.gitattributes',
-        '.gitignore',
-        'Directory.Build.props',
-        'Directory.Build.targets',
-        'Directory.Packages.props',
-        'global.json',
-        'LICENSE',
-        'NuGet.Config',
-        'PcmCdbEditor.slnx',
-        'README.md',
-        'THIRD_PARTY_NOTICES.md'
-    )
-    $skipDirectories = New-Object 'System.Collections.Generic.HashSet[string]' (
-        [System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($name in @(
-            'bin',
-            'obj',
-            'artifacts',
-            '.git',
-            '.nuget',
-            '.tools',
-            'TestResults',
-            'output',
-            'out',
-            'publish',
-            'dist',
-            'tools',
-            'cache',
-            '.cache',
-            'local-smoke',
-            'sessions',
-            'backups')) {
-        [void]$skipDirectories.Add($name)
-    }
-    $files = New-Object 'System.Collections.Generic.List[System.IO.FileInfo]'
-
-    foreach ($relativeDirectory in $sourceDirectories) {
-        $fullDirectory = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot $relativeDirectory))
-        if (-not [System.IO.Directory]::Exists($fullDirectory)) {
-            throw "Source-manifest directory is missing: $relativeDirectory"
-        }
-
-        $rootDirectory = New-Object System.IO.DirectoryInfo($fullDirectory)
-        if (($rootDirectory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Source-manifest directory must not be a reparse point: $relativeDirectory"
-        }
-
-        $pending = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
-        $pending.Push($rootDirectory)
-        while ($pending.Count -gt 0) {
-            $directory = $pending.Pop()
-            foreach ($file in $directory.EnumerateFiles()) {
-                if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    throw "Source-manifest file must not be a reparse point: $($file.FullName)"
-                }
-                $files.Add($file)
-            }
-
-            foreach ($child in $directory.EnumerateDirectories()) {
-                if ($skipDirectories.Contains($child.Name)) {
-                    continue
-                }
-                if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    throw "Source-manifest directory must not be a reparse point: $($child.FullName)"
-                }
-                $pending.Push($child)
-            }
-        }
-    }
-
-    foreach ($relativeFile in $sourceRootFiles) {
-        $fullPath = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot $relativeFile))
-        if (-not [System.IO.File]::Exists($fullPath)) {
-            throw "Source-manifest file is missing: $relativeFile"
-        }
-        $files.Add((New-Object System.IO.FileInfo($fullPath)))
-    }
-
-    $recordsByPath = New-Object 'System.Collections.Generic.SortedDictionary[string,object]' (
-        [System.StringComparer]::Ordinal)
-    foreach ($file in $files) {
-        $relativePath = (Get-RelativePath -BasePath $repositoryRoot -TargetPath $file.FullName).Replace('\', '/')
-        if ($recordsByPath.ContainsKey($relativePath)) {
-            throw "Source-manifest path was discovered twice: $relativePath"
-        }
-        $recordsByPath.Add($relativePath, [pscustomobject]@{
-                Path = $relativePath
-                Size = $file.Length
-                Sha256 = Get-Sha256 -Path $file.FullName
-            })
-    }
-
-    return @($recordsByPath.Values)
 }
 
 function Write-Utf8NoBom {
@@ -569,355 +370,384 @@ function Copy-ComponentEvidence {
     }
 }
 
+$initialGit = Get-ReleaseGitState -Root $sourceCheckout
+$sourceCommit = $initialGit.Commit
+$gitStatus = $initialGit.Status
+if ($RequireCleanSource -and $gitStatus.Count -ne 0) {
+    throw 'A release-eligible build requires a clean source checkout.'
+}
+$sourceFiles = @(Get-SourceManifestFiles -Root $sourceCheckout)
+$sourceTreeSha256 = Get-ReleaseSourceDigest -Files $sourceFiles
+
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
-    $OutputRoot = Join-Path $repositoryRoot 'artifacts\release'
+    $OutputRoot = Join-Path $sourceCheckout 'artifacts\release'
 }
 
 $outputRootFullPath = [System.IO.Path]::GetFullPath($OutputRoot)
-$artifactsRoot = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'artifacts'))
+$artifactsRoot = [System.IO.Path]::GetFullPath((Join-Path $sourceCheckout 'artifacts'))
 Assert-DescendantPath -Child $outputRootFullPath -Parent $artifactsRoot -Purpose 'Release output root'
-[System.IO.Directory]::CreateDirectory($outputRootFullPath) | Out-Null
 Assert-NoReparsePointInDirectoryChain -Path $outputRootFullPath -Root $artifactsRoot -Purpose 'Release output root'
+[System.IO.Directory]::CreateDirectory($outputRootFullPath) | Out-Null
 
-$releaseDirectory = [System.IO.Path]::GetFullPath((Join-Path $outputRootFullPath $Version))
-Assert-DescendantPath -Child $releaseDirectory -Parent $outputRootFullPath -Purpose 'Versioned release directory'
-if ([System.IO.Directory]::Exists($releaseDirectory)) {
-    Assert-NoReparsePointInDirectoryChain -Path $releaseDirectory -Root $artifactsRoot -Purpose 'Versioned release cleanup'
-    Assert-NoReparsePointInDirectoryTree -Path $releaseDirectory -Purpose 'Versioned release cleanup'
-    Remove-Item -LiteralPath $releaseDirectory -Recurse -Force
+$publishedDirectory = Join-Path $outputRootFullPath $Version
+Assert-DescendantPath -Child $publishedDirectory -Parent $outputRootFullPath -Purpose 'Versioned release directory'
+$runId = [Guid]::NewGuid().ToString('N').Substring(0, 16)
+$runRoot = Join-Path $artifactsRoot ".r-$runId"
+if (Test-Path -LiteralPath $runRoot) {
+    throw 'The generated release scratch directory already exists.'
 }
+$previousNugetPackages = $env:NUGET_PACKAGES
+$locationPushed = $false
+try {
+    [System.IO.Directory]::CreateDirectory($runRoot) | Out-Null
+    Write-Host "Release scratch directory: $runRoot"
+    $repositoryRoot = Join-Path $runRoot 's'
+    $releaseDirectory = Join-Path $runRoot 'c'
+    $buildDirectory = Join-Path $runRoot 'b'
+    $toolsDirectory = Join-Path $runRoot 't'
+    $publishDirectory = Join-Path $buildDirectory 'publish'
+    $componentEvidenceDirectory = Join-Path $buildDirectory 'component-evidence'
 
-$buildDirectory = Join-Path $releaseDirectory '_build'
-$toolsDirectory = Join-Path $releaseDirectory '_tools'
-$publishDirectory = Join-Path $buildDirectory 'publish'
-$componentEvidenceDirectory = Join-Path $buildDirectory 'component-evidence'
-$payloadDirectory = Join-Path $releaseDirectory 'payload'
-$packagesDirectory = Join-Path $releaseDirectory 'packages'
-$metadataDirectory = Join-Path $releaseDirectory 'metadata'
-$sbomDirectory = Join-Path $metadataDirectory 'sbom'
-$checksumsPath = Join-Path $releaseDirectory 'SHA256SUMS.txt'
-$vulnerabilityAuditPath = Join-Path $metadataDirectory 'dependency-vulnerabilities.json'
+    $sourceMode = 'WorkingTreeSnapshot'
+    $cleanCommit = ''
+    if ($gitStatus.Count -eq 0) {
+        $sourceMode = 'CommittedSnapshot'
+        $cleanCommit = $sourceCommit
+    }
+    Copy-ReleaseSourceSnapshot -Root $sourceCheckout -Destination $repositoryRoot -Files $sourceFiles -CleanCommit $cleanCommit
+    Assert-ReleaseSnapshot -Root $repositoryRoot -Files $sourceFiles -TreeSha256 $sourceTreeSha256 -BeforeBuild
+    Assert-ReleaseSourceState -Root $sourceCheckout -Commit $sourceCommit -StatusSha256 $initialGit.StatusSha256 -TreeSha256 $sourceTreeSha256
+    Push-Location -LiteralPath $repositoryRoot
+    $locationPushed = $true
+    $env:NUGET_PACKAGES = Join-Path $sourceCheckout '.nuget\packages'
 
-foreach ($directory in @($buildDirectory, $toolsDirectory, $publishDirectory, $payloadDirectory, $packagesDirectory, $metadataDirectory, $sbomDirectory)) {
-    [System.IO.Directory]::CreateDirectory($directory) | Out-Null
-}
+    $solutionPath = Join-Path $repositoryRoot 'PcmCdbEditor.slnx'
+    $appProjectPath = Join-Path $repositoryRoot 'src\PcmCdbEditor.App\PcmCdbEditor.App.csproj'
+    $unitTestsPath = Join-Path $repositoryRoot 'tests\PcmCdbEditor.UnitTests\PcmCdbEditor.UnitTests.csproj'
+    $integrationTestsPath = Join-Path $repositoryRoot 'tests\PcmCdbEditor.IntegrationTests\PcmCdbEditor.IntegrationTests.csproj'
+    $nugetConfigPath = Join-Path $repositoryRoot 'NuGet.Config'
+    $installerScriptPath = Join-Path $repositoryRoot 'installer\PcmCdbEditor.iss'
+    $verifyScriptPath = Join-Path $repositoryRoot 'eng\Verify-Release.ps1'
+    $payloadDirectory = Join-Path $releaseDirectory 'payload'
+    $packagesDirectory = Join-Path $releaseDirectory 'packages'
+    $metadataDirectory = Join-Path $releaseDirectory 'metadata'
+    $sbomDirectory = Join-Path $metadataDirectory 'sbom'
+    $checksumsPath = Join-Path $releaseDirectory 'SHA256SUMS.txt'
+    $vulnerabilityAuditPath = Join-Path $metadataDirectory 'dependency-vulnerabilities.json'
 
-$sdkVersion = (& dotnet --version).Trim()
-if ($LASTEXITCODE -ne 0 -or $sdkVersion -ne $requiredSdkVersion) {
-    throw "Release builds require .NET SDK $requiredSdkVersion exactly; found '$sdkVersion'."
-}
+    foreach ($directory in @($buildDirectory, $toolsDirectory, $publishDirectory, $payloadDirectory, $packagesDirectory, $metadataDirectory, $sbomDirectory)) {
+        [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    }
 
-Assert-NuGetConfiguration
-Assert-SbomToolManifest
+    $sdkVersion = (& dotnet --version).Trim()
+    if ($LASTEXITCODE -ne 0 -or $sdkVersion -ne $requiredSdkVersion) {
+        throw "Release builds require .NET SDK $requiredSdkVersion exactly; found '$sdkVersion'."
+    }
 
-Invoke-Checked -FilePath 'dotnet' -Description 'Restore repository-local tools' -Arguments @(
-    'tool', 'restore', '--configfile', $nugetConfigPath
-)
+    Assert-NuGetConfiguration
+    Assert-SbomToolManifest
+    $runtimeSecurity = Get-RuntimeSecurityEvidence -RuntimeVersion $runtimeFrameworkVersion
 
-Invoke-Checked -FilePath 'dotnet' -Description 'Restore the locked solution graph' -Arguments @(
-    'restore', $solutionPath,
-    '--locked-mode',
-    '--configfile', $nugetConfigPath,
-    '--disable-parallel',
-    '--disable-build-servers',
-    '-p:RestoreUseStaticGraphEvaluation=false',
-    '-p:BuildInParallel=false',
-    '-m:1'
-)
+    Invoke-Checked -FilePath 'dotnet' -Description 'Restore repository-local tools' -Arguments @(
+        'tool', 'restore', '--configfile', $nugetConfigPath
+    )
 
-# A solution-level RID restore is unsupported, but self-contained publish needs the
-# app and all project references restored with the concrete RID so the pinned
-# runtime/apphost packs are downloaded before --no-restore publish.
-Invoke-Checked -FilePath 'dotnet' -Description 'Restore the locked app graph for win-x64 publish' -Arguments @(
-    'restore', $appProjectPath,
-    '--runtime', $runtimeIdentifier,
-    '--locked-mode',
-    '--configfile', $nugetConfigPath,
-    '--disable-parallel',
-    '--disable-build-servers',
-    '-p:RestoreUseStaticGraphEvaluation=false',
-    '-p:BuildInParallel=false',
-    '-m:1'
-)
+    Invoke-Checked -FilePath 'dotnet' -Description 'Restore the locked solution graph' -Arguments @(
+        'restore', $solutionPath,
+        '--locked-mode',
+        '--configfile', $nugetConfigPath,
+        '--disable-parallel',
+        '--disable-build-servers',
+        '-p:RestoreUseStaticGraphEvaluation=false',
+        '-p:BuildInParallel=false',
+        '-m:1'
+    )
 
-Invoke-NuGetVulnerabilityAudit -OutputPath $vulnerabilityAuditPath
+    # A solution-level RID restore is unsupported, but self-contained publish needs the
+    # app and all project references restored with the concrete RID so the pinned
+    # runtime/apphost packs are downloaded before --no-restore publish.
+    Invoke-Checked -FilePath 'dotnet' -Description 'Restore the locked app graph for win-x64 publish' -Arguments @(
+        'restore', $appProjectPath,
+        '--runtime', $runtimeIdentifier,
+        '--locked-mode',
+        '--configfile', $nugetConfigPath,
+        '--disable-parallel',
+        '--disable-build-servers',
+        '-p:RestoreUseStaticGraphEvaluation=false',
+        '-p:BuildInParallel=false',
+        '-m:1'
+    )
 
-Invoke-Checked -FilePath 'dotnet' -Description 'Build the complete solution' -Arguments @(
-    'build', $solutionPath,
-    '--configuration', 'Release',
-    '--no-restore',
-    '--disable-build-servers',
-    '-m:1',
-    '-p:ContinuousIntegrationBuild=true',
-    '-p:Platform=x64'
-)
+    Invoke-NuGetVulnerabilityAudit -OutputPath $vulnerabilityAuditPath
 
-foreach ($testProject in @($unitTestsPath, $integrationTestsPath)) {
-    Invoke-Checked -FilePath 'dotnet' -Description "Test $(Split-Path -Leaf $testProject)" -Arguments @(
-        'test', $testProject,
+    Invoke-Checked -FilePath 'dotnet' -Description 'Build the complete solution' -Arguments @(
+        'build', $solutionPath,
         '--configuration', 'Release',
-        '--no-build',
         '--no-restore',
+        '--disable-build-servers',
+        '-m:1',
+        '-p:ContinuousIntegrationBuild=true',
+        '-p:Platform=x64'
+    )
+
+    foreach ($testProject in @($unitTestsPath, $integrationTestsPath)) {
+        $testArguments = @('test', $testProject, '--configuration', 'Release', '--no-build', '--no-restore', '--disable-build-servers', '-m:1')
+        if ($testProject -eq $integrationTestsPath) {
+            $testArguments += @('--filter', 'TestCategory!=AuthorizedLocalSmoke')
+        }
+        Invoke-Checked -FilePath 'dotnet' -Description "Test $(Split-Path -Leaf $testProject)" -Arguments $testArguments
+    }
+
+    Invoke-Checked -FilePath 'dotnet' -Description 'Publish the self-contained win-x64 payload' -Arguments @(
+        'publish', $appProjectPath,
+        '--configuration', 'Release',
+        '--runtime', $runtimeIdentifier,
+        '--self-contained', 'true',
+        '--no-restore',
+        '--output', $publishDirectory,
+        '-p:WindowsAppSDKSelfContained=true',
+        '-p:WindowsPackageType=None',
+        '-p:PublishSingleFile=false',
+        '-p:PublishTrimmed=false',
+        '-p:PublishReadyToRun=false',
+        '-p:PublishAot=false',
         '--disable-build-servers',
         '-m:1'
     )
-}
 
-Invoke-Checked -FilePath 'dotnet' -Description 'Publish the self-contained win-x64 payload' -Arguments @(
-    'publish', $appProjectPath,
-    '--configuration', 'Release',
-    '--runtime', $runtimeIdentifier,
-    '--self-contained', 'true',
-    '--no-restore',
-    '--output', $publishDirectory,
-    '-p:WindowsAppSDKSelfContained=true',
-    '-p:WindowsPackageType=None',
-    '-p:PublishSingleFile=false',
-    '-p:PublishTrimmed=false',
-    '-p:PublishReadyToRun=false',
-    '-p:PublishAot=false',
-    '--disable-build-servers',
-    '-m:1'
-)
+    Copy-DirectoryContents -Source $publishDirectory -Destination $payloadDirectory
 
-Copy-DirectoryContents -Source $publishDirectory -Destination $payloadDirectory
-
-$thirdPartySource = Join-Path $repositoryRoot 'third_party\SQLiteExporter'
-$exporterSource = Join-Path $thirdPartySource 'SQLiteExporter.exe'
-$exporterReadmeSource = Join-Path $thirdPartySource 'Readme.pdf'
-if (-not [System.IO.File]::Exists($exporterSource) -or -not [System.IO.File]::Exists($exporterReadmeSource)) {
-    throw 'The approved SQLiteExporter.exe and Readme.pdf are required under third_party\SQLiteExporter.'
-}
-
-if ((Get-Sha256 -Path $exporterSource) -ne $exporterSha256) {
-    throw 'Source SQLiteExporter.exe does not match the approved SHA-256.'
-}
-
-if ((Get-Sha256 -Path $exporterReadmeSource) -ne $exporterReadmeSha256) {
-    throw 'Source SQLiteExporter Readme.pdf does not match the approved SHA-256.'
-}
-
-$thirdPartyPayload = Join-Path $payloadDirectory 'third_party\SQLiteExporter'
-[System.IO.Directory]::CreateDirectory($thirdPartyPayload) | Out-Null
-Copy-Item -LiteralPath $exporterSource -Destination (Join-Path $thirdPartyPayload 'SQLiteExporter.exe') -Force
-Copy-Item -LiteralPath $exporterReadmeSource -Destination (Join-Path $thirdPartyPayload 'Readme.pdf') -Force
-Copy-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE') -Destination (Join-Path $payloadDirectory 'LICENSE') -Force
-Copy-Item -LiteralPath (Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md') -Destination (Join-Path $payloadDirectory 'THIRD_PARTY_NOTICES.md') -Force
-
-Copy-ComponentEvidence -Destination $componentEvidenceDirectory
-
-Invoke-Checked -FilePath 'dotnet' -Description 'Generate the SPDX 2.2 SBOM' -Arguments @(
-    'tool', 'run', 'sbom-tool', '--allow-roll-forward',
-    '--',
-    'generate',
-    '-b', $payloadDirectory,
-    '-bc', $componentEvidenceDirectory,
-    '-pn', 'PCM CDB Editor',
-    '-pv', $Version,
-    '-ps', 'Peter537',
-    '-nsb', 'https://github.com/Peter537/pcm-cdb-editor',
-    '-m', $sbomDirectory
-)
-
-$sbomManifestPath = Join-Path $sbomDirectory '_manifest\spdx_2.2\manifest.spdx.json'
-if (-not [System.IO.File]::Exists($sbomManifestPath)) {
-    throw "SBOM generation did not create the expected manifest: $sbomManifestPath"
-}
-
-$sbomText = Get-Content -Raw -LiteralPath $sbomManifestPath
-if ($sbomText -match '(?i)[A-Z]:\\Users\\') {
-    throw 'The generated SBOM contains a personal absolute Windows path.'
-}
-$sbomDocument = $sbomText | ConvertFrom-Json
-$sbomPackageNames = @($sbomDocument.packages | ForEach-Object { [string] $_.name })
-foreach ($requiredSbomPackage in @(
-    'PCM CDB Editor',
-    'Microsoft.WindowsAppSDK',
-    'WinUI.TableView',
-    'Microsoft.Data.Sqlite',
-    'Microsoft.Data.Sqlite.Core',
-    'SQLitePCLRaw.bundle_e_sqlite3',
-    'SQLitePCLRaw.core',
-    'SQLitePCLRaw.lib.e_sqlite3',
-    'SQLitePCLRaw.provider.e_sqlite3',
-    'Microsoft.NET.Test.Sdk',
-    'MSTest.TestFramework',
-    'MSTest.TestAdapter'
-)) {
-    if ($requiredSbomPackage -cnotin $sbomPackageNames) {
-        throw "The generated SBOM is missing required package component: $requiredSbomPackage"
+    $thirdPartySource = Join-Path $repositoryRoot 'third_party\SQLiteExporter'
+    $exporterSource = Join-Path $thirdPartySource 'SQLiteExporter.exe'
+    $exporterReadmeSource = Join-Path $thirdPartySource 'Readme.pdf'
+    if (-not [System.IO.File]::Exists($exporterSource) -or -not [System.IO.File]::Exists($exporterReadmeSource)) {
+        throw 'The approved SQLiteExporter.exe and Readme.pdf are required under third_party\SQLiteExporter.'
     }
-}
 
-Invoke-Checked -FilePath 'dotnet' -Description 'Validate the SPDX 2.2 SBOM' -Arguments @(
-    'tool', 'run', 'sbom-tool', '--allow-roll-forward',
-    '--',
-    'validate',
-    '-b', $payloadDirectory,
-    '-o', (Join-Path $metadataDirectory 'sbom-validation.json'),
-    '-mi', 'SPDX:2.2',
-    '-m', (Join-Path $sbomDirectory '_manifest')
-)
+    if ((Get-Sha256 -Path $exporterSource) -ne $exporterSha256) {
+        throw 'Source SQLiteExporter.exe does not match the approved SHA-256.'
+    }
 
-$zipPath = Join-Path $packagesDirectory "PcmCdbEditor-$Version-win-x64.zip"
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::CreateFromDirectory(
-    $payloadDirectory,
-    $zipPath,
-    [System.IO.Compression.CompressionLevel]::Optimal,
-    $false
-)
+    if ((Get-Sha256 -Path $exporterReadmeSource) -ne $exporterReadmeSha256) {
+        throw 'Source SQLiteExporter Readme.pdf does not match the approved SHA-256.'
+    }
 
-$innoInstallerPath = Join-Path $toolsDirectory $innoInstallerName
-Invoke-WebRequest -Uri $innoInstallerUrl -OutFile $innoInstallerPath -UseBasicParsing
-if ((Get-Sha256 -Path $innoInstallerPath) -ne $innoInstallerSha256) {
-    throw 'Inno Setup installer does not match the approved SHA-256.'
-}
+    $thirdPartyPayload = Join-Path $payloadDirectory 'third_party\SQLiteExporter'
+    [System.IO.Directory]::CreateDirectory($thirdPartyPayload) | Out-Null
+    Copy-Item -LiteralPath $exporterSource -Destination (Join-Path $thirdPartyPayload 'SQLiteExporter.exe') -Force
+    Copy-Item -LiteralPath $exporterReadmeSource -Destination (Join-Path $thirdPartyPayload 'Readme.pdf') -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE') -Destination (Join-Path $payloadDirectory 'LICENSE') -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md') -Destination (Join-Path $payloadDirectory 'THIRD_PARTY_NOTICES.md') -Force
 
-Assert-AuthenticodePublisher -Path $innoInstallerPath -PublisherPattern 'CN=Pyrsys B\.V\.' -Description 'Inno Setup installer'
+    Copy-ComponentEvidence -Destination $componentEvidenceDirectory
 
-$githubCli = Get-Command 'gh' -ErrorAction SilentlyContinue
-if ($null -eq $githubCli) {
-    throw 'GitHub CLI is required to verify the Inno Setup release asset attestation.'
-}
+    Invoke-Checked -FilePath 'dotnet' -Description 'Generate the SPDX 2.2 SBOM' -Arguments @(
+        'tool', 'run', 'sbom-tool', '--allow-roll-forward',
+        '--',
+        'generate',
+        '-b', $payloadDirectory,
+        '-bc', $componentEvidenceDirectory,
+        '-pn', 'PCM CDB Editor',
+        '-pv', $Version,
+        '-ps', 'Peter537',
+        '-nsb', 'https://github.com/Peter537/pcm-cdb-editor',
+        '-m', $sbomDirectory
+    )
 
-Invoke-Checked -FilePath $githubCli.Path -Description 'Verify the Inno Setup GitHub release attestation' -Arguments @(
-    'release', 'verify-asset', $innoReleaseTag, $innoInstallerPath,
-    '--repo', 'jrsoftware/issrc'
-)
+    $sbomManifestPath = Join-Path $sbomDirectory '_manifest\spdx_2.2\manifest.spdx.json'
+    if (-not [System.IO.File]::Exists($sbomManifestPath)) {
+        throw "SBOM generation did not create the expected manifest: $sbomManifestPath"
+    }
 
-$innoInstallDirectory = Join-Path $toolsDirectory "InnoSetup-$innoVersion"
-$innoInstallArguments = @(
-    '/VERYSILENT',
-    '/SUPPRESSMSGBOXES',
-    '/NORESTART',
-    '/CURRENTUSER',
-    '/PORTABLE=1',
-    "/DIR=`"$innoInstallDirectory`""
-)
-$installProcess = Start-Process -FilePath $innoInstallerPath -ArgumentList $innoInstallArguments -Wait -PassThru -WindowStyle Hidden
-if ($installProcess.ExitCode -ne 0) {
-    throw "Verified Inno Setup installation failed with exit code $($installProcess.ExitCode)."
-}
+    $sbomText = Get-Content -Raw -LiteralPath $sbomManifestPath
+    if ($sbomText -match '(?i)[A-Z]:\\Users\\') {
+        throw 'The generated SBOM contains a personal absolute Windows path.'
+    }
+    $sbomDocument = $sbomText | ConvertFrom-Json
+    $sbomPackageNames = @($sbomDocument.packages | ForEach-Object { [string] $_.name })
+    foreach ($requiredSbomPackage in @(
+        'PCM CDB Editor',
+        'Microsoft.WindowsAppSDK',
+        'WinUI.TableView',
+        'Microsoft.Data.Sqlite',
+        'Microsoft.Data.Sqlite.Core',
+        'SQLitePCLRaw.bundle_e_sqlite3',
+        'SQLitePCLRaw.core',
+        'SQLitePCLRaw.lib.e_sqlite3',
+        'SQLitePCLRaw.provider.e_sqlite3',
+        'Microsoft.NET.Test.Sdk',
+        'MSTest.TestFramework',
+        'MSTest.TestAdapter'
+    )) {
+        if ($requiredSbomPackage -cnotin $sbomPackageNames) {
+            throw "The generated SBOM is missing required package component: $requiredSbomPackage"
+        }
+    }
 
-$innoCompilerPath = Join-Path $innoInstallDirectory 'ISCC.exe'
-if (-not [System.IO.File]::Exists($innoCompilerPath)) {
-    throw "Inno Setup compiler was not installed at the expected path: $innoCompilerPath"
-}
+    Invoke-Checked -FilePath 'dotnet' -Description 'Validate the SPDX 2.2 SBOM' -Arguments @(
+        'tool', 'run', 'sbom-tool', '--allow-roll-forward',
+        '--',
+        'validate',
+        '-b', $payloadDirectory,
+        '-o', (Join-Path $metadataDirectory 'sbom-validation.json'),
+        '-mi', 'SPDX:2.2',
+        '-m', (Join-Path $sbomDirectory '_manifest')
+    )
 
-Assert-AuthenticodePublisher -Path $innoCompilerPath -PublisherPattern 'CN=Pyrsys B\.V\.' -Description 'Inno Setup compiler'
+    $zipPath = Join-Path $packagesDirectory "PcmCdbEditor-$Version-win-x64.zip"
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+        $payloadDirectory,
+        $zipPath,
+        [System.IO.Compression.CompressionLevel]::Optimal,
+        $false
+    )
 
-Invoke-Checked -FilePath $innoCompilerPath -Description 'Compile the per-user installer from the staged payload' -Arguments @(
-    "/DAppVersion=$Version",
-    "/DSourceDir=$payloadDirectory",
-    "/DOutputDir=$packagesDirectory",
-    $installerScriptPath
-)
+    $innoInstallerPath = Join-Path $toolsDirectory $innoInstallerName
+    Invoke-WebRequest -Uri $innoInstallerUrl -OutFile $innoInstallerPath -UseBasicParsing
+    if ((Get-Sha256 -Path $innoInstallerPath) -ne $innoInstallerSha256) {
+        throw 'Inno Setup installer does not match the approved SHA-256.'
+    }
 
-$installerPath = Join-Path $packagesDirectory "PcmCdbEditor-$Version-win-x64-setup.exe"
-if (-not [System.IO.File]::Exists($installerPath)) {
-    throw "Inno Setup did not create the expected installer: $installerPath"
-}
+    Assert-AuthenticodePublisher -Path $innoInstallerPath -PublisherPattern 'CN=Pyrsys B\.V\.' -Description 'Inno Setup installer'
 
-$sourceCommit = (& git -C $repositoryRoot rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sourceCommit)) {
-    throw 'Unable to record the source commit for release provenance.'
-}
+    $githubCli = Get-Command 'gh' -ErrorAction SilentlyContinue
+    if ($null -eq $githubCli) {
+        throw 'GitHub CLI is required to verify the Inno Setup release asset attestation.'
+    }
 
-$gitStatus = @(& git -C $repositoryRoot status --porcelain=v1 --untracked-files=all 2>&1)
-if ($LASTEXITCODE -ne 0) {
-    throw 'Unable to record the working-tree state for release provenance.'
-}
-$sourceFiles = @(Get-SourceManifestFiles)
-$sourceCanonicalLines = @(
-    $sourceFiles |
-        ForEach-Object { "$($_.Path)`0$($_.Size)`0$($_.Sha256)" }
-)
-$sourceTreeSha256 = Get-StringSha256 -Value ([string]::Join("`n", $sourceCanonicalLines))
-$sourceManifestPath = Join-Path $metadataDirectory 'source-manifest.json'
-Write-Utf8NoBom `
-    -Path $sourceManifestPath `
-    -Content (([ordered]@{
-            SchemaVersion = 1
-            Canonicalization = 'Path NUL decimal-size NUL uppercase-SHA256, UTF-8, sorted ordinal by path, LF-separated'
+    Invoke-Checked -FilePath $githubCli.Path -Description 'Verify the Inno Setup GitHub release attestation' -Arguments @(
+        'release', 'verify-asset', $innoReleaseTag, $innoInstallerPath,
+        '--repo', 'jrsoftware/issrc'
+    )
+
+    $innoInstallDirectory = Join-Path $toolsDirectory "InnoSetup-$innoVersion"
+    $innoInstallArguments = @(
+        '/VERYSILENT',
+        '/SUPPRESSMSGBOXES',
+        '/NORESTART',
+        '/CURRENTUSER',
+        '/PORTABLE=1',
+        "/DIR=`"$innoInstallDirectory`""
+    )
+    $installProcess = Start-Process -FilePath $innoInstallerPath -ArgumentList $innoInstallArguments -Wait -PassThru -WindowStyle Hidden
+    if ($installProcess.ExitCode -ne 0) {
+        throw "Verified Inno Setup installation failed with exit code $($installProcess.ExitCode)."
+    }
+
+    $innoCompilerPath = Join-Path $innoInstallDirectory 'ISCC.exe'
+    if (-not [System.IO.File]::Exists($innoCompilerPath)) {
+        throw "Inno Setup compiler was not installed at the expected path: $innoCompilerPath"
+    }
+
+    Assert-AuthenticodePublisher -Path $innoCompilerPath -PublisherPattern 'CN=Pyrsys B\.V\.' -Description 'Inno Setup compiler'
+
+    Invoke-Checked -FilePath $innoCompilerPath -Description 'Compile the per-user installer from the staged payload' -Arguments @(
+        "/DAppVersion=$Version",
+        "/DSourceDir=$payloadDirectory",
+        "/DOutputDir=$packagesDirectory",
+        $installerScriptPath
+    )
+
+    $installerPath = Join-Path $packagesDirectory "PcmCdbEditor-$Version-win-x64-setup.exe"
+    if (-not [System.IO.File]::Exists($installerPath)) {
+        throw "Inno Setup did not create the expected installer: $installerPath"
+    }
+
+    Assert-ReleaseSnapshot -Root $repositoryRoot -Files $sourceFiles -TreeSha256 $sourceTreeSha256
+    Assert-ReleaseSourceState -Root $sourceCheckout -Commit $sourceCommit -StatusSha256 $initialGit.StatusSha256 -TreeSha256 $sourceTreeSha256
+    $sourceManifestPath = Join-Path $metadataDirectory 'source-manifest.json'
+    Write-Utf8NoBom `
+        -Path $sourceManifestPath `
+        -Content (([ordered]@{
+                SchemaVersion = 1
+                Canonicalization = 'Path NUL decimal-size NUL uppercase-SHA256, UTF-8, sorted ordinal by path, LF-separated'
+                TreeSha256 = $sourceTreeSha256
+                Files = $sourceFiles
+            }) | ConvertTo-Json -Depth 8)
+    $trackedStatus = @($gitStatus | Where-Object { -not $_.StartsWith('??') })
+    $untrackedStatus = @($gitStatus | Where-Object { $_.StartsWith('??') })
+
+    $provenance = [ordered]@{
+        SchemaVersion = 4
+        Product = 'PCM CDB Editor'
+        Version = $Version
+        SourceCommit = $sourceCommit
+        Source = [ordered]@{
+            Commit = $sourceCommit
+            BuildMode = $sourceMode
+            GitStatusSha256 = $initialGit.StatusSha256
+            WorkingTreeDirty = $gitStatus.Count -gt 0
+            TrackedChangesPresent = $trackedStatus.Count -gt 0
+            UntrackedFilesPresent = $untrackedStatus.Count -gt 0
+            GitStatusEntryCount = $gitStatus.Count
+            Manifest = 'metadata/source-manifest.json'
+            ManifestFileCount = $sourceFiles.Count
             TreeSha256 = $sourceTreeSha256
-            Files = $sourceFiles
-        }) | ConvertTo-Json -Depth 8)
-$trackedStatus = @($gitStatus | Where-Object { -not $_.StartsWith('??') })
-$untrackedStatus = @($gitStatus | Where-Object { $_.StartsWith('??') })
+        }
+        GeneratedUtc = [System.DateTimeOffset]::UtcNow.ToString('O')
+        BuildEnvironment = [ordered]@{
+            OSDescription = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+            OSArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+            ProcessArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+            PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+        }
+        DotNet = [ordered]@{
+            Sdk = $requiredSdkVersion
+            RuntimeFramework = $runtimeFrameworkVersion
+            AppHostPack = $runtimeFrameworkVersion
+            RuntimeSecurity = $runtimeSecurity
+            RuntimeIdentifier = $runtimeIdentifier
+        }
+        InnoSetup = [ordered]@{
+            Version = $innoVersion
+            ReleaseTag = $innoReleaseTag
+            DownloadUrl = $innoInstallerUrl
+            InstallerSha256 = $innoInstallerSha256
+            AuthenticodePublisher = 'Pyrsys B.V.'
+            AttestationVerification = 'gh release verify-asset is-7_1_0 <asset> --repo jrsoftware/issrc'
+            AcquisitionMode = 'Portable'
+            PrivilegeMode = 'CurrentUser'
+        }
+        SQLiteExporter = [ordered]@{
+            ExecutableSha256 = $exporterSha256
+            ReadmePdfSha256 = $exporterReadmeSha256
+        }
+        Signing = 'Unsigned verification candidate'
+    }
+    Write-Utf8NoBom `
+        -Path (Join-Path $metadataDirectory 'release-provenance.json') `
+        -Content ($provenance | ConvertTo-Json -Depth 8)
 
-$provenance = [ordered]@{
-    SchemaVersion = 3
-    Product = 'PCM CDB Editor'
-    Version = $Version
-    SourceCommit = $sourceCommit
-    Source = [ordered]@{
-        Commit = $sourceCommit
-        WorkingTreeDirty = $gitStatus.Count -gt 0
-        TrackedChangesPresent = $trackedStatus.Count -gt 0
-        UntrackedFilesPresent = $untrackedStatus.Count -gt 0
-        GitStatusEntryCount = $gitStatus.Count
-        Manifest = 'metadata/source-manifest.json'
-        ManifestFileCount = $sourceFiles.Count
-        TreeSha256 = $sourceTreeSha256
+    $verifiedTreeHash = & $verifyScriptPath `
+        -EmitCandidateTreeHash `
+        -Version $Version `
+        -SourceCheckout $sourceCheckout `
+        -RecordRestoreAssets `
+        -PayloadDirectory $payloadDirectory `
+        -ZipPath $zipPath `
+        -InstallerPath $installerPath `
+        -SbomPath $sbomManifestPath `
+        -MetadataDirectory $metadataDirectory `
+        -ChecksumsPath $checksumsPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Release verification failed with exit code $LASTEXITCODE."
     }
-    GeneratedUtc = [System.DateTimeOffset]::UtcNow.ToString('O')
-    BuildEnvironment = [ordered]@{
-        OSDescription = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
-        OSArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-        ProcessArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
-        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
-    }
-    DotNet = [ordered]@{
-        Sdk = $requiredSdkVersion
-        RuntimeFramework = $runtimeFrameworkVersion
-        AppHostPack = $runtimeFrameworkVersion
-        RuntimeIdentifier = $runtimeIdentifier
-    }
-    InnoSetup = [ordered]@{
-        Version = $innoVersion
-        ReleaseTag = $innoReleaseTag
-        DownloadUrl = $innoInstallerUrl
-        InstallerSha256 = $innoInstallerSha256
-        AuthenticodePublisher = 'Pyrsys B.V.'
-        AttestationVerification = 'gh release verify-asset is-7_1_0 <asset> --repo jrsoftware/issrc'
-        AcquisitionMode = 'Portable'
-        PrivilegeMode = 'CurrentUser'
-    }
-    SQLiteExporter = [ordered]@{
-        ExecutableSha256 = $exporterSha256
-        ReadmePdfSha256 = $exporterReadmeSha256
-    }
-    Signing = 'Unsigned verification candidate'
+
+    Assert-ReleaseSnapshot -Root $repositoryRoot -Files $sourceFiles -TreeSha256 $sourceTreeSha256
+    Assert-ReleaseSourceState -Root $sourceCheckout -Commit $sourceCommit -StatusSha256 $initialGit.StatusSha256 -TreeSha256 $sourceTreeSha256
+
+    Publish-ReleaseCandidate -Staged $releaseDirectory -Destination $publishedDirectory -RunId $runId -ArtifactsRoot $artifactsRoot -VerifiedTreeHash $verifiedTreeHash
+
+    Write-Host ''
+    Write-Host 'Release verification candidate created successfully.'
+    Write-Host "Location: $publishedDirectory"
+    Write-Host 'The artifacts are intentionally unsigned and have not been published.'
 }
-Write-Utf8NoBom `
-    -Path (Join-Path $metadataDirectory 'release-provenance.json') `
-    -Content ($provenance | ConvertTo-Json -Depth 8)
-
-& $verifyScriptPath `
-    -Version $Version `
-    -PayloadDirectory $payloadDirectory `
-    -ZipPath $zipPath `
-    -InstallerPath $installerPath `
-    -SbomPath $sbomManifestPath `
-    -MetadataDirectory $metadataDirectory `
-    -ChecksumsPath $checksumsPath
-if ($LASTEXITCODE -ne 0) {
-    throw "Release verification failed with exit code $LASTEXITCODE."
+finally {
+    if ($locationPushed) {
+        Pop-Location
+    }
+    $env:NUGET_PACKAGES = $previousNugetPackages
+    Remove-ReleaseScratch -Path $runRoot -ArtifactsRoot $artifactsRoot
 }
-
-Assert-NoReparsePointInDirectoryChain -Path $buildDirectory -Root $artifactsRoot -Purpose 'Intermediate build cleanup'
-Assert-NoReparsePointInDirectoryChain -Path $toolsDirectory -Root $artifactsRoot -Purpose 'Intermediate tool cleanup'
-Assert-NoReparsePointInDirectoryTree -Path $buildDirectory -Purpose 'Intermediate build cleanup'
-Assert-NoReparsePointInDirectoryTree -Path $toolsDirectory -Purpose 'Intermediate tool cleanup'
-Remove-Item -LiteralPath $buildDirectory -Recurse -Force
-Remove-Item -LiteralPath $toolsDirectory -Recurse -Force
-
-Write-Host ''
-Write-Host 'Release verification candidate created successfully.'
-Write-Host "Payload:   $payloadDirectory"
-Write-Host "ZIP:       $zipPath"
-Write-Host "Installer: $installerPath"
-Write-Host "SBOM:      $sbomManifestPath"
-Write-Host "Checksums: $checksumsPath"
-Write-Host 'The artifacts are intentionally unsigned and have not been published.'

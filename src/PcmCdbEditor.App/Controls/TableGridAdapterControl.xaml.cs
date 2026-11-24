@@ -18,9 +18,9 @@ namespace PcmCdbEditor.App.Controls;
 /// </summary>
 public sealed partial class TableGridAdapterControl : UserControl, ITableGridAdapter
 {
-    private readonly BulkRowSource<GridRowPresentation> _rowSource = new();
+    private GridRowPresentation[] _rows = [];
     private readonly InlineEditCommitStager _editStager = new();
-    private HashSet<string> _relationshipPickerColumns = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _relationshipPickerColumns = new(SqliteIdentifierComparer.Instance);
     private RelationshipCellEditRequest? _pendingRelationshipEdit;
     private ColumnFingerprintHeader? _columnFingerprintHeader;
     private GridColumnFingerprint[] _columnFingerprint = [];
@@ -43,7 +43,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         GridControl.CurrentCellChanged += (_, _) => QueuePresentedRowChanged();
     }
 
-    public IReadOnlyList<GridRowPresentation> Rows => _rowSource.Items;
+    public IReadOnlyList<GridRowPresentation> Rows => _rows;
 
     public bool IsEditing => GetCurrentCell()?.Content is TextBox;
 
@@ -61,9 +61,9 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         }
 
         index = GridControl.SelectedIndex;
-        return !_isBinding && (uint)index < (uint)_rowSource.Items.Length &&
-            ReferenceEquals(GridControl.SelectedItem, _rowSource.Items[index])
-            ? _rowSource.Items[index]
+        return !_isBinding && (uint)index < (uint)_rows.Length &&
+            ReferenceEquals(GridControl.SelectedItem, _rows[index])
+            ? _rows[index]
             : null;
     }
 
@@ -114,25 +114,18 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
     public void SetRelationshipPickerColumns(IEnumerable<string> columnNames)
     {
         ArgumentNullException.ThrowIfNull(columnNames);
-        _relationshipPickerColumns = columnNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _relationshipPickerColumns = columnNames.ToHashSet(SqliteIdentifierComparer.Instance);
         _pendingRelationshipEdit = null;
     }
 
-    public void Bind(
-        TableSchema schema,
-        IReadOnlyList<TypedRow> rows,
-        TableViewState? state,
-        ForeignKeyDisplayMode displayMode)
+    public void Bind(GridPagePresentation page, TableViewState? state)
     {
-        ArgumentNullException.ThrowIfNull(schema);
-        ArgumentNullException.ThrowIfNull(rows);
+        ArgumentNullException.ThrowIfNull(page);
         _editStager.Clear();
         _pendingRelationshipEdit = null;
 
-        ColumnSchema[] visibleColumns = schema.Columns
-            .Where(static column => !column.IsHidden)
-            .OrderBy(static column => column.Ordinal)
-            .ToArray();
+        TableSchema schema = page.Schema;
+        ColumnSchema[] visibleColumns = page.Columns;
         Dictionary<string, ColumnDisplayState> savedColumns = CreateSavedColumnMap(state);
         var nextHeader = new ColumnFingerprintHeader(
             schema.Name,
@@ -150,9 +143,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
             NeutralizeHorizontalOffsetForColumnTopologyChange();
         }
 
-        _rowSource.Replace(
-            rows,
-            row => new GridRowPresentation(schema.Name, row, visibleColumns, displayMode));
+        _rows = page.Rows;
         _bindGeneration++;
 
         _isBinding = true;
@@ -168,7 +159,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
             }
 
             // One complete replacement avoids a notification and layout pass per row.
-            GridControl.ItemsSource = _rowSource.Items;
+            GridControl.ItemsSource = _rows;
             if (!columnsChanged)
             {
                 RestoreSelection(selection);
@@ -194,7 +185,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
             NeutralizeHorizontalOffsetForColumnTopologyChange();
             GridControl.ItemsSource = null;
             GridControl.Columns.Clear();
-            _rowSource.Clear();
+            _rows = [];
             _columnFingerprintHeader = null;
             _columnFingerprint = [];
             _bindGeneration++;
@@ -209,14 +200,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
 
     private void NeutralizeHorizontalOffsetForColumnTopologyChange()
     {
-        if (GridControl.HorizontalOffset == 0)
-        {
-            return;
-        }
-
-        GridControl.SetValue(
-            WinUI.TableView.TableView.HorizontalOffsetProperty,
-            0d);
+        GridControl.SetHorizontalPosition(0);
     }
 
     private void RebuildColumns(
@@ -276,7 +260,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
     private static Dictionary<string, ColumnDisplayState> CreateSavedColumnMap(
         TableViewState? state)
     {
-        var savedColumns = new Dictionary<string, ColumnDisplayState>(StringComparer.OrdinalIgnoreCase);
+        var savedColumns = new Dictionary<string, ColumnDisplayState>(SqliteIdentifierComparer.Instance);
         if (state is null)
         {
             return savedColumns;
@@ -342,7 +326,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
 
         WinUI.TableView.TableViewColumn? primaryColumn = GridControl.Columns.FirstOrDefault(column =>
             column.Tag is string name &&
-            name.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+            SqliteIdentifierComparer.Instance.Equals(name, columnName));
         if (primaryColumn is null)
         {
             return;
@@ -427,14 +411,14 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
     {
         IList<WinUI.TableView.TableViewColumn> visibleColumns = GridControl.Columns.VisibleColumns;
         if (!_isBinding && GridControl.CurrentCellSlot is { } current &&
-            (uint)current.Row < (uint)_rowSource.Items.Length &&
+            (uint)current.Row < (uint)_rows.Length &&
             (uint)current.Row < (uint)GridControl.Items.Count &&
-            ReferenceEquals(GridControl.Items[current.Row], _rowSource.Items[current.Row]) &&
+            ReferenceEquals(GridControl.Items[current.Row], _rows[current.Row]) &&
             (uint)current.Column < (uint)visibleColumns.Count &&
             visibleColumns[current.Column].Tag is string physicalColumn)
         {
             slot = current;
-            row = _rowSource.Items[current.Row];
+            row = _rows[current.Row];
             columnName = physicalColumn;
             return true;
         }
@@ -461,7 +445,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
 
     public GridViewport CaptureViewport()
     {
-        if (_rowSource.Items.Length == 0)
+        if (_rows.Length == 0)
         {
             return new GridViewport(null, 0);
         }
@@ -470,10 +454,9 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         int firstIndex = Math.Clamp(
             (int)Math.Floor(GridControl.VerticalOffset / rowHeight),
             0,
-            _rowSource.Items.Length - 1);
-        GridRowPresentation first = _rowSource.Items[firstIndex];
-        return new GridViewport(first.Identity,
-            checked((int)Math.Round(GridControl.HorizontalOffset, MidpointRounding.ToEven)))
+            _rows.Length - 1);
+        GridRowPresentation first = _rows[firstIndex];
+        return new GridViewport(first.Identity, GridControl.HorizontalOffset)
         {
             ReadOnlyFirstRow = first.Identity is null ? (firstIndex, first.Row) : null,
         };
@@ -503,7 +486,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         GridSelectionResolution<GridRowPresentation> resolved =
             GridContentBindingSession.ResolveSelection(
                 selection,
-                _rowSource.Items,
+                _rows,
                 static row => row.Identity,
                 visibleColumns
                     .Select(static column => column.Tag)
@@ -511,7 +494,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
 
         int readOnlySelectedIndex = ResolveReadOnlyRow(selection.ReadOnlySelectedRow);
         GridRowPresentation? primarySelection = readOnlySelectedIndex >= 0
-            ? _rowSource.Items[readOnlySelectedIndex]
+            ? _rows[readOnlySelectedIndex]
             : resolved.CurrentRow;
         GridControl.SelectedItems.Clear();
         if (primarySelection is not null)
@@ -528,7 +511,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         if (selection.ReadOnlyCheckedRows.Count > 0)
         {
             var checkedRows = new HashSet<TypedRow>(selection.ReadOnlyCheckedRows, ReferenceEqualityComparer.Instance);
-            foreach (GridRowPresentation row in _rowSource.Items)
+            foreach (GridRowPresentation row in _rows)
             {
                 if (!ReferenceEquals(row, primarySelection) && checkedRows.Contains(row.Row))
                 {
@@ -539,13 +522,13 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
 
         int rowIndex = selection.ReadOnlyCell is not null
             ? ResolveReadOnlyRow(selection.ReadOnlyCell)
-            : Array.IndexOf(_rowSource.Items, resolved.CurrentCellRow);
+            : Array.IndexOf(_rows, resolved.CurrentCellRow);
         if (rowIndex >= 0 && selection.CurrentColumn is not null)
         {
             int columnIndex = visibleColumns
                 .Select((column, index) => new { column, index })
                 .Where(item => item.column.Tag is string name &&
-                    name.Equals(selection.CurrentColumn, StringComparison.OrdinalIgnoreCase))
+                    SqliteIdentifierComparer.Instance.Equals(name, selection.CurrentColumn))
                 .Select(static item => item.index)
                 .DefaultIfEmpty(-1)
                 .First();
@@ -562,8 +545,8 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
     }
 
     private int ResolveReadOnlyRow((int Index, TypedRow Row)? snapshot) =>
-        snapshot is { } locator && (uint)locator.Index < (uint)_rowSource.Items.Length &&
-        ReferenceEquals(_rowSource.Items[locator.Index].Row, locator.Row)
+        snapshot is { } locator && (uint)locator.Index < (uint)_rows.Length &&
+        ReferenceEquals(_rows[locator.Index].Row, locator.Row)
             ? locator.Index
             : -1;
 
@@ -608,19 +591,17 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         }
 
         if (viewport.FirstVisibleRow is not null &&
-            _rowSource.Items.FirstOrDefault(row =>
+            _rows.FirstOrDefault(row =>
                 row.Identity is not null && row.Identity.Equals(viewport.FirstVisibleRow)) is { } first)
         {
             GridControl.ScrollIntoView(first);
         }
         else if (ResolveReadOnlyRow(viewport.ReadOnlyFirstRow) is var readOnlyIndex && readOnlyIndex >= 0)
         {
-            GridControl.ScrollIntoView(_rowSource.Items[readOnlyIndex]);
+            GridControl.ScrollIntoView(_rows[readOnlyIndex]);
         }
 
-        GridControl.SetValue(
-            WinUI.TableView.TableView.HorizontalOffsetProperty,
-            (double)viewport.HorizontalOffset);
+        GridControl.SetHorizontalPosition(viewport.HorizontalOffset);
     }
 
     private void GridControl_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -754,7 +735,7 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         return RelationshipEditRequested is not null && _isEditingAllowed && !_isBinding && IsEnabled &&
             !nativeCell.IsReadOnly && row.Identity is not null && cell.Value.Kind != SqliteValueKind.Blob &&
             _relationshipPickerColumns.Contains(cell.ColumnName) &&
-            (uint)rowIndex < (uint)_rowSource.Items.Length && ReferenceEquals(_rowSource.Items[rowIndex], row);
+            (uint)rowIndex < (uint)_rows.Length && ReferenceEquals(_rows[rowIndex], row);
     }
 
     private void QueueRelationshipEdit(GridRowPresentation row, GridCellPresentation cell)
@@ -792,42 +773,17 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         _editStager.Clear();
         if (args.EditAction != WinUI.TableView.TableViewEditAction.Commit ||
             args.DataItem is not GridRowPresentation row ||
-            row.Identity is null ||
             args.Column.Tag is not string columnName ||
-            args.EditingElement is not TextBox editor ||
-            !row.TryGetCell(columnName, out GridCellPresentation cell))
+            args.EditingElement is not TextBox editor)
         {
             return;
         }
 
-        if (FormatInlineValue(cell.Value).Equals(editor.Text, StringComparison.Ordinal))
+        args.Cancel = !TryCreateInlineUpdate(row, columnName, editor.Text, out RowUpdateOperation? operation);
+        if (operation is not null)
         {
-            return;
+            _editStager.Stage(operation, _bindGeneration, row, columnName);
         }
-
-        if (!TryParseInlineValue(cell.Value.Kind, editor.Text, out SqliteValue value, out string? error))
-        {
-            args.Cancel = true;
-            RejectEdit($"{columnName}: {error}");
-            return;
-        }
-
-        if (value.Equals(cell.Value))
-        {
-            return;
-        }
-
-        _editStager.Stage(new RowUpdateOperation(
-            Guid.NewGuid(),
-            row.TableName,
-            DateTimeOffset.UtcNow,
-            row.Identity,
-            [KeyValuePair.Create(columnName, cell.Value)],
-            [KeyValuePair.Create(columnName, value)],
-            row.Revision),
-            _bindGeneration,
-            row,
-            columnName);
     }
 
     private void GridControl_CellEditEnded(
@@ -843,6 +799,61 @@ public sealed partial class TableGridAdapterControl : UserControl, ITableGridAda
         {
             AnnounceEdit(operation);
         }
+    }
+
+    public bool TryFinishInlineEdit(out RowUpdateOperation? update)
+    {
+        update = null;
+        if (GetCurrentCell() is not { Content: TextBox editor } nativeCell)
+        {
+            return true;
+        }
+
+        if (nativeCell.Row?.Content is not GridRowPresentation row ||
+            nativeCell.Column?.Tag is not string columnName ||
+            !TryCreateInlineUpdate(row, columnName, editor.Text, out update))
+        {
+            editor.Focus(FocusState.Programmatic);
+            return false;
+        }
+
+        _editStager.Clear();
+        GridControl.FinishExternalCommit(nativeCell);
+        return true;
+    }
+
+    private bool TryCreateInlineUpdate(
+        GridRowPresentation row,
+        string columnName,
+        string text,
+        out RowUpdateOperation? update)
+    {
+        update = null;
+        if (row.Identity is null || !row.TryGetCell(columnName, out GridCellPresentation cell))
+        {
+            RejectEdit("This cell has no verified row identity and cannot be edited safely.");
+            return false;
+        }
+
+        if (FormatInlineValue(cell.Value).Equals(text, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (!TryParseInlineValue(cell.Value.Kind, text, out SqliteValue value, out string? error))
+        {
+            RejectEdit($"{columnName}: {error}");
+            return false;
+        }
+
+        if (!value.Equals(cell.Value))
+        {
+            update = new RowUpdateOperation(
+                Guid.NewGuid(), row.TableName, DateTimeOffset.UtcNow, row.Identity,
+                [KeyValuePair.Create(columnName, cell.Value)],
+                [KeyValuePair.Create(columnName, value)], row.Revision);
+        }
+        return true;
     }
 
     private static bool TryParseInlineValue(
@@ -1063,110 +1074,3 @@ public sealed record RelationshipCellEditRequest(
     RowRevision Revision,
     string ColumnName,
     SqliteValue OldValue);
-
-public sealed class GridRowPresentation
-{
-    public GridRowPresentation(
-        string tableName,
-        TypedRow row,
-        IReadOnlyList<ColumnSchema> columns,
-        ForeignKeyDisplayMode displayMode)
-    {
-        TableName = tableName;
-        Row = row;
-        Identity = row.Identity;
-        Revision = row.Revision;
-        Cells = columns.Select(column => new GridCellPresentation(
-            column.Name,
-            row.Values.TryGetValue(column.Name, out SqliteValue value)
-                ? value
-                : SqliteValue.Null,
-            row.RelatedValues.GetValueOrDefault(column.Name),
-            displayMode)).ToArray();
-    }
-
-    public string TableName { get; }
-
-    public TypedRow Row { get; }
-
-    public RowIdentity? Identity { get; }
-
-    public RowRevision Revision { get; }
-
-    public IReadOnlyList<GridCellPresentation> Cells { get; }
-
-    public bool TryGetCell(string columnName, out GridCellPresentation cell)
-    {
-        cell = Cells.FirstOrDefault(candidate =>
-            candidate.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase))!;
-        return cell is not null;
-    }
-}
-
-public sealed record GridCellPresentation
-{
-    public GridCellPresentation(
-        string columnName,
-        SqliteValue value,
-        RelatedValue? relatedValue,
-        ForeignKeyDisplayMode displayMode)
-    {
-        ColumnName = columnName;
-        Value = value;
-        string? label = relatedValue is { Resolution: RelationshipResolution.Resolved, Label: { } text } &&
-            !string.IsNullOrWhiteSpace(text) ? text : null;
-        IsDisplayProjection = label is not null &&
-            displayMode is ForeignKeyDisplayMode.RawAndName or ForeignKeyDisplayMode.ResolvedName;
-        CombinedLabel = displayMode == ForeignKeyDisplayMode.RawAndName ? label : null;
-        Display = displayMode switch
-        {
-            ForeignKeyDisplayMode.RawAndName when label is not null => $"{label} · {Format(value)}",
-            ForeignKeyDisplayMode.ResolvedName when label is not null => label,
-            _ => Format(value),
-        };
-        RelationshipHelp = relatedValue?.Resolution switch
-        {
-            RelationshipResolution.TargetUnavailable => "The referenced table or key column is unavailable.",
-            RelationshipResolution.MissingTarget => "The referenced record could not be found for this stored key.",
-            RelationshipResolution.AmbiguousKey => "More than one record matches this stored key.",
-            RelationshipResolution.LabelUnavailable => "No readable name is available for this relationship.",
-            RelationshipResolution.Resolved when label is null => "No readable name is available for this relationship.",
-            RelationshipResolution.UnknownRelationship => "No known relationship for this column.",
-            RelationshipResolution.AmbiguousRelationship => "This column has more than one possible relationship.",
-            RelationshipResolution.CompositeRelationship => "This relationship uses multiple columns. Showing the stored value.",
-            _ => null,
-        };
-    }
-
-    public string ColumnName { get; }
-    public SqliteValue Value { get; }
-    public bool IsDisplayProjection { get; }
-    public string Display { get; }
-    public string? CombinedLabel { get; }
-    public string? RelationshipHelp { get; }
-
-    private static string Format(SqliteValue value) => value.Kind switch
-    {
-        SqliteValueKind.Null => "NULL",
-        SqliteValueKind.Integer => value.IntegerValue.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        SqliteValueKind.Real => value.RealValue.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
-        SqliteValueKind.Text => value.TextValue ?? string.Empty,
-        SqliteValueKind.Blob => $"BLOB · {GetBlobLength(value.BlobBase64):N0} bytes",
-        _ => string.Empty,
-    };
-
-    private static int GetBlobLength(string? base64)
-    {
-        if (string.IsNullOrEmpty(base64))
-        {
-            return 0;
-        }
-
-        int padding = base64.EndsWith("==", StringComparison.Ordinal)
-            ? 2
-            : base64.EndsWith('=')
-                ? 1
-                : 0;
-        return checked((base64.Length / 4 * 3) - padding);
-    }
-}

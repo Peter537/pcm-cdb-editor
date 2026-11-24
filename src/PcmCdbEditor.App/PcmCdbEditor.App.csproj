@@ -23,14 +23,14 @@
     RuntimeFrameworkVersion cannot be used on a Windows TFM because dotnet/sdk#37044
     applies it to Microsoft.Windows.SDK.NET.Ref as well. Override only the .NET 10
     runtime and apphost pack metadata so the selected compiler publishes the
-    security-serviced 10.0.11 runtime without changing the Windows SDK reference.
+    security-serviced 10.0.15 runtime without changing the Windows SDK reference.
   -->
   <ItemGroup>
     <KnownFrameworkReference Update="Microsoft.NETCore.App">
-      <LatestRuntimeFrameworkVersion>10.0.11</LatestRuntimeFrameworkVersion>
+      <LatestRuntimeFrameworkVersion>10.0.15</LatestRuntimeFrameworkVersion>
     </KnownFrameworkReference>
     <KnownAppHostPack Update="Microsoft.NETCore.App">
-      <AppHostPackVersion>10.0.11</AppHostPackVersion>
+      <AppHostPackVersion>10.0.15</AppHostPackVersion>
     </KnownAppHostPack>
   </ItemGroup>
   <ItemGroup>

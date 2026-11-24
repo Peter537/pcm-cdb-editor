@@ -63,6 +63,363 @@ public sealed class WorkspaceServiceTests
     }
 
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task IncompleteReplacementPreservesStageAndOnlyRestoresToVacantDestination(bool occupied)
+    {
+        string root = Directory.CreateTempSubdirectory("PcmCdbEditorHandoff-").FullName;
+        string source = Path.Combine(root, "original.cdb");
+        try
+        {
+            await File.WriteAllTextAsync(source, "original");
+            using var service = new WorkspaceService(new SyntheticConverter(), Path.Combine(root, "sessions"),
+                Path.Combine(root, "backups"))
+            {
+                ReplaceDestination = (_, target, backup) =>
+                {
+                    File.Move(target, backup);
+                    if (occupied)
+                    {
+                        File.WriteAllText(target, "newer");
+                    }
+                    throw new IOException("Injected incomplete Windows handoff.");
+                }
+            };
+            EditorSessionState session = await service.OpenAsync(new WorkspaceOpenRequest(source), CancellationToken.None);
+            var failure = await Assert.ThrowsExactlyAsync<WorkspaceSaveHandoffException>(
+                () => service.SaveAsync(session, CancellationToken.None));
+
+            Assert.AreEqual("converted-output", await File.ReadAllTextAsync(failure.Stage));
+            Assert.AreEqual(occupied ? "newer" : "original", await File.ReadAllTextAsync(source));
+            if (occupied)
+            {
+                Assert.IsNotNull(failure.Backup);
+                Assert.AreEqual("original", await File.ReadAllTextAsync(failure.Backup));
+            }
+            else
+            {
+                Assert.IsNull(failure.Backup);
+            }
+
+            service.ReleaseSession(session.SessionId);
+            EditorSessionState recovered = await service.RecoverAsync(session.SessionId, CancellationToken.None);
+            Assert.IsTrue(recovered.IsDirty);
+            Assert.IsTrue(recovered.HistoryUncertain);
+            Assert.IsFalse(File.Exists(failure.Stage));
+            if (occupied)
+            {
+                Assert.AreEqual(failure.Backup, recovered.LastBackupPath);
+                Assert.IsTrue(File.Exists(failure.Backup));
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task RecoveryListsAndRollsBackAHotJournal()
+    {
+        string root = Directory.CreateTempSubdirectory("PcmCdbEditorJournal-").FullName;
+        string source = Path.Combine(root, "original.cdb");
+        try
+        {
+            await File.WriteAllTextAsync(source, "original");
+            using var service = new WorkspaceService(new SyntheticConverter(), Path.Combine(root, "sessions"),
+                Path.Combine(root, "backups"));
+            EditorSessionState session = await service.OpenAsync(new WorkspaceOpenRequest(source), CancellationToken.None);
+            session = await service.MarkDirtyAsync(session, CancellationToken.None);
+            string database = session.WorkingSqlitePath;
+            byte[] interruptedDatabase;
+            byte[] hotJournal;
+            using (var connection = SqliteSupport.CreateConnection(database))
+            {
+                connection.Open();
+                using var command = connection.CreateCommand();
+                command.CommandText = """
+                    PRAGMA journal_mode = DELETE;
+                    PRAGMA cache_size = 4;
+                    PRAGMA cache_spill = ON;
+                    CREATE TABLE audit_recovery(id INTEGER PRIMARY KEY, value TEXT);
+                    WITH RECURSIVE ids(x) AS(SELECT 1 UNION ALL SELECT x+1 FROM ids WHERE x<100)
+                    INSERT INTO audit_recovery SELECT x, printf('%04096d', 1) FROM ids;
+                    """;
+                command.ExecuteNonQuery();
+
+                using var transaction = connection.BeginTransaction();
+                command.Transaction = transaction;
+                command.CommandText = "UPDATE audit_recovery SET value = printf('%04096d', 2)";
+                command.ExecuteNonQuery();
+                // Copy the on-disk state at a point where cache spill has written uncommitted pages.
+                interruptedDatabase = ReadShared(database);
+                hotJournal = ReadShared(database + "-journal");
+                Assert.AreNotEqual(0, hotJournal[0], "The captured rollback journal is not hot.");
+            }
+
+            File.WriteAllBytes(database, interruptedDatabase);
+            File.WriteAllBytes(database + "-journal", hotJournal);
+            service.ReleaseSession(session.SessionId);
+            var listing = await service.GetRecoverableSessionsAsync(CancellationToken.None);
+            Assert.IsTrue(Assert.ContainsSingle(listing).RequiresJournalRecovery);
+            Assert.IsTrue(File.Exists(database + "-journal"), "Listing must leave recovery to explicit resume.");
+            var recovered = await service.RecoverAsync(session.SessionId, CancellationToken.None, session.UpdatedAtUtc);
+            using var check = SqliteSupport.CreateConnection(recovered.WorkingSqlitePath, SqliteOpenMode.ReadOnly);
+            check.Open();
+            using var query = check.CreateCommand();
+            query.CommandText = "SELECT COUNT(*) FROM audit_recovery WHERE substr(value,-1)='1'";
+            Assert.AreEqual(100L, query.ExecuteScalar());
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+
+        static byte[] ReadShared(string path)
+        {
+            using var sourceStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var buffer = new MemoryStream();
+            sourceStream.CopyTo(buffer);
+            return buffer.ToArray();
+        }
+    }
+
+    [TestMethod]
+    public async Task CleanupFailureReturnsClosedResultAndCanBeRetried()
+    {
+        string root = Directory.CreateTempSubdirectory("PcmCdbEditorClose-").FullName;
+        string source = Path.Combine(root, "original.cdb");
+        string sessions = Path.Combine(root, "sessions");
+        string backups = Path.Combine(root, "backups");
+        try
+        {
+            await File.WriteAllTextAsync(source, "original");
+            using var service = new WorkspaceService(new SyntheticConverter(), sessions, backups)
+            {
+                DeleteCompletedDirectory = _ => throw new IOException("Injected cleanup failure.")
+            };
+            EditorSessionState session = await service.OpenAsync(new WorkspaceOpenRequest(source), CancellationToken.None);
+            WorkspaceCloseResult result = await service.CloseAsync(session, false, CancellationToken.None);
+            Assert.IsNotNull(result.RemainingDirectory);
+            Assert.IsTrue(Directory.Exists(result.RemainingDirectory));
+            Assert.IsFalse(Directory.Exists(session.SessionDirectory));
+
+            using var cleanup = new WorkspaceService(new SyntheticConverter(), sessions, backups);
+            string unrelated = Path.Combine(sessions, $".closed-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(unrelated);
+            await cleanup.CleanCompletedSessionsAsync(CancellationToken.None);
+            Assert.IsFalse(Directory.Exists(result.RemainingDirectory));
+            Assert.IsTrue(Directory.Exists(unrelated));
+            Assert.AreEqual("original", await File.ReadAllTextAsync(source));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task CleanupReclaimsVerifiedReadySessionAndOnlyItsTrackedStages()
+    {
+        string root = Directory.CreateTempSubdirectory("PcmCdbEditorStages-").FullName;
+        string source = Path.Combine(root, "original.cdb");
+        string sessions = Path.Combine(root, "sessions");
+        try
+        {
+            await File.WriteAllTextAsync(source, "original");
+            using var service = new WorkspaceService(new SyntheticConverter(), sessions, Path.Combine(root, "backups"));
+            EditorSessionState session = await service.OpenAsync(new WorkspaceOpenRequest(source), CancellationToken.None);
+            var attempt = new WorkspaceSaveAttempt(Guid.NewGuid(), source, root);
+            string stage = Path.Combine(root, $".original.{attempt.Id:N}.sqlite");
+            string sidecar = stage + "-journal";
+            string backup = Path.Combine(root, $"original-backup-{attempt.Id:N}.cdb");
+            string unrelated = Path.Combine(root, $".original.{Guid.NewGuid():N}.sqlite");
+            foreach (string path in new[] { stage, sidecar, backup, unrelated })
+            {
+                await File.WriteAllTextAsync(path, "fixture");
+            }
+            await File.WriteAllTextAsync(Path.Combine(session.SessionDirectory, "session.json"),
+                System.Text.Json.JsonSerializer.Serialize(session with { PendingSaveAttempt = attempt }));
+
+            await service.CleanCompletedSessionsAsync(CancellationToken.None);
+            Assert.IsTrue(File.Exists(stage), "An active owner retains its stage.");
+            service.ReleaseSession(session.SessionId);
+            await service.CleanCompletedSessionsAsync(CancellationToken.None);
+
+            Assert.IsFalse(Directory.Exists(session.SessionDirectory));
+            Assert.IsFalse(File.Exists(stage));
+            Assert.IsFalse(File.Exists(sidecar));
+            Assert.IsTrue(File.Exists(backup));
+            Assert.IsTrue(File.Exists(unrelated));
+            Assert.AreEqual("original", await File.ReadAllTextAsync(source));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task LockedStageSurvivesSubsequentMetadataWritesAndDoesNotPreventResume()
+    {
+        string root = Directory.CreateTempSubdirectory("PcmCdbEditorResume-").FullName;
+        string source = Path.Combine(root, "original.cdb");
+        string sessions = Path.Combine(root, "sessions");
+        try
+        {
+            await File.WriteAllTextAsync(source, "original");
+            using var service = new WorkspaceService(new SyntheticConverter(), sessions, Path.Combine(root, "backups"));
+            EditorSessionState session = await service.OpenAsync(new WorkspaceOpenRequest(source), CancellationToken.None);
+            var attempt = new WorkspaceSaveAttempt(Guid.NewGuid(), source, root);
+            string stage = Path.Combine(root, $".original.{attempt.Id:N}.sqlite");
+            await File.WriteAllTextAsync(Path.Combine(session.SessionDirectory, "session.json"),
+                System.Text.Json.JsonSerializer.Serialize(session with { PendingSaveAttempt = attempt }));
+            EditorSessionState updated = await service.MarkDirtyAsync(session, CancellationToken.None);
+            Assert.AreEqual(attempt, updated.PendingSaveAttempt);
+            service.ReleaseSession(session.SessionId);
+
+            string? remainingDirectory;
+            string newDestination = Path.Combine(root, "saved-as.cdb");
+            using (new FileStream(stage, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                EditorSessionState resumed = await service.RecoverAsync(session.SessionId, CancellationToken.None);
+                var deferredAttempt = attempt with { CleanupNeedsEvidence = true };
+                Assert.AreEqual(deferredAttempt, resumed.PendingSaveAttempt);
+                Assert.IsTrue(File.Exists(resumed.WorkingSqlitePath));
+
+                WorkspaceSaveResult saved = await service.SaveAsAsync(resumed, newDestination, CancellationToken.None);
+                Assert.AreEqual(deferredAttempt, Assert.ContainsSingle(saved.Session.DeferredSaveAttempts!));
+                Assert.IsFalse(saved.Session.IsDirty);
+                Assert.IsTrue(File.Exists(newDestination));
+
+                WorkspaceCloseResult closed = await service.CloseAsync(saved.Session, false, CancellationToken.None);
+                remainingDirectory = closed.RemainingDirectory;
+                Assert.IsNotNull(remainingDirectory);
+                Assert.IsFalse(Directory.Exists(resumed.SessionDirectory));
+                Assert.IsTrue(Directory.Exists(remainingDirectory));
+            }
+
+            await service.CleanCompletedSessionsAsync(CancellationToken.None);
+            Assert.IsFalse(Directory.Exists(remainingDirectory));
+            Assert.IsFalse(File.Exists(stage));
+            Assert.IsTrue(File.Exists(newDestination));
+            Assert.AreEqual("original", await File.ReadAllTextAsync(source));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task UnavailableSaveFolderRetainsCleanupThroughResumeAndClose()
+    {
+        string root = Directory.CreateTempSubdirectory("PcmCdbEditorOfflineStage-").FullName;
+        string source = Path.Combine(root, "original.cdb");
+        string staging = Path.Combine(root, "destination-folder");
+        string unavailableStaging = Path.Combine(root, "unavailable-folder");
+        try
+        {
+            await File.WriteAllTextAsync(source, "original").ConfigureAwait(false);
+            Directory.CreateDirectory(staging);
+            using var service = new WorkspaceService(new SyntheticConverter(), Path.Combine(root, "sessions"), Path.Combine(root, "backups"));
+            EditorSessionState session = await service.OpenAsync(new WorkspaceOpenRequest(source), CancellationToken.None)
+                .ConfigureAwait(false);
+            var attempt = new WorkspaceSaveAttempt(Guid.NewGuid(), Path.Combine(staging, "export.cdb"), staging);
+            string stage = Path.Combine(staging, $".export.{attempt.Id:N}.sqlite");
+            string unrelated = Path.Combine(staging, "keep.sqlite");
+            await File.WriteAllTextAsync(stage, "recorded stage").ConfigureAwait(false);
+            await File.WriteAllTextAsync(unrelated, "unrelated file").ConfigureAwait(false);
+            await File.WriteAllTextAsync(Path.Combine(session.SessionDirectory, "session.json"),
+                System.Text.Json.JsonSerializer.Serialize(session with
+                {
+                    Lifecycle = EditorSessionLifecycle.Saving,
+                    PendingSaveAttempt = attempt
+                })).ConfigureAwait(false);
+            service.ReleaseSession(session.SessionId);
+            Directory.Move(staging, unavailableStaging);
+
+            EditorSessionState resumed = await service.RecoverAsync(session.SessionId, CancellationToken.None).ConfigureAwait(false);
+            Assert.AreEqual(attempt.Id, resumed.PendingSaveAttempt?.Id);
+            WorkspaceSaveAttempt? tracked = (await ReadSessionMetadataAsync(resumed).ConfigureAwait(false)).PendingSaveAttempt;
+            Assert.AreEqual(attempt.Id, tracked?.Id);
+            Assert.IsTrue(tracked?.CleanupNeedsEvidence == true);
+            Assert.IsTrue(File.Exists(resumed.WorkingSqlitePath));
+            Directory.CreateDirectory(staging);
+            WorkspaceCloseResult closed = await service.CloseAsync(resumed, true, CancellationToken.None).ConfigureAwait(false);
+            Assert.IsNotNull(closed.RemainingDirectory);
+
+            Directory.Delete(staging);
+            Directory.Move(unavailableStaging, staging);
+            await service.CleanCompletedSessionsAsync(CancellationToken.None).ConfigureAwait(false);
+            Assert.IsFalse(Directory.Exists(closed.RemainingDirectory));
+            Assert.IsFalse(File.Exists(stage));
+            Assert.AreEqual("unrelated file", await File.ReadAllTextAsync(unrelated).ConfigureAwait(false));
+            Assert.AreEqual("original", await File.ReadAllTextAsync(source).ConfigureAwait(false));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task SaveFailureRetainsTheAttemptWhenItsStagingFolderDisappears()
+    {
+        string root = Directory.CreateTempSubdirectory("PcmCdbEditorLostSaveFolder-").FullName;
+        string source = Path.Combine(root, "original.cdb");
+        string staging = Path.Combine(root, "destination-folder");
+        string unavailableStaging = Path.Combine(root, "unavailable-folder");
+        string destination = Path.Combine(staging, "export.cdb");
+        try
+        {
+            Directory.CreateDirectory(staging);
+            await File.WriteAllTextAsync(source, "original").ConfigureAwait(false);
+            await File.WriteAllTextAsync(destination, "previous destination").ConfigureAwait(false);
+            bool hideFolderAfterImport = true;
+            var converter = new SyntheticConverter
+            {
+                AfterImport = _ =>
+                {
+                    if (hideFolderAfterImport)
+                    {
+                        Directory.Move(staging, unavailableStaging);
+                    }
+                }
+            };
+            using var service = new WorkspaceService(converter, Path.Combine(root, "sessions"), Path.Combine(root, "backups"));
+            EditorSessionState session = await service.OpenAsync(new WorkspaceOpenRequest(source), CancellationToken.None)
+                .ConfigureAwait(false);
+            session = await service.MarkDirtyAsync(session, CancellationToken.None).ConfigureAwait(false);
+            converter.SessionMetadataPath = Path.Combine(session.SessionDirectory, "session.json");
+
+            await Assert.ThrowsExactlyAsync<FileNotFoundException>(() =>
+                service.SaveAsAsync(session, destination, CancellationToken.None)).ConfigureAwait(false);
+            WorkspaceSaveAttempt? attempt = (await ReadSessionMetadataAsync(session).ConfigureAwait(false)).PendingSaveAttempt;
+            Assert.IsNotNull(attempt);
+            Assert.AreEqual(destination, attempt.DestinationPath);
+            Assert.IsNotNull(attempt.StagingDirectoryIdentity);
+
+            hideFolderAfterImport = false;
+            WorkspaceSaveResult retry = await service.SaveAsAsync(session, destination, CancellationToken.None).ConfigureAwait(false);
+            Assert.AreEqual(attempt, Assert.ContainsSingle(retry.Session.DeferredSaveAttempts!));
+            Assert.AreEqual("converted-output", await File.ReadAllTextAsync(destination).ConfigureAwait(false));
+            string replacement = Path.Combine(root, "replacement-folder");
+            Directory.Move(staging, replacement);
+            Directory.Move(unavailableStaging, staging);
+            WorkspaceCloseResult closed = await service.CloseAsync(retry.Session, false, CancellationToken.None).ConfigureAwait(false);
+            Assert.IsNull(closed.RemainingDirectory);
+            Assert.IsFalse(File.Exists(Path.Combine(staging, $".export.{attempt.Id:N}.cdb")));
+            Assert.AreEqual("previous destination", await File.ReadAllTextAsync(destination).ConfigureAwait(false));
+            Assert.AreEqual("converted-output", await File.ReadAllTextAsync(Path.Combine(replacement, "export.cdb")).ConfigureAwait(false));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
     public async Task SavePathsCannotPointIntoManagedSessions()
     {
         string root = Directory.CreateTempSubdirectory("PcmCdbEditorSave-").FullName;
@@ -411,7 +768,7 @@ public sealed class WorkspaceServiceTests
     }
 
     [TestMethod]
-    public async Task MetadataFailureAfterCommitReportsCommittedSave()
+    public async Task MetadataFailureAfterCommitAllowsClosingOnlyTheVerifiedCommittedSave()
     {
         var root = Path.Combine(Path.GetTempPath(), "PcmCdbEditorTests", Guid.NewGuid().ToString("N"));
         var source = Path.Combine(root, "neutral.cdb");
@@ -420,10 +777,15 @@ public sealed class WorkspaceServiceTests
         await File.WriteAllTextAsync(source, "source").ConfigureAwait(false);
         await File.WriteAllTextAsync(destination, "safe-old").ConfigureAwait(false);
         FileStream? metadataLock = null;
+        bool rejectRetry = false;
         var converter = new SyntheticConverter
         {
             AfterImport = sessionMetadataPath =>
             {
+                if (rejectRetry)
+                {
+                    throw new InvalidOperationException("Synthetic retry failure before replacement.");
+                }
                 metadataLock = new FileStream(
                     sessionMetadataPath,
                     FileMode.Open,
@@ -458,6 +820,46 @@ public sealed class WorkspaceServiceTests
             Assert.AreEqual(
                 "safe-old",
                 await File.ReadAllTextAsync(exception.CommittedSave.BackupPath).ConfigureAwait(false));
+
+            metadataLock!.Dispose();
+            metadataLock = null;
+            EditorSessionState saved = exception.CommittedSave.Session;
+            Assert.AreEqual(EditorSessionLifecycle.Saving,
+                (await ReadSessionMetadataAsync(saved).ConfigureAwait(false)).Lifecycle);
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+                service.CloseAsync(saved with { }, false, CancellationToken.None)).ConfigureAwait(false);
+
+            string metadataPath = Path.Combine(saved.SessionDirectory, "session.json");
+            string savingMetadata = await File.ReadAllTextAsync(metadataPath).ConfigureAwait(false);
+            await File.WriteAllTextAsync(destination, "outside change").ConfigureAwait(false);
+            await File.WriteAllTextAsync(metadataPath, "{").ConfigureAwait(false);
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+                service.CloseAsync(saved, false, CancellationToken.None)).ConfigureAwait(false);
+            await File.WriteAllTextAsync(metadataPath, savingMetadata).ConfigureAwait(false);
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+                service.CloseAsync(saved, false, CancellationToken.None)).ConfigureAwait(false);
+            Assert.IsTrue(Directory.Exists(saved.SessionDirectory));
+            await File.WriteAllTextAsync(destination, "converted-output").ConfigureAwait(false);
+
+            string blockedClose = Path.Combine(Path.GetDirectoryName(saved.SessionDirectory)!, $".closed-{saved.SessionId:N}");
+            Directory.CreateDirectory(blockedClose);
+            await Assert.ThrowsExactlyAsync<IOException>(() =>
+                service.CloseAsync(saved, false, CancellationToken.None)).ConfigureAwait(false);
+            Assert.AreEqual(EditorSessionLifecycle.Ready,
+                (await ReadSessionMetadataAsync(saved).ConfigureAwait(false)).Lifecycle);
+            Directory.Delete(blockedClose);
+            await File.WriteAllTextAsync(destination, "changed after metadata repair").ConfigureAwait(false);
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+                service.CloseAsync(saved, false, CancellationToken.None)).ConfigureAwait(false);
+            await File.WriteAllTextAsync(destination, "converted-output").ConfigureAwait(false);
+
+            rejectRetry = true;
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+                service.SaveAsync(saved, CancellationToken.None)).ConfigureAwait(false);
+            WorkspaceCloseResult closed = await service.CloseAsync(saved, false, CancellationToken.None).ConfigureAwait(false);
+            Assert.IsNull(closed.RemainingDirectory);
+            Assert.IsFalse(Directory.Exists(saved.SessionDirectory));
+            Assert.AreEqual("converted-output", await File.ReadAllTextAsync(destination).ConfigureAwait(false));
         }
         finally
         {
@@ -921,6 +1323,58 @@ public sealed class WorkspaceServiceTests
         {
             service.Dispose();
             if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task CancellingResumeDuringLockedValidationKeepsMetadataAndReleasesTheSession()
+    {
+        string root = Directory.CreateTempSubdirectory("PcmCdbEditorResumeCancel-").FullName;
+        string source = Path.Combine(root, "neutral.cdb");
+        using var service = new WorkspaceService(new SyntheticConverter(), Path.Combine(root, "sessions"), Path.Combine(root, "backups"));
+        try
+        {
+            await File.WriteAllTextAsync(source, "source").ConfigureAwait(false);
+            EditorSessionState session = await service.OpenAsync(new WorkspaceOpenRequest(source), CancellationToken.None)
+                .ConfigureAwait(false);
+            session = await service.MarkDirtyAsync(session, CancellationToken.None).ConfigureAwait(false);
+            service.ReleaseSession(session.SessionId);
+            string metadataPath = Path.Combine(session.SessionDirectory, "session.json");
+            string before = await File.ReadAllTextAsync(metadataPath).ConfigureAwait(false);
+
+            await using var connection = SqliteSupport.CreateConnection(session.WorkingSqlitePath);
+            await connection.OpenAsync().ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "BEGIN EXCLUSIVE";
+            await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+            using var cancellation = new CancellationTokenSource();
+            Task<EditorSessionState> recovery = service.RecoverAsync(session.SessionId, cancellation.Token, session.UpdatedAtUtc);
+            try
+            {
+                await Task.Delay(250).ConfigureAwait(false);
+                Assert.IsFalse(recovery.IsCompleted, "Validation should be waiting for the SQLite lock.");
+                await cancellation.CancelAsync().ConfigureAwait(false);
+                await Assert.ThrowsAsync<OperationCanceledException>(() => recovery.WaitAsync(TimeSpan.FromSeconds(5)))
+                    .ConfigureAwait(false);
+                Assert.AreEqual(before, await File.ReadAllTextAsync(metadataPath).ConfigureAwait(false));
+            }
+            finally
+            {
+                await cancellation.CancelAsync().ConfigureAwait(false);
+                command.CommandText = "ROLLBACK";
+                await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+                await ((Task)recovery).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            }
+
+            EditorSessionState resumed = await service.RecoverAsync(session.SessionId, CancellationToken.None, session.UpdatedAtUtc)
+                .ConfigureAwait(false);
+            Assert.IsTrue(resumed.IsDirty);
+            Assert.AreEqual(session.SessionId, resumed.SessionId);
+        }
+        finally
+        {
+            service.Dispose();
+            Directory.Delete(root, recursive: true);
         }
     }
 

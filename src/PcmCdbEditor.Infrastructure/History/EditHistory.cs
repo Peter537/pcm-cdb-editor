@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json.Serialization;
 using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
 using PcmCdbEditor.Infrastructure.Internal;
@@ -22,6 +23,7 @@ public sealed class EditHistory : IEditHistory
     private Guid _savedStateId;
     private bool _recoveredInterruptedReplay;
     private bool _historyUncertain;
+    private EditHistorySnapshot _view = null!;
 
     public EditHistory(string? snapshotPath = null, bool recovering = false)
     {
@@ -31,38 +33,30 @@ public sealed class EditHistory : IEditHistory
         {
             LoadSnapshot(recovering);
         }
+        PublishView();
     }
 
-    public EditHistoryState State
-    {
-        get
-        {
-            lock (_gate)
-            {
-                return new EditHistoryState(
-                    _undo.Count > 0,
-                    _redo.Count > 0,
-                    _undo.Count,
-                    _redo.Count,
-                    _historyUncertain || _currentStateId != _savedStateId,
-                    _pending is not null,
-                    _recoveredInterruptedReplay,
-                    _historyUncertain);
-            }
-        }
-    }
+    public EditHistoryState State => Volatile.Read(ref _view).State;
 
-    public EditHistorySnapshot GetSnapshot()
+    public EditHistorySnapshot GetSnapshot() => Volatile.Read(ref _view);
+
+    private void PublishView()
     {
-        lock (_gate)
-        {
-            return EditHistorySnapshot.FromTimeline(
-                State,
-                _currentStateId,
-                _savedStateId,
-                _undo.Select(static entry => (entry.Operation, entry.BeforeStateId)),
-                _redo.Select(static entry => (entry.Operation, entry.AfterStateId)));
-        }
+        var state = new EditHistoryState(
+            _undo.Count > 0,
+            _redo.Count > 0,
+            _undo.Count,
+            _redo.Count,
+            _historyUncertain || _currentStateId != _savedStateId,
+            _pending is not null,
+            _recoveredInterruptedReplay,
+            _historyUncertain);
+        Volatile.Write(ref _view, EditHistorySnapshot.FromTimeline(
+            state,
+            _currentStateId,
+            _savedStateId,
+            _undo.Select(static entry => (entry.Operation, entry.BeforeStateId)),
+            _redo.Select(static entry => (entry.Operation, entry.AfterStateId))));
     }
 
     public void Record(EditOperation operation) => Record(operation, []);
@@ -78,10 +72,25 @@ public sealed class EditHistory : IEditHistory
                 FreezeGuards(undoGuards),
                 _currentStateId,
                 Guid.NewGuid());
+            HistoryEntry[] previousRedo = _redo.ToArray();
             _undo.Push(entry);
             _redo.Clear();
             _currentStateId = entry.AfterStateId;
-            Persist();
+            try
+            {
+                Persist();
+            }
+            catch
+            {
+                _undo.Pop();
+                foreach (HistoryEntry item in previousRedo.Reverse())
+                {
+                    _redo.Push(item);
+                }
+                _currentStateId = entry.BeforeStateId;
+                throw;
+            }
+            PublishView();
         }
     }
 
@@ -199,6 +208,7 @@ public sealed class EditHistory : IEditHistory
             }
             _savedStateId = _currentStateId;
             _historyUncertain = false;
+            PublishView();
         }
     }
 
@@ -207,9 +217,13 @@ public sealed class EditHistory : IEditHistory
         lock (_gate)
         {
             EnsureNoPendingReplay();
+            if (_snapshotPath is not null)
+            {
+                Persist(CaptureDocument() with { Undo = [], Redo = [] });
+            }
             _undo.Clear();
             _redo.Clear();
-            Persist();
+            PublishView();
         }
     }
 
@@ -234,6 +248,7 @@ public sealed class EditHistory : IEditHistory
             source.Push(entry);
             throw;
         }
+        PublishView();
         return replay;
     }
 
@@ -244,19 +259,24 @@ public sealed class EditHistory : IEditHistory
     {
         PendingReplay pending = RequirePending(replay, direction);
         var completed = pending.Entry with { Guards = FreezeGuards(oppositeGuards) };
-        if (direction == EditReplayDirection.Undo)
-        {
-            _redo.Push(completed);
-            _currentStateId = completed.BeforeStateId;
-        }
-        else
-        {
-            _undo.Push(completed);
-            _currentStateId = completed.AfterStateId;
-        }
-
+        bool isUndo = direction == EditReplayDirection.Undo;
+        Stack<HistoryEntry> destination = isUndo ? _redo : _undo;
+        Guid previousState = _currentStateId;
+        destination.Push(completed);
+        _currentStateId = isUndo ? completed.BeforeStateId : completed.AfterStateId;
         _pending = null;
-        Persist();
+        try
+        {
+            Persist();
+        }
+        catch
+        {
+            destination.Pop();
+            _currentStateId = previousState;
+            _pending = pending;
+            throw;
+        }
+        PublishView();
     }
 
     private void RestoreReplay(EditHistoryReplay replay, EditReplayDirection direction)
@@ -289,6 +309,7 @@ public sealed class EditHistory : IEditHistory
             _pending = pending;
             throw;
         }
+        PublishView();
     }
 
     private void LoadSnapshot(bool recovering)
@@ -660,7 +681,7 @@ public sealed class EditHistory : IEditHistory
             values.ToDictionary(
                 static pair => pair.Key,
                 static pair => ValueEnvelope.From(pair.Value),
-                StringComparer.OrdinalIgnoreCase);
+                SqliteIdentifierComparer.Instance);
 
         private static IEnumerable<KeyValuePair<string, SqliteValue>> ThawValues(
             IReadOnlyDictionary<string, ValueEnvelope> values) =>
@@ -693,7 +714,7 @@ public sealed class EditHistory : IEditHistory
             values.ToDictionary(
                 static pair => pair.Key,
                 static pair => ValueEnvelope.From(pair.Value),
-                StringComparer.OrdinalIgnoreCase);
+                SqliteIdentifierComparer.Instance);
     }
 
     private sealed record RowEnvelope(
@@ -705,7 +726,7 @@ public sealed class EditHistory : IEditHistory
             row.Values.ToDictionary(
                 static pair => pair.Key,
                 static pair => ValueEnvelope.From(pair.Value),
-                StringComparer.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance));
 
         public TypedRow ToRow() => new(
             Identity?.ToIdentity(),
@@ -749,7 +770,7 @@ public sealed class EditHistory : IEditHistory
     private sealed record ValueEnvelope(
         SqliteValueKind Kind,
         long IntegerValue,
-        double RealValue,
+        [property: JsonNumberHandling(JsonNumberHandling.AllowNamedFloatingPointLiterals)] double RealValue,
         string? TextValue,
         string? BlobBase64)
     {

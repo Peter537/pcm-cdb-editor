@@ -1,3 +1,5 @@
+using PcmCdbEditor.Domain;
+
 namespace PcmCdbEditor.App;
 
 internal static class TabCloseSelectionReconciler
@@ -22,25 +24,25 @@ internal static class TabCloseSelectionReconciler
         }
 
         string[] remainingTables = openTablesBeforeClose
-            .Where(table => !table.Equals(closingTable, StringComparison.OrdinalIgnoreCase))
+            .Where(table => !SqliteIdentifierComparer.Instance.Equals(table, closingTable))
             .ToArray();
         string? selectedTable = MatchRemaining(remainingTables, selectedAfterRemoval);
         if (selectedTable is null &&
             selectedBeforeClose is not null &&
-            !selectedBeforeClose.Equals(closingTable, StringComparison.OrdinalIgnoreCase))
+            !SqliteIdentifierComparer.Instance.Equals(selectedBeforeClose, closingTable))
         {
             selectedTable = MatchRemaining(remainingTables, selectedBeforeClose);
         }
 
         if (selectedTable is null &&
-            selectedBeforeClose?.Equals(closingTable, StringComparison.OrdinalIgnoreCase) == true &&
+            SqliteIdentifierComparer.Instance.Equals(selectedBeforeClose, closingTable) &&
             remainingTables.Length > 0)
         {
             selectedTable = remainingTables[Math.Min(closingIndex, remainingTables.Length - 1)];
         }
 
         string? sidebarTable = selectedTable is not null &&
-            visibleTables.Contains(selectedTable, StringComparer.OrdinalIgnoreCase)
+            visibleTables.Contains(selectedTable, SqliteIdentifierComparer.Instance)
                 ? selectedTable
                 : null;
         return new TabCloseSelectionResolution(selectedTable, sidebarTable);
@@ -50,7 +52,7 @@ internal static class TabCloseSelectionReconciler
     {
         for (var index = 0; index < tables.Count; index++)
         {
-            if (tables[index].Equals(tableName, StringComparison.OrdinalIgnoreCase))
+            if (SqliteIdentifierComparer.Instance.Equals(tables[index], tableName))
             {
                 return index;
             }
@@ -63,7 +65,7 @@ internal static class TabCloseSelectionReconciler
         tableName is null
             ? null
             : remainingTables.FirstOrDefault(table =>
-                table.Equals(tableName, StringComparison.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance.Equals(table, tableName));
 }
 
 internal sealed record TabCloseSelectionResolution(

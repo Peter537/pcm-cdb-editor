@@ -15,7 +15,7 @@ public static class RelationshipMetadata
         ArgumentNullException.ThrowIfNull(table);
         relation = null!;
         ForeignKeyRelation[] matches = table.Relationships.Where(candidate =>
-            candidate.SourceColumn.Equals(sourceColumn, StringComparison.OrdinalIgnoreCase)).ToArray();
+            SqliteIdentifierComparer.Instance.Equals(candidate.SourceColumn, sourceColumn)).ToArray();
         reason = matches.Length switch
         {
             0 => "No known relationship for this column.",
@@ -64,7 +64,7 @@ public static class RelationshipMetadata
         ForeignKeyRelation? match = null;
         foreach (ForeignKeyRelation candidate in table.Relationships)
         {
-            if (!candidate.SourceColumn.Equals(sourceColumn, StringComparison.OrdinalIgnoreCase))
+            if (!SqliteIdentifierComparer.Instance.Equals(candidate.SourceColumn, sourceColumn))
             {
                 continue;
             }
@@ -91,5 +91,5 @@ public static class RelationshipMetadata
 
     private static bool HasVisibleColumn(TableSchema table, string? name) =>
         !string.IsNullOrWhiteSpace(name) && table.Columns.Any(column =>
-            !column.IsHidden && column.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            !column.IsHidden && SqliteIdentifierComparer.Instance.Equals(column.Name, name));
 }

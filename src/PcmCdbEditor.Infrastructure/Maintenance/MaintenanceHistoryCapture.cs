@@ -39,7 +39,7 @@ internal static class MaintenanceHistoryCapture
         }
 
         ColumnSchema column = table.Columns.FirstOrDefault(candidate =>
-            candidate.Name.Equals(idColumn, StringComparison.OrdinalIgnoreCase))
+            SqliteIdentifierComparer.Instance.Equals(candidate.Name, idColumn))
             ?? throw new InvalidOperationException(
                 $"Maintenance history column '{idColumn}' no longer exists in '{table.Name}'.");
         string[] parameterNames = ids.Select((_, index) => $"$historyId{index}").ToArray();
@@ -82,7 +82,7 @@ internal static class MaintenanceHistoryCapture
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            var values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+            var values = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
             for (var ordinal = 0; ordinal < columns.Length; ordinal++)
             {
                 values[columns[ordinal].Name] = ReadValue(reader, ordinal);

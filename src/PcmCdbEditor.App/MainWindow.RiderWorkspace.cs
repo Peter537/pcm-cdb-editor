@@ -114,7 +114,12 @@ public sealed partial class MainWindow
     private void RiderDraftRole_Changed(object sender, SelectionChangedEventArgs e) => InvalidateRiderCreationPreview();
     private void RiderBulkValue_Changed(NumberBox sender, NumberBoxValueChangedEventArgs e) => ClearRiderValidationMessage();
 
-    private async Task SearchRiderLookupAsync(AutoSuggestBox sender, RiderLookupTarget? target, int limit)
+    private Task SearchRiderLookupAsync(AutoSuggestBox sender, RiderLookupTarget? target, int limit) =>
+        RunSessionReaderAsync(token => SearchRiderLookupCoreAsync(sender, target, limit, token),
+            _lifetimeCancellation.Token);
+
+    private async Task SearchRiderLookupCoreAsync(
+        AutoSuggestBox sender, RiderLookupTarget? target, int limit, CancellationToken sessionToken)
     {
         if (target is null || _session is not { } session || _riderCreationSessionId != session.SessionId)
         {
@@ -122,7 +127,7 @@ public sealed partial class MainWindow
         }
 
         CancelRiderLookup(sender);
-        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(sessionToken);
         CancellationToken token = cancellation.Token;
         _riderLookupCancellations[sender] = cancellation;
         string search = sender.Text;

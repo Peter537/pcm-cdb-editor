@@ -1,3 +1,4 @@
+using PcmCdbEditor.Domain;
 using System.Globalization;
 using Microsoft.Data.Sqlite;
 
@@ -25,13 +26,18 @@ internal static class SqliteSupport
         return $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
     }
 
+    public static string EscapeLikeLiteral(string value) => value
+        .Replace("\\", "\\\\", StringComparison.Ordinal)
+        .Replace("%", "\\%", StringComparison.Ordinal)
+        .Replace("_", "\\_", StringComparison.Ordinal);
+
     public static async Task<HashSet<string>> ReadTableNamesAsync(
         SqliteConnection connection,
         CancellationToken cancellationToken)
     {
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var names = new HashSet<string>(SqliteIdentifierComparer.Instance);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'";
+        command.CommandText = "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite!_%' ESCAPE '!'";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -49,7 +55,7 @@ internal static class SqliteSupport
         string tableName,
         CancellationToken cancellationToken)
     {
-        var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var columns = new HashSet<string>(SqliteIdentifierComparer.Instance);
         await using var command = connection.CreateCommand();
         command.CommandText = $"PRAGMA table_xinfo({QuoteIdentifier(tableName)})";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -71,7 +77,7 @@ internal static class SqliteSupport
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT gene_i_date FROM GAM_config ORDER BY rowid LIMIT 2";
+        command.CommandText = "SELECT gene_i_date FROM GAM_config LIMIT 2";
         var values = new List<string>(capacity: 2);
         var rows = 0;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);

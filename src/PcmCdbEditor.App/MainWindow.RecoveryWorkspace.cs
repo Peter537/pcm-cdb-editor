@@ -95,6 +95,10 @@ public sealed partial class MainWindow
     private static ListViewItem CreateRecoveryItem(RecoverableSession recoverable)
     {
         string label = DescribeRecoverySession(recoverable.Session);
+        if (recoverable.RequiresJournalRecovery)
+        {
+            label += "\nSQLite journal recovery is required before editing.";
+        }
         var item = new ListViewItem
         {
             Tag = recoverable,
@@ -126,24 +130,20 @@ public sealed partial class MainWindow
         }
 
         EditorSessionState? recovered = null;
-        bool activated = false;
         try
         {
-            if (!await CloseCurrentSessionForReplacementAsync(cancellationToken))
+            bool? discard = await ConfirmSessionReplacementAsync(cancellationToken);
+            if (discard is null)
             {
                 return;
             }
 
             SetBusyPresentation(
                 "Resuming working session",
-                "Validating the isolated CDB and SQLite working files.",
-                allowCancellation: false);
+                "Validating the isolated CDB and SQLite working files.");
             recovered = await _workspaceService.RecoverAsync(
                 selected.SessionId, cancellationToken, expectedUpdatedAtUtc: selected.UpdatedAtUtc);
-            DatabaseSchemaCatalog catalog = await _tableCatalog.DiscoverAsync(
-                recovered.WorkingSqlitePath, cancellationToken);
-            await ActivateSessionAsync(recovered, catalog, cancellationToken);
-            activated = true;
+            string? remaining = await ReplaceSessionAsync(recovered, discard.Value, cancellationToken);
             if (ReferenceEquals(Navigation.SelectedItem, RecoveryNavigationItem))
             {
                 Navigation.SelectedItem = TablesNavigationItem;
@@ -159,40 +159,35 @@ public sealed partial class MainWindow
             {
                 PresentSuccess("Unsaved work resumed", "The recovered working copy is open for editing.");
             }
+            if (_session?.PendingSaveAttempt is not null || _session?.DeferredSaveAttempts is { Count: > 0 })
+            {
+                PresentWarning("Unsaved work resumed with pending save cleanup",
+                    "The working database is open. An earlier save left staging files that could not be removed yet.");
+            }
+            PresentRemainingSessionCleanup(remaining);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             if (!_lifetimeCancellation.IsCancellationRequested)
             {
-                RestoreAfterFailedRecovery(recovered);
+                RestoreAfterFailedOpen();
+                PresentWarning("Resume cancelled", "The selected session can still be recovered. Any previously open session is still available.");
             }
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            RestoreAfterFailedRecovery(recovered);
+            RestoreAfterFailedOpen();
             PresentError("Could not resume the session",
                 SafeFailureMessage(exception, "Refresh to check whether the selected working session is still available."));
         }
         finally
         {
-            if (!activated && recovered is not null)
+            if (recovered is not null && _session?.SessionId != recovered.SessionId)
             {
                 _workspaceService.ReleaseSession(recovered.SessionId);
             }
             EndOperation();
             await RefreshRecoverySessionsAsync(_lifetimeCancellation.Token);
-        }
-    }
-
-    private void RestoreAfterFailedRecovery(EditorSessionState? recovered)
-    {
-        if (recovered is not null && _session?.SessionId == recovered.SessionId)
-        {
-            ResetToNoFile();
-        }
-        else
-        {
-            RestoreSessionState();
         }
     }
 
@@ -212,9 +207,16 @@ public sealed partial class MainWindow
                     "Discard session",
                     "Keep session"))
             {
-                await _workspaceService.DiscardRecoverableSessionAsync(
+                WorkspaceCloseResult close = await _workspaceService.DiscardRecoverableSessionAsync(
                     selected.SessionId, selected.UpdatedAtUtc, cancellationToken);
-                PresentSuccess("Working session discarded", "The selected working copy was removed.");
+                if (close.RemainingDirectory is { } remaining)
+                {
+                    PresentWarning("Session discarded with files left for cleanup", remaining);
+                }
+                else
+                {
+                    PresentSuccess("Working session discarded", "The selected working copy was removed.");
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

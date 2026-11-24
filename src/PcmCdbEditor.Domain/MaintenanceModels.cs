@@ -591,18 +591,29 @@ public sealed record MaintenanceApplyResult(
 
 public sealed record CountryQuotaValues(long WorldRoad, long WorldTimeTrial, long EuropeanRoad, long EuropeanTimeTrial);
 
+public sealed record StoredCountryQuotaValues(
+    long? WorldRoad,
+    long? WorldTimeTrial,
+    long? EuropeanRoad,
+    long? EuropeanTimeTrial);
+
 public sealed record CountryQuotaChange(
     long CountryId,
     string RawCode,
     string CanonicalCode,
     string DisplayName,
-    double UciPoints,
+    decimal UciPoints,
     int WorldRank,
     int? EuropeanRank,
-    CountryQuotaValues OldValues,
+    StoredCountryQuotaValues OldValues,
     CountryQuotaValues NewValues)
 {
     public string? CountryName { get; init; }
+
+    public bool HasChanges => OldValues.WorldRoad != NewValues.WorldRoad ||
+        OldValues.WorldTimeTrial != NewValues.WorldTimeTrial ||
+        OldValues.EuropeanRoad != NewValues.EuropeanRoad ||
+        OldValues.EuropeanTimeTrial != NewValues.EuropeanTimeTrial;
 }
 
 public sealed record CountryQuotaPreview

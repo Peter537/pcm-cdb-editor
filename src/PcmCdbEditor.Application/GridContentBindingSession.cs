@@ -108,7 +108,7 @@ internal sealed class GridContentBindingSession
             rowsByIdentity.TryGetValue(cellIdentity, out T? cellRow))
         {
             currentColumn = visibleColumns.FirstOrDefault(column =>
-                column.Equals(savedColumn, StringComparison.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance.Equals(column, savedColumn));
             currentCellRow = currentColumn is null ? null : cellRow;
         }
 
@@ -121,25 +121,6 @@ internal sealed class GridContentBindingSession
 
         return new GridSelectionResolution<T>(currentRow, currentColumn, selectedRows, currentCellRow);
     }
-}
-
-/// <summary>
-/// Projects a complete replacement off to the side and publishes the new array
-/// with one assignment, so consumers never observe a partially populated source.
-/// </summary>
-internal sealed class BulkRowSource<T>
-{
-    public T[] Items { get; private set; } = [];
-
-    public void Replace<TSource>(IEnumerable<TSource> source, Func<TSource, T> projector)
-    {
-        ArgumentNullException.ThrowIfNull(source);
-        ArgumentNullException.ThrowIfNull(projector);
-        T[] replacement = source.Select(projector).ToArray();
-        Items = replacement;
-    }
-
-    public void Clear() => Items = [];
 }
 
 internal sealed record GridSelectionResolution<T>(

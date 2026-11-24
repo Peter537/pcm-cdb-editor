@@ -15,6 +15,59 @@ public sealed class SqliteCatalogAndStoreTests
     private static readonly string?[] ResolvedCountryOrder = [null, "Belgium", "Denmark"];
 
     [TestMethod]
+    public async Task QueryEntryPointsRejectProgrammaticFiltersOutsideTheComplexityBudget()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE sample(id INTEGER PRIMARY KEY)", "INSERT INTO sample VALUES (1)").ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        var store = new SqliteTableDataStore();
+        var rule = new FilterCondition("id", FilterOperator.Equals, SqliteValue.Integer(1));
+        FilterGroup FlatFilter(int count) => new(FilterGroupOperator.And, Enumerable.Repeat(rule, count));
+        var page = new PageRequest(0, 10);
+        var allowed = new TableQuery("sample", page, filter: FlatFilter(FilterExpressionLimits.MaximumRules));
+        Assert.HasCount(1, (await store.QueryRowsAsync(database.Path, catalog, allowed, CancellationToken.None)
+            .ConfigureAwait(false)).Rows);
+
+        FilterExpression deep = rule;
+        for (int depth = 0; depth < FilterExpressionLimits.MaximumDepth; depth++)
+        {
+            deep = new FilterGroup(FilterGroupOperator.And, [deep]);
+        }
+
+        foreach (FilterExpression rejected in new[] { deep, FlatFilter(FilterExpressionLimits.MaximumRules + 1) })
+        {
+            var invalid = new TableQuery("sample", page, filter: rejected);
+            await Assert.ThrowsExactlyAsync<FilterParseException>(() => store.QueryRowsAsync(
+                database.Path, catalog, invalid, CancellationToken.None)).ConfigureAwait(false);
+            await Assert.ThrowsExactlyAsync<FilterParseException>(() => store.QueryAllRowsAsync(
+                database.Path, catalog, invalid.Definition, CancellationToken.None)).ConfigureAwait(false);
+            await Assert.ThrowsExactlyAsync<FilterParseException>(() => store.CountAsync(
+                database.Path, catalog, invalid, CancellationToken.None)).ConfigureAwait(false);
+        }
+    }
+
+    [TestMethod]
+    [DataRow(500, false)]
+    [DataRow(501, true)]
+    public async Task FullFiniteChunkPreservesSqliteLookaheadWithoutCounting(int rowCount, bool hasMore)
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE sample(id INTEGER PRIMARY KEY)",
+            $"WITH RECURSIVE numbers(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM numbers WHERE x < {rowCount}) " +
+            "INSERT INTO sample SELECT x FROM numbers").ConfigureAwait(false);
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None).ConfigureAwait(false);
+        var store = new SqliteTableDataStore();
+        using var coordinator = new VirtualTableQueryCoordinator(store, database.Path, catalog,
+            new TableQuery("sample", new PageRequest(0, 500)));
+
+        var chunk = await coordinator.LoadChunkContainingAsync(499, CancellationToken.None).ConfigureAwait(false);
+
+        Assert.HasCount(500, chunk.Items);
+        Assert.AreEqual(hasMore, chunk.HasMoreAfter(500));
+        Assert.AreEqual(TableRowCountStatus.Unknown, coordinator.CountState.Status);
+    }
+
+    [TestMethod]
     public async Task CatalogDiscoversCompositeRowIdViewAndConservativeRelationships()
     {
         await using var database = await SqliteTestDatabase.CreateAsync(

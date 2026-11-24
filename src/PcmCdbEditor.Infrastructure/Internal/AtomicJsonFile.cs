@@ -55,7 +55,7 @@ internal static class AtomicJsonFile
         }
     }
 
-    public static async Task UpdateAsync<T>(
+    public static async Task<T> UpdateAsync<T>(
         string path,
         Func<T> defaultFactory,
         Func<T, T> update,
@@ -72,7 +72,9 @@ internal static class AtomicJsonFile
         {
             T current = await ReadOrCreateCoreAsync(fullPath, defaultFactory, cancellationToken)
                 .ConfigureAwait(false);
-            await WriteCoreAsync(fullPath, update(current), cancellationToken).ConfigureAwait(false);
+            T updated = update(current);
+            await WriteCoreAsync(fullPath, updated, cancellationToken).ConfigureAwait(false);
+            return updated;
         }
         finally
         {

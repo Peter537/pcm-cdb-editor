@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
 using PcmCdbEditor.Infrastructure.Internal;
@@ -25,13 +26,29 @@ public sealed class JsonSettingsStore : ISettingsStore
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(preferences);
-        var preferencesDocument = PreferencesDocument.From(Normalize(preferences));
-        await AtomicJsonFile.UpdateAsync(
+        await UpdatePreferencesAsync(_ => preferences, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<EditorPreferences> UpdatePreferencesAsync(
+        Func<EditorPreferences, EditorPreferences> update,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        using var lease = await AcquireLeaseAsync(cancellationToken).ConfigureAwait(false);
+        SettingsDocument updated = await AtomicJsonFile.UpdateAsync(
                 _settingsPath,
                 CreateDefaultDocument,
-                document => NormalizeDocument(document) with { Preferences = preferencesDocument },
+                document =>
+                {
+                    EditorPreferences current = Normalize(document.Preferences?.ToModel() ?? CreateDefaultPreferences());
+                    return NormalizeDocument(document) with
+                    {
+                        Preferences = PreferencesDocument.From(Normalize(update(current)))
+                    };
+                },
                 cancellationToken)
             .ConfigureAwait(false);
+        return updated.Preferences!.ToModel();
     }
 
     public async Task<TableViewState?> LoadTableViewStateAsync(
@@ -48,6 +65,7 @@ public sealed class JsonSettingsStore : ISettingsStore
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(state);
+        using var lease = await AcquireLeaseAsync(cancellationToken).ConfigureAwait(false);
         await AtomicJsonFile.UpdateAsync(
                 _settingsPath,
                 CreateDefaultDocument,
@@ -56,7 +74,7 @@ public sealed class JsonSettingsStore : ISettingsStore
                     document = NormalizeDocument(document);
                     var states = new Dictionary<string, TableViewStateDocument>(
                         document.TableViewStates,
-                        StringComparer.OrdinalIgnoreCase)
+                        SqliteIdentifierComparer.Instance)
                     {
                         [BuildKey(state.SchemaSignature, state.TableName)] = TableViewStateDocument.From(state)
                     };
@@ -68,10 +86,31 @@ public sealed class JsonSettingsStore : ISettingsStore
 
     private async Task<SettingsDocument> LoadAsync(CancellationToken cancellationToken)
     {
+        using var lease = await AcquireLeaseAsync(cancellationToken).ConfigureAwait(false);
         var document = await AtomicJsonFile
             .ReadOrCreateAsync(_settingsPath, CreateDefaultDocument, cancellationToken)
             .ConfigureAwait(false);
         return NormalizeDocument(document);
+    }
+
+    private async Task<FileStream> AcquireLeaseAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
+        var timer = Stopwatch.StartNew();
+        var timeout = TimeSpan.FromSeconds(5);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                return new FileStream(_settingsPath + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException exception) when ((exception.HResult & 0xffff) is 32 or 33 && timer.Elapsed < timeout)
+            {
+                await Task.Delay(25, cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     private static SettingsDocument NormalizeDocument(SettingsDocument document)
@@ -80,7 +119,7 @@ public sealed class JsonSettingsStore : ISettingsStore
         {
             TableViewStates = new Dictionary<string, TableViewStateDocument>(
                 document.TableViewStates ?? [],
-                StringComparer.OrdinalIgnoreCase)
+                SqliteIdentifierComparer.Instance)
         };
     }
 
@@ -114,7 +153,7 @@ public sealed class JsonSettingsStore : ISettingsStore
 
     private static SettingsDocument CreateDefaultDocument() => new(
         PreferencesDocument.From(CreateDefaultPreferences()),
-        new Dictionary<string, TableViewStateDocument>(StringComparer.OrdinalIgnoreCase));
+        new Dictionary<string, TableViewStateDocument>(SqliteIdentifierComparer.Instance));
 
     private sealed record SettingsDocument(
         PreferencesDocument? Preferences,

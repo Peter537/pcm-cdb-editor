@@ -22,6 +22,7 @@ internal enum CountryQuotaReviewSortField
 internal enum CountryQuotaValueChangeKind
 {
     Unchanged,
+    Set,
     Increase,
     Decrease,
     Reset
@@ -31,25 +32,31 @@ internal sealed record CountryQuotaReviewSort(
     CountryQuotaReviewSortField Field,
     SortDirection Direction);
 
-internal sealed record CountryQuotaReviewValue(long OldValue, long NewValue)
+internal sealed record CountryQuotaReviewValue(long? OldValue, long NewValue)
 {
     public bool IsChanged => OldValue != NewValue;
 
     public CountryQuotaValueChangeKind ChangeKind => (OldValue, NewValue) switch
     {
         var (oldValue, newValue) when oldValue == newValue => CountryQuotaValueChangeKind.Unchanged,
+        (null, _) => CountryQuotaValueChangeKind.Set,
         (_, 0) => CountryQuotaValueChangeKind.Reset,
         var (oldValue, newValue) when newValue > oldValue => CountryQuotaValueChangeKind.Increase,
         _ => CountryQuotaValueChangeKind.Decrease
     };
 
     public string DisplayText => IsChanged
-        ? $"{OldValue:N0} → {NewValue:N0}"
+        ? $"{FormatOldValue(CultureInfo.CurrentCulture)} → {NewValue:N0}"
         : $"{NewValue:N0}, unchanged";
 
-    public string AccessibleText => IsChanged
-        ? $"{OldValue:N0} to {NewValue:N0}"
-        : $"{NewValue:N0}, unchanged";
+    public string AccessibleText => FormatAccessibleText(CultureInfo.CurrentCulture);
+
+    public string FormatAccessibleText(IFormatProvider formatProvider) => IsChanged
+        ? string.Format(formatProvider, "{0} to {1:N0}", FormatOldValue(formatProvider), NewValue)
+        : string.Format(formatProvider, "{0:N0}, unchanged", NewValue);
+
+    private string FormatOldValue(IFormatProvider formatProvider) =>
+        OldValue?.ToString("N0", formatProvider) ?? "Not set";
 }
 
 internal sealed class CountryQuotaReviewRow
@@ -81,7 +88,7 @@ internal sealed class CountryQuotaReviewRow
         ? $"{name} · ID {CountryId:N0}"
         : $"ID {CountryId:N0}";
 
-    public double UciPoints => Source.UciPoints;
+    public decimal UciPoints => Source.UciPoints;
 
     public string UciPointsText => $"{UciPoints:N2}";
 
@@ -93,10 +100,7 @@ internal sealed class CountryQuotaReviewRow
 
     public string? StoredCodeLabel => HasStoredCodeAlias ? $"Stored code: {RawCode}" : null;
 
-    public bool HasChanges => WorldRoadQuota.IsChanged ||
-        WorldTimeTrialQuota.IsChanged ||
-        EuropeanRoadQuota.IsChanged ||
-        EuropeanTimeTrialQuota.IsChanged;
+    public bool HasChanges => Source.HasChanges;
 
     public bool IsWorldQualifier => WorldRank is >= 1 and <= 25;
 
@@ -129,11 +133,11 @@ internal sealed class CountryQuotaReviewRow
             alias,
             UciPoints,
             FormatAccessibleRank(WorldRank, formatProvider),
-            FormatAccessibleValue(WorldRoadQuota, formatProvider),
-            FormatAccessibleValue(WorldTimeTrialQuota, formatProvider),
+            WorldRoadQuota.FormatAccessibleText(formatProvider),
+            WorldTimeTrialQuota.FormatAccessibleText(formatProvider),
             FormatAccessibleRank(EuropeanRank, formatProvider),
-            FormatAccessibleValue(EuropeanRoadQuota, formatProvider),
-            FormatAccessibleValue(EuropeanTimeTrialQuota, formatProvider),
+            EuropeanRoadQuota.FormatAccessibleText(formatProvider),
+            EuropeanTimeTrialQuota.FormatAccessibleText(formatProvider),
             CountryId,
             Source.CountryName is { Length: > 0 } name ? $" {name}." : string.Empty);
     }
@@ -143,12 +147,6 @@ internal sealed class CountryQuotaReviewRow
     private static string FormatAccessibleRank(int? rank, IFormatProvider formatProvider) => rank is null
         ? "not ranked"
         : string.Format(formatProvider, "rank {0:N0}", rank.Value);
-
-    private static string FormatAccessibleValue(
-        CountryQuotaReviewValue value,
-        IFormatProvider formatProvider) => value.IsChanged
-            ? string.Format(formatProvider, "{0:N0} to {1:N0}", value.OldValue, value.NewValue)
-            : string.Format(formatProvider, "{0:N0}, unchanged", value.NewValue);
 }
 
 internal sealed class CountryQuotaReviewProjection

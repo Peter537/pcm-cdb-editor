@@ -1,3 +1,4 @@
+using PcmCdbEditor.Domain;
 using Microsoft.Data.Sqlite;
 using PcmCdbEditor.Application;
 
@@ -21,7 +22,7 @@ internal static class SqliteMutationSafety
         IEnumerable<string> updatedColumns,
         CancellationToken cancellationToken) =>
         EnsureReversibleAsync(connection, transaction, tableName,
-            updatedColumns.ToHashSet(StringComparer.OrdinalIgnoreCase), cancellationToken);
+            updatedColumns.ToHashSet(SqliteIdentifierComparer.Instance), cancellationToken);
 
     private static async Task EnsureReversibleAsync(
         SqliteConnection connection,
@@ -46,7 +47,7 @@ internal static class SqliteMutationSafety
                 string sql = reader.GetString(2);
                 if (reader.GetString(0) == "table")
                 {
-                    if (EnumerateBareWords(sql).Contains("AUTOINCREMENT", StringComparer.OrdinalIgnoreCase))
+                    if (EnumerateBareWords(sql).Contains("AUTOINCREMENT", SqliteIdentifierComparer.Instance))
                     {
                         throw new UnsafeRowMutationException(
                             $"Table '{tableName}' uses AUTOINCREMENT. Row history cannot restore the sqlite_sequence counter that SQLite uses to allocate future IDs.");
@@ -109,13 +110,13 @@ internal static class SqliteMutationSafety
         {
             if (!foundTriggerKeyword)
             {
-                foundTriggerKeyword = word.Equals("TRIGGER", StringComparison.OrdinalIgnoreCase);
+                foundTriggerKeyword = SqliteIdentifierComparer.Instance.Equals(word, "TRIGGER");
                 continue;
             }
 
-            if (word.Equals("DELETE", StringComparison.OrdinalIgnoreCase)
-                || word.Equals("INSERT", StringComparison.OrdinalIgnoreCase)
-                || word.Equals("UPDATE", StringComparison.OrdinalIgnoreCase))
+            if (SqliteIdentifierComparer.Instance.Equals(word, "DELETE")
+                || SqliteIdentifierComparer.Instance.Equals(word, "INSERT")
+                || SqliteIdentifierComparer.Instance.Equals(word, "UPDATE"))
             {
                 return word.ToUpperInvariant();
             }

@@ -16,7 +16,7 @@ dotnet test tests/PcmCdbEditor.UnitTests/PcmCdbEditor.UnitTests.csproj --configu
 
 The unit suite covers domain and view-model state, typed SQLite values, filter and query models, paging coordination, finite preferences, sort descriptors, edit history, write-ahead state, and maintenance projections. Source-level checks cover the shell's per-tab **All rows** wiring, wizard commands, save-state presentation, accessibility metadata, and TableView adapter contracts. Use the native checks below for the resulting UI behavior.
 
-The source-level TableView checks verify event deferral, committed primary-indicator wiring, bind-generation guards, the selection-scroll completion barrier, and viewport restoration through `TableView.HorizontalOffsetProperty`. They do not run the WinUI layout engine. A passing unit suite therefore does not prove rendered header and row alignment or crash-free header sorting.
+The source-level TableView checks verify event deferral, committed primary-indicator wiring, bind-generation guards, and the order in which selection and the viewport are restored. The native runner checks the rendered layout and sorting behavior.
 
 ## Integration tests
 
@@ -32,9 +32,9 @@ Create Rider fixtures cover clean draft preparation, bounded team/type/region/pr
 
 ## Optional local CDB round-trip test
 
-`AuthorizedCdbSmokeTests.AuthorizedCdbsRoundTripOnlyThroughCopyFirstSessions` is part of the integration test assembly and is discovered during an ordinary integration run. When `PCM_CDB_AUTHORIZED_SMOKE` is not exactly `1`, the method returns immediately. A normal passing run therefore does not include a real-CDB round trip.
+`AuthorizedCdbSmokeTests.AuthorizedCdbsRoundTripOnlyThroughCopyFirstSessions` is part of the integration test assembly and is discovered during an ordinary integration run. When `PCM_CDB_AUTHORIZED_SMOKE` is not exactly `1`, the test is reported as inconclusive or skipped. Release builds exclude the category from their synthetic integration gate.
 
-This opt-in test requires two local CDBs that you own or have permission to test. It hashes each source before and after, performs copy-first round trips in isolated sessions, and verifies that the sources remain unchanged. Do not use any database without its owner's permission.
+This opt-in test requires two local CDBs that you own or have permission to test. It hashes each source before and after, copies it to a private temporary directory, and performs the copy-first round trip using only that copied input. Do not use any database without its owner's permission.
 
 ```powershell
 $env:PCM_CDB_AUTHORIZED_SMOKE = '1'
@@ -48,7 +48,21 @@ Remove-Item Env:PCM_CDB_SMOKE_1
 Remove-Item Env:PCM_CDB_SMOKE_2
 ```
 
-The opt-in test writes ignored output under `local-smoke/proof-<id>`. That directory can contain source paths, hashes, copied databases, and round-trip outputs. Keep it local, do not attach it to public issues or other shared artifacts, and remove it when you no longer need it.
+The test prints its private scratch paths and deletes each case's copies, sessions, output, and backups after success, failure, or cooperative cancellation. If the test host is forcibly terminated, remove only the printed scratch directory once the host and child converter have stopped. To retain a concise result, explicitly set `PCM_CDB_SMOKE_RETAIN_PROOF=1`. The ignored `local-smoke/authorized-cdb-<id>.proof.json` records the exporter hash, time, and assertions by case number. It omits database paths, hashes, and contents.
+
+## Native WinUI regression
+
+On an interactive Windows desktop with 64-bit PowerShell 7 and Python 3, run this after building the app.
+
+```powershell
+pwsh -NoProfile -File eng/Verify-NativeUi.ps1
+```
+
+The runner launches a separate editor with its own data root and two generated recovery sessions. It uses Windows UI Automation and directs native clicks and keys only to that editor. Keep its window visible while the checks run. Read-only SQLite connections verify insertion, Undo, Redo, and an inline edit committed by switching tabs. The runner also checks that Escape, unchanged input, and invalid input add no history. It compares rendered header glyphs with the corresponding body cell after horizontal scrolling, both sort directions, and a wide-to-narrow-to-wide tab switch.
+
+A synthetic view forces a refresh failure after a durable Undo, then allows a successful retry. The runner verifies that cancelling Resume while SQLite is locked keeps the active and recoverable sessions available. It also checks that a failed replacement preserves the active session and that confirmed close during a pending SQLite count cleans up only that session.
+
+The runner uses the Windows .NET Framework compiler to build the repository's fake exporter for a disposable second editor instance. It verifies that cancelling Open and Save while the exporter is running shows the cancellation title and preserves the working copy and destination. A nonzero converter exit still shows an error. The runner closes its processes and removes generated files on success or failure. Real-CDB conversion and manual accessibility checks have separate verification steps.
 
 ## Manual Windows and accessibility checks
 
@@ -97,7 +111,7 @@ Record only non-sensitive observations. Do not include real database contents, l
 
 ## Local release verification
 
-Routine unit and integration tests do not create or validate a distributable package. `eng/Build-Release.ps1` performs the locked build, tests, self-contained publish, dependency and content checks, SBOM creation, ZIP and installer production, and checksum generation. It downloads and runs a pinned Inno Setup build tool and replaces the existing `artifacts/release/<version>` directory, so read [Release and verification](release-and-verification.md) before running it.
+Routine unit and integration tests do not create or validate a distributable package. `eng/Build-Release.ps1` performs the locked build, tests, self-contained publish, dependency and content checks, SBOM creation, ZIP and installer production, and checksum generation. It downloads and runs a pinned Inno Setup build tool and promotes the result after verification. [Release and verification](release-and-verification.md) covers the isolated build, retained candidate, and Windows Sandbox evidence.
 
 After the script creates a local candidate, verify it with:
 
@@ -107,4 +121,4 @@ After the script creates a local candidate, verify it with:
 
 The verifier checks the generated artifacts. It does not sign or publish them, establish SmartScreen reputation, replace an installed-app accessibility pass, or establish compatibility with every Pro Cycling Manager database version.
 
-The standalone verifier is not read-only: it rewrites the content and dependency allow/deny records plus `SHA256SUMS.txt`. It also requires the current Git dirty-state flag and status-entry count to match the state recorded for the candidate. Run it only against the intended candidate, without changing the source tree after creating that candidate.
+The standalone verifier refreshes the content and dependency records and `SHA256SUMS.txt`. Run it from the captured checkout. It verifies the source commit, complete source manifest, and Git status digest against the candidate evidence.

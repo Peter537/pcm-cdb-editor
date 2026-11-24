@@ -12,6 +12,8 @@ public sealed partial class MainWindow
     private int _recordedChangeRowIndex;
     private bool _refreshingRecordedChanges;
     private bool _historyReplayActive;
+    private EditHistorySnapshot? _displayedHistory;
+    private bool _displayedHistoryUncertain;
 
     private void RefreshSessionChanges()
     {
@@ -26,6 +28,7 @@ public sealed partial class MainWindow
         {
             ChangesBaselineText.Text = "Open a CDB to see recorded changes.";
             ChangesReplayText.Text = string.Empty;
+            _displayedHistory = null;
             SetRecordedChanges([]);
             return;
         }
@@ -41,9 +44,14 @@ public sealed partial class MainWindow
             : pendingReplay ? "The pending operation could not be recorded. Save to establish a new baseline."
             : $"{statusPrefix} Undo · {DescribeHistoryAction(snapshot.NextUndo)}\n{statusPrefix} Redo · {DescribeHistoryAction(snapshot.NextRedo)}" +
                 (snapshot.Applied.Count + snapshot.Undone.Count == 0 ? "\nNo operations are available to inspect." : string.Empty);
-        SetRecordedChanges(snapshot.Applied.Select(operation => new RecordedChange(operation, IsApplied: true, isUncertain))
-            .Concat(snapshot.Undone.Select(operation => new RecordedChange(operation, IsApplied: false, isUncertain)))
-            .ToArray());
+        if (!ReferenceEquals(snapshot, _displayedHistory) || isUncertain != _displayedHistoryUncertain)
+        {
+            _displayedHistory = snapshot;
+            _displayedHistoryUncertain = isUncertain;
+            SetRecordedChanges(snapshot.Applied.Select(operation => new RecordedChange(operation, IsApplied: true, isUncertain))
+                .Concat(snapshot.Undone.Select(operation => new RecordedChange(operation, IsApplied: false, isUncertain)))
+                .ToArray());
+        }
     }
 
     private static string DescribeSavedBaseline(

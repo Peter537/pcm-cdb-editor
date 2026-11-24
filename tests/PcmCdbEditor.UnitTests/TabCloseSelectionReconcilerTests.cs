@@ -35,6 +35,20 @@ public sealed class TabCloseSelectionReconcilerTests
     }
 
     [TestMethod]
+    public void ClosingDistinctUnicodeTableUsesItsOwnNeighbor()
+    {
+        TabCloseSelectionResolution result = TabCloseSelectionReconciler.Resolve(
+            ["Ä", "middle", "ä", "trailing"],
+            closingTable: "ä",
+            selectedBeforeClose: "ä",
+            selectedAfterRemoval: null,
+            visibleTables: ["Ä", "middle", "trailing"]);
+
+        Assert.AreEqual("trailing", result.SelectedTable);
+        Assert.AreEqual("trailing", result.SidebarTable);
+    }
+
+    [TestMethod]
     public void LastTabCloseClearsBothSelections()
     {
         TabCloseSelectionResolution result = TabCloseSelectionReconciler.Resolve(

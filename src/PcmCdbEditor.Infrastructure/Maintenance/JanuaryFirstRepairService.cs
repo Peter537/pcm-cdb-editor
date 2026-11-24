@@ -12,7 +12,7 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
     private const string TargetTable = "DYN_result_season_stage";
 
     private static readonly IReadOnlyDictionary<string, IReadOnlyCollection<string>> Requirements =
-        new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        new Dictionary<string, IReadOnlyCollection<string>>(SqliteIdentifierComparer.Instance)
         {
             ["GAM_config"] = new[] { "gene_i_date" },
             [TargetTable] = Array.Empty<string>()
@@ -21,12 +21,13 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
     public Task<MaintenanceCapability> CheckCapabilityAsync(
         string sqlitePath,
         CancellationToken cancellationToken) =>
-        MaintenanceSupport.CheckAsync(
-            sqlitePath,
-            MaintenanceToolKind.JanuaryFirstSeasonStageRepair,
-            Requirements,
-            [TargetTable],
-            cancellationToken);
+        MaintenanceSupport.CheckAsync(sqlitePath, CheckCapability, cancellationToken);
+
+    private static MaintenanceCapability CheckCapability(DatabaseSchemaCatalog catalog) =>
+        MaintenanceSupport.Check(catalog, MaintenanceToolKind.JanuaryFirstSeasonStageRepair, Requirements, [TargetTable],
+            static table => FindRowIdAlias(table) is null
+                ? $"The mutation target '{TargetTable}' must expose an unshadowed SQLite rowid."
+                : null);
 
     public Task<JanuaryFirstRepairPreview> PreviewAsync(
         string sqlitePath,
@@ -35,12 +36,12 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
             () => PreviewCoreAsync(sqlitePath, cancellationToken),
             cancellationToken);
 
-    private async Task<JanuaryFirstRepairPreview> PreviewCoreAsync(
+    private static async Task<JanuaryFirstRepairPreview> PreviewCoreAsync(
         string sqlitePath,
         CancellationToken cancellationToken)
     {
-        var capability = await CheckCapabilityAsync(sqlitePath, cancellationToken).ConfigureAwait(false);
-        MaintenanceSupport.RequireEnabled(capability);
+        DatabaseSchemaCatalog catalog = await MaintenanceSupport.RequireCatalogAsync(sqlitePath, CheckCapability, cancellationToken)
+            .ConfigureAwait(false);
         await using var connection = SqliteSupport.CreateConnection(sqlitePath, SqliteOpenMode.ReadOnly);
         using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
                 connection,
@@ -48,7 +49,8 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
             .ConfigureAwait(false);
         var date = await SqliteSupport.ReadSingleGameDateAsync(connection, null, cancellationToken).ConfigureAwait(false);
         EnsureJanuaryFirst(date);
-        var state = await ReadStateAsync(connection, null, date, cancellationToken).ConfigureAwait(false);
+        string rowIdAlias = RequireRowIdAlias(catalog);
+        var state = await ReadStateAsync(connection, null, date, rowIdAlias, cancellationToken).ConfigureAwait(false);
         return new JanuaryFirstRepairPreview(state.Token, date, state.Count);
     }
 
@@ -60,16 +62,13 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
             () => ApplyCoreAsync(sqlitePath, preview, cancellationToken),
             cancellationToken);
 
-    private async Task<MaintenanceApplyResult> ApplyCoreAsync(
+    private static async Task<MaintenanceApplyResult> ApplyCoreAsync(
         string sqlitePath,
         JanuaryFirstRepairPreview preview,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(preview);
-        var capability = await CheckCapabilityAsync(sqlitePath, cancellationToken).ConfigureAwait(false);
-        MaintenanceSupport.RequireEnabled(capability);
-        DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
-            .DiscoverAsync(sqlitePath, cancellationToken)
+        DatabaseSchemaCatalog catalog = await MaintenanceSupport.RequireCatalogAsync(sqlitePath, CheckCapability, cancellationToken)
             .ConfigureAwait(false);
         TableSchema historyTable = MaintenanceHistoryCapture.RequireEditableTable(catalog, TargetTable);
         await using var connection = SqliteSupport.CreateConnection(sqlitePath);
@@ -84,7 +83,9 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
             var date = await SqliteSupport.ReadSingleGameDateAsync(connection, sqliteTransaction, cancellationToken)
                 .ConfigureAwait(false);
             EnsureJanuaryFirst(date);
-            var state = await ReadStateAsync(connection, sqliteTransaction, date, cancellationToken).ConfigureAwait(false);
+            string rowIdAlias = RequireRowIdAlias(catalog);
+            var state = await ReadStateAsync(connection, sqliteTransaction, date, rowIdAlias, cancellationToken)
+                .ConfigureAwait(false);
             if (date != preview.CurrentDate
                 || state.Count != preview.RowCount
                 || !state.Token.Equals(preview.SnapshotToken, StringComparison.Ordinal))
@@ -149,11 +150,13 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
         SqliteConnection connection,
         SqliteTransaction? transaction,
         DateOnly date,
+        string rowIdAlias,
         CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = $"SELECT rowid, * FROM {SqliteSupport.QuoteIdentifier(TargetTable)} ORDER BY rowid";
+        string rowId = SqliteSupport.QuoteIdentifier(rowIdAlias);
+        command.CommandText = $"SELECT {rowId}, * FROM {SqliteSupport.QuoteIdentifier(TargetTable)} ORDER BY {rowId}";
         var tokenValues = new List<string> { date.ToString("yyyyMMdd", CultureInfo.InvariantCulture) };
         long count = 0;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -170,6 +173,23 @@ public sealed class JanuaryFirstRepairService : IJanuaryFirstRepairService
         }
 
         return (count, MaintenanceSupport.ComputeToken(tokenValues));
+    }
+
+    private static string RequireRowIdAlias(DatabaseSchemaCatalog catalog) =>
+        catalog.TryGetTable(TargetTable, out TableSchema? table) && FindRowIdAlias(table) is { } rowId
+            ? rowId
+            : throw new InvalidOperationException($"The mutation target '{TargetTable}' must expose an unshadowed SQLite rowid.");
+
+    private static string? FindRowIdAlias(TableSchema table)
+    {
+        if (table.IsWithoutRowId)
+        {
+            return null;
+        }
+
+        string[] aliases = ["rowid", "_rowid_", "oid"];
+        return aliases.FirstOrDefault(alias => !table.Columns.Any(column =>
+            SqliteIdentifierComparer.Instance.Equals(column.Name, alias)));
     }
 
     private static string CanonicalValue(SqliteDataReader reader, int ordinal)

@@ -521,6 +521,7 @@ public sealed class MainWindowAccessibilityTests
         string source = File.ReadAllText(GetMainWindowCodePath());
         string normalizedSource = source.ReplaceLineEndings("\n");
         string activateSession = GetMethodSource(source, "private async Task ActivateSessionAsync(");
+        string prepareInitialTable = GetMethodSource(source, "private async Task<PreparedInitialTable?> PrepareInitialTableAsync(");
         string loadSelectedTable = GetMethodSource(source, "private async Task LoadSelectedTableAsync(");
         string openTable = GetMethodSource(source, "private async Task OpenTableAsync(");
         string ensureTabBound = GetMethodSource(source, "private void EnsureTabBound(");
@@ -551,7 +552,8 @@ public sealed class MainWindowAccessibilityTests
 
         const string persistedFiniteChoice =
             "TableRowDisplayChoice.FromPageSize(_preferences.PageSize)";
-        StringAssert.Contains(activateSession, persistedFiniteChoice, StringComparison.Ordinal);
+        StringAssert.Contains(prepareInitialTable, persistedFiniteChoice, StringComparison.Ordinal);
+        StringAssert.Contains(activateSession, "rowDisplay: firstTable!.RowDisplay", StringComparison.Ordinal);
         StringAssert.Contains(loadSelectedTable, persistedFiniteChoice, StringComparison.Ordinal);
 
         StringAssert.Contains(

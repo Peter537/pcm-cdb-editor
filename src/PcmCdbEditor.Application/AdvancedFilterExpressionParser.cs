@@ -14,6 +14,11 @@ public static class AdvancedFilterExpressionParser
 {
     public static FilterExpression Parse(string expression, IEnumerable<NumberedFilterRule> rules)
     {
+        if (expression?.Length > FilterExpressionLimits.MaximumTextLength)
+        {
+            throw new FilterParseException($"An advanced expression may contain at most {FilterExpressionLimits.MaximumTextLength} characters.");
+        }
+
         if (string.IsNullOrWhiteSpace(expression))
         {
             throw new FilterParseException("An advanced filter expression is required.");
@@ -24,6 +29,11 @@ public static class AdvancedFilterExpressionParser
         var ruleMap = new Dictionary<int, FilterCondition>();
         foreach (var rule in rules)
         {
+            if (ruleMap.Count == FilterExpressionLimits.MaximumRules)
+            {
+                throw new FilterParseException($"Define at most {FilterExpressionLimits.MaximumRules} numbered rules.");
+            }
+
             if (rule.Number <= 0)
             {
                 throw new FilterParseException("Rule numbers must be positive integers.");
@@ -40,9 +50,11 @@ public static class AdvancedFilterExpressionParser
             throw new FilterParseException("At least one filter rule is required.");
         }
 
-        var values = new Stack<FilterExpression>();
+        var values = new Stack<ParseNode>();
         var operators = new Stack<Token>();
         var expectingOperand = true;
+        int ruleOccurrences = 0;
+        int parenthesisDepth = 0;
 
         foreach (var token in Tokenize(expression))
         {
@@ -59,7 +71,12 @@ public static class AdvancedFilterExpressionParser
                         throw new FilterParseException($"Expression references undefined rule {token.RuleNumber}.");
                     }
 
-                    values.Push(condition);
+                    if (++ruleOccurrences > FilterExpressionLimits.MaximumRules)
+                    {
+                        throw FilterExpressionLimits.TooManyRules();
+                    }
+
+                    values.Push(new RuleNode(condition));
                     expectingOperand = false;
                     break;
 
@@ -67,6 +84,11 @@ public static class AdvancedFilterExpressionParser
                     if (!expectingOperand)
                     {
                         throw new FilterParseException("An operator is required before '('.");
+                    }
+
+                    if (++parenthesisDepth > FilterExpressionLimits.MaximumRules)
+                    {
+                        throw new FilterParseException($"An advanced expression may nest at most {FilterExpressionLimits.MaximumRules} pairs of parentheses.");
                     }
 
                     operators.Push(token);
@@ -89,6 +111,7 @@ public static class AdvancedFilterExpressionParser
                     }
 
                     operators.Pop();
+                    parenthesisDepth--;
                     expectingOperand = false;
                     break;
 
@@ -136,7 +159,7 @@ public static class AdvancedFilterExpressionParser
             throw new FilterParseException("The advanced filter expression is invalid.");
         }
 
-        return values.Pop();
+        return BuildFilter(values.Pop(), depth: 1);
     }
 
     private static IEnumerable<Token> Tokenize(string expression)
@@ -213,7 +236,7 @@ public static class AdvancedFilterExpressionParser
 
     private static int Precedence(Token token) => token.Kind == TokenKind.And ? 2 : 1;
 
-    private static void ApplyOperator(Stack<FilterExpression> values, Token token)
+    private static void ApplyOperator(Stack<ParseNode> values, Token token)
     {
         if (values.Count < 2)
         {
@@ -223,29 +246,42 @@ public static class AdvancedFilterExpressionParser
         var right = values.Pop();
         var left = values.Pop();
         var groupOperator = token.Kind == TokenKind.And ? FilterGroupOperator.And : FilterGroupOperator.Or;
-        var children = new List<FilterExpression>();
-        AddFlattened(children, left, groupOperator);
-        AddFlattened(children, right, groupOperator);
-        values.Push(new FilterGroup(groupOperator, children));
+        values.Push(new LogicalNode(groupOperator, left, right));
     }
 
-    private static void AddFlattened(
-        List<FilterExpression> destination,
-        FilterExpression expression,
-        FilterGroupOperator parentOperator)
+    private static FilterExpression BuildFilter(ParseNode node, int depth)
     {
-        if (expression is FilterGroup group && group.Operator == parentOperator)
+        FilterExpressionLimits.EnsureDepth(depth);
+        if (node is RuleNode rule)
         {
-            foreach (var child in group.Children)
-            {
-                destination.Add(child);
-            }
-
-            return;
+            return rule.Condition;
         }
 
-        destination.Add(expression);
+        var logical = (LogicalNode)node;
+        var pending = new Stack<ParseNode>();
+        var children = new List<FilterExpression>();
+        pending.Push(logical);
+        while (pending.TryPop(out ParseNode? child))
+        {
+            if (child is LogicalNode branch && branch.Operator == logical.Operator)
+            {
+                pending.Push(branch.Right);
+                pending.Push(branch.Left);
+            }
+            else
+            {
+                children.Add(BuildFilter(child, depth + 1));
+            }
+        }
+
+        return new FilterGroup(logical.Operator, children);
     }
+
+    private abstract record ParseNode;
+
+    private sealed record RuleNode(FilterCondition Condition) : ParseNode;
+
+    private sealed record LogicalNode(FilterGroupOperator Operator, ParseNode Left, ParseNode Right) : ParseNode;
 
     private enum TokenKind
     {

@@ -23,7 +23,7 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
     ];
 
     private static readonly IReadOnlyDictionary<string, IReadOnlyCollection<string>> Requirements =
-        new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        new Dictionary<string, IReadOnlyCollection<string>>(SqliteIdentifierComparer.Instance)
         {
             [Table] = new[] { "IDcyclist" }.Concat(PresetColumns).ToArray()
         };
@@ -31,12 +31,10 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
     public Task<MaintenanceCapability> CheckCapabilityAsync(
         string sqlitePath,
         CancellationToken cancellationToken) =>
-        MaintenanceSupport.CheckAsync(
-            sqlitePath,
-            MaintenanceToolKind.RiderRecovery,
-            Requirements,
-            [Table],
-            cancellationToken);
+        MaintenanceSupport.CheckAsync(sqlitePath, CheckCapability, cancellationToken);
+
+    private static MaintenanceCapability CheckCapability(DatabaseSchemaCatalog catalog) =>
+        MaintenanceSupport.Check(catalog, MaintenanceToolKind.RiderRecovery, Requirements, [Table]);
 
     public Task<IReadOnlyList<RiderTeamOption>> ListTeamsAsync(
         string sqlitePath,
@@ -147,22 +145,19 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
             () => ApplyCoreAsync(sqlitePath, preview, cancellationToken),
             cancellationToken);
 
-    private async Task<MaintenanceApplyResult> ApplyCoreAsync(
+    private static async Task<MaintenanceApplyResult> ApplyCoreAsync(
         string sqlitePath,
         RiderRecoveryPreview preview,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(preview);
-        var capability = await CheckCapabilityAsync(sqlitePath, cancellationToken).ConfigureAwait(false);
-        MaintenanceSupport.RequireEnabled(capability);
+        DatabaseSchemaCatalog catalog = await MaintenanceSupport.RequireCatalogAsync(sqlitePath, CheckCapability, cancellationToken)
+            .ConfigureAwait(false);
         if (preview.CyclistIds.Count == 0)
         {
             return new MaintenanceApplyResult(0, preview.NoChangeSummary ?? "No rider IDs were supplied.");
         }
 
-        DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
-            .DiscoverAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
         TableSchema historyTable = MaintenanceHistoryCapture.RequireEditableTable(catalog, Table);
         await using var connection = SqliteSupport.CreateConnection(sqlitePath);
         using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
@@ -186,12 +181,16 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
                     : "The selected team roster changed after the preview was generated.");
             }
 
-            var current = await ReadChangesAsync(
-                    connection,
-                    sqliteTransaction,
-                    preview.CyclistIds,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            List<RiderRecoveryChange> current;
+            try
+            {
+                current = await ReadChangesAsync(connection, sqliteTransaction, preview.CyclistIds, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (InvalidDataException exception)
+            {
+                throw new DBConcurrencyException(exception.Message, exception);
+            }
             if (!ComputeToken(preview.Target, preview.CyclistIds, current)
                 .Equals(preview.SnapshotToken, StringComparison.Ordinal))
             {
@@ -294,20 +293,41 @@ ORDER BY IDcyclist";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
+            long cyclistId = reader.GetInt64(0);
             changes.Add(new RiderRecoveryChange(
-                reader.GetInt64(0),
+                cyclistId,
                 new RiderRecoveryValues(
-                    Convert.ToDouble(reader.GetValue(1), CultureInfo.InvariantCulture),
-                    Convert.ToDouble(reader.GetValue(2), CultureInfo.InvariantCulture),
-                    Convert.ToInt64(reader.GetValue(3), CultureInfo.InvariantCulture),
-                    Convert.ToDouble(reader.GetValue(4), CultureInfo.InvariantCulture),
-                    Convert.ToDouble(reader.GetValue(5), CultureInfo.InvariantCulture),
-                    Convert.ToDouble(reader.GetValue(6), CultureInfo.InvariantCulture)),
+                    ReadFitnessNumber(reader, 1, cyclistId),
+                    ReadFitnessNumber(reader, 2, cyclistId),
+                    ReadInjuryDays(reader, 3, cyclistId),
+                    ReadFitnessNumber(reader, 4, cyclistId),
+                    ReadFitnessNumber(reader, 5, cyclistId),
+                    ReadFitnessNumber(reader, 6, cyclistId)),
                 RiderRecoveryValues.Default));
         }
 
         return changes;
     }
+
+    private static double ReadFitnessNumber(SqliteDataReader reader, int ordinal, long cyclistId) =>
+        reader.GetValue(ordinal) switch
+        {
+            long value when (Int128)(double)value == value => value,
+            double value when double.IsFinite(value) => value,
+            _ => throw InvalidFitnessValue(reader, ordinal, cyclistId, "a finite SQLite number")
+        };
+
+    private static long ReadInjuryDays(SqliteDataReader reader, int ordinal, long cyclistId) =>
+        reader.GetValue(ordinal) is long value
+            ? value
+            : throw InvalidFitnessValue(reader, ordinal, cyclistId, "a SQLite integer");
+
+    private static InvalidDataException InvalidFitnessValue(
+        SqliteDataReader reader,
+        int ordinal,
+        long cyclistId,
+        string expected) =>
+        new($"Rider recovery cannot read {Table}.{reader.GetName(ordinal)} for rider ID {cyclistId}. Expected {expected}.");
 
     private static async Task<Dictionary<long, string>> ReadRiderNamesAsync(
         SqliteConnection connection,

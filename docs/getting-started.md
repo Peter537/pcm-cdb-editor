@@ -8,7 +8,7 @@ Compatibility testing has covered only Pro Cycling Manager 2025 (PCM 25). Other 
 
 - Windows 10 or 11 x64, build 19041 or later
 - Git and PowerShell
-- .NET SDK 10.0.303 exactly, selected by `global.json`
+- .NET SDK 10.0.403 exactly, selected by `global.json`
 - network access for the first restore from the single NuGet.org source in `NuGet.Config`
 - the hash-pinned third-party files under `third_party/SQLiteExporter`, matching [Third-party notices](../THIRD_PARTY_NOTICES.md)
 
@@ -24,7 +24,7 @@ dotnet restore PcmCdbEditor.slnx --locked-mode --configfile NuGet.Config --disab
 dotnet build PcmCdbEditor.slnx --configuration Release --no-restore -p:Platform=x64 --disable-build-servers -m:1
 ```
 
-The first command must print `10.0.303`. Every project has a `packages.lock.json`. Serialized non-static-graph evaluation avoids an SDK/WinUI `.slnx` restore failure while retaining locked mode. Do not add another feed or switch to unlocked restore to work around a restore failure.
+The first command must print `10.0.403`. Every project has a `packages.lock.json`. Serialized non-static-graph evaluation avoids an SDK/WinUI `.slnx` restore failure while retaining locked mode. Do not add another feed or switch to unlocked restore to work around a restore failure.
 
 Run the automated suites separately as described in [Testing](testing.md).
 
@@ -122,7 +122,7 @@ Create Rider has six steps: Identity, Profile, Abilities, Contract, Advanced, an
 
 ### The SDK version is rejected
 
-Run `dotnet --version` from the repository root. Install SDK 10.0.303 if another version is selected, and keep `global.json` in place.
+Run `dotnet --version` from the repository root. Install SDK 10.0.403 if another version is selected, and keep `global.json` in place.
 
 ### Locked restore fails
 

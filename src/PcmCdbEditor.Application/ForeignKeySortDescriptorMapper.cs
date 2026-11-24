@@ -9,7 +9,7 @@ internal sealed record TableQueryColumnOption(ColumnSchema Column, QueryValueTar
     public SqliteAffinity Affinity => Target == QueryValueTarget.RelatedLabel ? SqliteAffinity.Text : Column.Affinity;
 
     public bool Matches(string columnName, QueryValueTarget target) =>
-        Target == target && ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase);
+        Target == target && SqliteIdentifierComparer.Instance.Equals(ColumnName, columnName);
 }
 
 internal sealed record TableHeaderSortIndicator(string HeaderColumnName, SortDirection Direction);
@@ -88,7 +88,7 @@ internal static class ForeignKeySortDescriptorMapper
                 ? QueryValueTarget.RelatedLabel
                 : QueryValueTarget.StoredValue;
         bool Matches(SortDescriptor descriptor) =>
-            descriptor.Target == target && descriptor.ColumnName.Equals(column.Name, StringComparison.OrdinalIgnoreCase);
+            descriptor.Target == target && SqliteIdentifierComparer.Instance.Equals(descriptor.ColumnName, column.Name);
         var direction = current.FirstOrDefault() is { Direction: SortDirection.Descending } primary && Matches(primary)
             ? SortDirection.Ascending
             : SortDirection.Descending;
@@ -128,7 +128,7 @@ internal static class ForeignKeySortDescriptorMapper
         }
 
         var column = table.Columns.FirstOrDefault(candidate =>
-            !candidate.IsHidden && candidate.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+            !candidate.IsHidden && SqliteIdentifierComparer.Instance.Equals(candidate.Name, columnName));
         return column is not null && (target == QueryValueTarget.StoredValue ||
             RelationshipMetadata.TryGetLabelRelation(catalog, table, column.Name, out _))
                 ? column

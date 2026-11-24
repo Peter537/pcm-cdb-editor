@@ -6,6 +6,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using PcmCdbEditor.Application;
 using PcmCdbEditor.Infrastructure.Conversion;
+using PcmCdbEditor.Infrastructure.Sqlite;
 using PcmCdbEditor.Infrastructure.Workspace;
 
 namespace PcmCdbEditor.IntegrationTests;
@@ -295,13 +296,45 @@ public sealed class CdbConverterTests
     }
 
     [TestMethod]
+    public async Task ConverterDeadlineOwnsPipesAfterTheParentExits()
+    {
+        using var fixture = await ConverterFixture.CreateAsync(s_fakeConverterPath, "exit-after-child")
+            .ConfigureAwait(false);
+        var converter = new CdbConverter(fixture.ExecutablePath);
+        var elapsed = Stopwatch.StartNew();
+        Task<ConversionResult> conversion = converter.ExportToSqliteAsync(
+            fixture.InputPath, TimeSpan.FromSeconds(3), CancellationToken.None);
+        int childId = await ReadProcessIdAsync(Path.Combine(fixture.Root, "child.pid")).ConfigureAwait(false);
+        using var child = Process.GetProcessById(childId);
+        try
+        {
+            int parentId = await ReadProcessIdAsync(Path.Combine(fixture.Root, "parent.pid")).ConfigureAwait(false);
+            await AssertProcessExitedAsync(parentId).ConfigureAwait(false);
+            Assert.IsFalse(child.HasExited, "The descendant must still own the pipe after root exit.");
+            var failure = await Assert.ThrowsExactlyAsync<CdbConversionException>(() =>
+                conversion.WaitAsync(TimeSpan.FromSeconds(7))).ConfigureAwait(false);
+            Assert.AreEqual(ConverterFailureCategory.TimedOut, failure.Failure.Category);
+            await AssertProcessExitedAsync(childId).ConfigureAwait(false);
+            Assert.IsTrue(elapsed.Elapsed < TimeSpan.FromSeconds(8));
+        }
+        finally
+        {
+            if (!child.HasExited)
+            {
+                child.Kill();
+                await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            }
+        }
+    }
+
+    [TestMethod]
     public async Task ArgumentListPreservesSpacesAndShellMetacharactersLiterally()
     {
-        const string hostileButValidName = "literal space & (group) ^ ! % ; [value]";
+        const string hostileButValidName = "space & () ^ ! % ; []";
         using var exportFixture = await ConverterFixture.CreateAsync(
                 s_fakeConverterPath,
                 "validate",
-                Path.Combine(hostileButValidName, "source & echo not-a-command.cdb"))
+                Path.Combine(hostileButValidName, "in & echo no.cdb"))
             .ConfigureAwait(false);
         await exportFixture.ConfigureAsync(
                 "validate",
@@ -310,11 +343,18 @@ public sealed class CdbConverterTests
             .ConfigureAwait(false);
         var exportConverter = new CdbConverter(exportFixture.ExecutablePath);
 
-        var export = await exportConverter.ExportToSqliteAsync(
-                exportFixture.InputPath,
-                TimeSpan.FromMinutes(1),
-                CancellationToken.None)
-            .ConfigureAwait(false);
+        ConversionResult export;
+        try
+        {
+            export = await exportConverter.ExportToSqliteAsync(exportFixture.InputPath,
+                TimeSpan.FromMinutes(1), CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (CdbConversionException failure)
+        {
+            throw new AssertFailedException(
+                $"The argument fixture exited with {failure.Failure.Diagnostics?.ExitCode}. " +
+                failure.Failure.Diagnostics?.StandardError, failure);
+        }
 
         Assert.AreEqual(Path.ChangeExtension(exportFixture.InputPath, ".sqlite"), export.OutputPath);
         Assert.AreEqual(
@@ -324,9 +364,17 @@ public sealed class CdbConverterTests
         using var importFixture = await ConverterFixture.CreateAsync(
                 s_fakeConverterPath,
                 "validate",
-                Path.Combine(hostileButValidName, "working & literal.sqlite"))
+                Path.Combine(hostileButValidName, "work & literal.sqlite"))
             .ConfigureAwait(false);
-        var destination = Path.Combine(importFixture.Root, hostileButValidName, "save & literal (copy).cdb");
+        File.Delete(importFixture.InputPath);
+        await using (var db = SqliteSupport.CreateConnection(importFixture.InputPath, SqliteOpenMode.ReadWriteCreate))
+        {
+            db.Open();
+            using var command = db.CreateCommand();
+            command.CommandText = "CREATE TABLE fixture (id INTEGER PRIMARY KEY)";
+            command.ExecuteNonQuery();
+        }
+        var destination = Path.Combine(importFixture.Root, hostileButValidName, "save & (copy).cdb");
         var expectedBasePath = Path.Combine(
             Path.GetDirectoryName(destination)!,
             Path.GetFileNameWithoutExtension(destination));
@@ -349,6 +397,33 @@ public sealed class CdbConverterTests
             "synthetic converter output",
             await File.ReadAllTextAsync(destination).ConfigureAwait(false));
         Assert.IsFalse(File.Exists(expectedBasePath + ".sqlite"), "The import staging copy was not removed.");
+    }
+
+    [TestMethod]
+    public async Task ImportIncludesCommittedPagesPinnedByAnOlderWalReader()
+    {
+        await using var working = await SqliteTestDatabase.CreateAsync(
+            "PRAGMA journal_mode = WAL", "CREATE TABLE sample(value INTEGER)", "INSERT INTO sample VALUES(1)");
+        await using var reader = SqliteSupport.CreateConnection(working.Path, SqliteOpenMode.ReadOnly);
+        reader.Open();
+        using var readTransaction = reader.BeginTransaction(deferred: true);
+        using var original = reader.CreateCommand();
+        original.Transaction = readTransaction;
+        original.CommandText = "SELECT value FROM sample";
+        Assert.AreEqual(1L, original.ExecuteScalar());
+        await working.ExecuteAsync("UPDATE sample SET value = 2");
+
+        using var fixture = await ConverterFixture.CreateAsync(s_fakeConverterPath, "copy-snapshot");
+        string output = Path.Combine(fixture.Root, "staged.cdb");
+        await new CdbConverter(fixture.ExecutablePath).ImportToCdbAsync(
+            working.Path, output, TimeSpan.FromSeconds(20), CancellationToken.None);
+        using var staged = SqliteSupport.CreateConnection(output, SqliteOpenMode.ReadOnly);
+        staged.Open();
+        using var published = staged.CreateCommand();
+        published.CommandText = "SELECT value FROM sample";
+        Assert.AreEqual(2L, published.ExecuteScalar());
+        Assert.AreEqual(1L, original.ExecuteScalar());
+        Assert.IsFalse(File.Exists(Path.ChangeExtension(output, ".sqlite")));
     }
 
     [TestMethod]
@@ -558,10 +633,8 @@ public sealed class CdbConverterTests
             string? relativeInputPath = null)
         {
             var root = Path.Combine(
-                Path.GetTempPath(),
-                "PcmCdbEditorTests",
-                "ConverterRuns",
-                Guid.NewGuid().ToString("N"));
+                AppContext.BaseDirectory,
+                "converter-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
             var executable = Path.Combine(root, "synthetic converter.exe");
             File.Copy(compiledFakeConverter, executable, overwrite: false);

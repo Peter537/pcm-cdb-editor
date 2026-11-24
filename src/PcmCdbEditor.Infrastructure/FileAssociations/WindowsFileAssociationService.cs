@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using Microsoft.Win32;
 using PcmCdbEditor.Application;
@@ -69,6 +70,7 @@ public sealed class WindowsFileAssociationService : IFileAssociationService
             command.SetValue(null, $"\"{fullPath}\" \"%1\"", RegistryValueKind.String);
         }
 
+        NotifyAssociationChanged();
         return Task.CompletedTask;
     }
 
@@ -85,8 +87,15 @@ public sealed class WindowsFileAssociationService : IFileAssociationService
         }
 
         Registry.CurrentUser.DeleteSubKeyTree(ProgramKey, throwOnMissingSubKey: false);
+        NotifyAssociationChanged();
         return Task.CompletedTask;
     }
+
+    private static void NotifyAssociationChanged() =>
+        SHChangeNotify(0x08000000, 0, IntPtr.Zero, IntPtr.Zero);
+
+    [DllImport("shell32.dll", ExactSpelling = true)]
+    private static extern void SHChangeNotify(uint eventId, uint flags, IntPtr item1, IntPtr item2);
 
     private static string? ExtractExecutable(string commandLine)
     {

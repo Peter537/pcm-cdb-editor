@@ -33,36 +33,6 @@ public sealed class GridContentBindingSessionTests
     }
 
     [TestMethod]
-    public void BulkRowSourcePublishesOnlyACompleteReplacement()
-    {
-        var source = new BulkRowSource<string>();
-        source.Replace([0], static value => $"old-{value}");
-        string[] original = source.Items;
-        var projected = 0;
-
-        source.Replace([1, 2, 3], value =>
-        {
-            Assert.AreSame(original, source.Items);
-            projected++;
-            return $"row-{value}";
-        });
-
-        Assert.AreEqual(3, projected);
-        Assert.AreNotSame(original, source.Items);
-        Assert.HasCount(3, source.Items);
-        Assert.AreEqual("row-1", source.Items[0]);
-        Assert.AreEqual("row-2", source.Items[1]);
-        Assert.AreEqual("row-3", source.Items[2]);
-
-        string[] completed = source.Items;
-        Assert.Throws<InvalidOperationException>(() =>
-            source.Replace([4, 5], value => value == 5
-                ? throw new InvalidOperationException("projection failed")
-                : $"row-{value}"));
-        Assert.AreSame(completed, source.Items);
-    }
-
-    [TestMethod]
     public void ResolveSelectionPreservesIdentityAndCanonicalCurrentColumn()
     {
         var first = new PresentedRow(RowIdentity.FromRowId(1), "first");

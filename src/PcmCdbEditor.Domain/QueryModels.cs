@@ -256,4 +256,18 @@ public sealed record TableRowCountState
     public long? Value { get; }
 
     public string? Problem { get; }
+
+    public TableRowCountState ReconcileWithPage(long offset, int rowCount, bool hasMore)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(rowCount);
+        if (Value is not long total)
+        {
+            return this;
+        }
+
+        long remaining = total - offset;
+        bool agrees = hasMore ? remaining > rowCount : remaining == rowCount;
+        return agrees ? this : Unknown;
+    }
 }

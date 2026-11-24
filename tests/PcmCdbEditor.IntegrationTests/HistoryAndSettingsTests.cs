@@ -11,6 +11,40 @@ namespace PcmCdbEditor.IntegrationTests;
 public sealed class HistoryAndSettingsTests
 {
     [TestMethod]
+    public async Task HistoryReplaysDistinctUnicodeColumnsAndInfiniteRealValues()
+    {
+        await using var database = await SqliteTestDatabase.CreateAsync(
+            """CREATE TABLE sqliteX(id INTEGER PRIMARY KEY, "É" TEXT, "é" TEXT, peak REAL, low REAL)""",
+            "INSERT INTO sqliteX VALUES (1, 'first', 'second', 9e999, -9e999)");
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None);
+        var store = new SqliteTableDataStore();
+        var query = new TableQuery("SQLITEX", new PageRequest(0, 100));
+        var first = (await store.QueryRowsAsync(database.Path, catalog, query, CancellationToken.None)).Rows.Single();
+        Assert.AreEqual(SqliteValue.Text("first"), first.Values["É"]);
+        Assert.AreEqual(SqliteValue.Text("second"), first.Values["é"]);
+        var deletion = new RowDeletionOperation(Guid.NewGuid(), "sqliteX", DateTimeOffset.UtcNow, first);
+        await store.DeleteRowAsync(database.Path, catalog, deletion, CancellationToken.None);
+        string snapshot = Path.Combine(database.Directory, "history.json");
+        var history = new EditHistory(snapshot);
+        history.Record(deletion, [RowReplayGuard.Absent("sqliteX", first.Identity!)]);
+        history = new EditHistory(snapshot);
+
+        var replayer = new SqliteEditOperationReplayer();
+        var undo = history.TakeUndoReplay();
+        var undone = await replayer.ReplayAsync(database.Path, catalog, undo, CancellationToken.None);
+        history.CompleteUndo(undo, undone.OppositeGuards);
+        var restored = (await store.QueryRowsAsync(database.Path, catalog, query, CancellationToken.None)).Rows.Single();
+        Assert.AreEqual(SqliteValue.Text("first"), restored.Values["É"]);
+        Assert.AreEqual(SqliteValue.Text("second"), restored.Values["é"]);
+        Assert.IsTrue(double.IsPositiveInfinity(restored.Values["peak"].RealValue));
+        Assert.IsTrue(double.IsNegativeInfinity(restored.Values["low"].RealValue));
+
+        var redo = new EditHistory(snapshot).TakeRedoReplay();
+        await replayer.ReplayAsync(database.Path, catalog, redo, CancellationToken.None);
+        Assert.IsEmpty((await store.QueryRowsAsync(database.Path, catalog, query, CancellationToken.None)).Rows);
+    }
+
+    [TestMethod]
     public void EditHistoryAtomicallyReloadsFullTypedUndoAndRedoStacks()
     {
         var directory = Path.Combine(Path.GetTempPath(), "PcmCdbEditorTests", Guid.NewGuid().ToString("N"));
@@ -121,6 +155,38 @@ public sealed class HistoryAndSettingsTests
         Assert.IsFalse(history.State.HasPendingReplay);
         Assert.IsFalse(history.State.IsDirty);
         Assert.IsFalse(new EditHistory(historyPath).State.CanUndo);
+    }
+
+    [TestMethod]
+    public async Task SettingsLeaseSerializesIndependentUpdatesAndRespectsCancellation()
+    {
+        await using var db = await SqliteTestDatabase.CreateAsync("CREATE TABLE data (id INTEGER PRIMARY KEY);")
+            .ConfigureAwait(false);
+        string path = Path.Combine(Path.GetDirectoryName(db.Path)!, "settings.json");
+        var first = new JsonSettingsStore(path);
+        var second = new JsonSettingsStore(path);
+        Task<EditorPreferences> themeUpdate;
+        Task<EditorPreferences> pageUpdate;
+        using (new FileStream(path + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+        {
+            themeUpdate = first.UpdatePreferencesAsync(current => new EditorPreferences(
+                ApplicationTheme.Dark, current.Density, current.PageSize,
+                current.ForeignKeyDisplayMode, current.RecentFiles), CancellationToken.None);
+            pageUpdate = second.UpdatePreferencesAsync(current => new EditorPreferences(
+                current.Theme, current.Density, 500,
+                current.ForeignKeyDisplayMode, current.RecentFiles), CancellationToken.None);
+            using var cancellation = new CancellationTokenSource();
+            var cancelledRead = first.LoadPreferencesAsync(cancellation.Token);
+            cancellation.Cancel();
+            await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => cancelledRead).ConfigureAwait(false);
+            Assert.IsFalse(themeUpdate.IsCompleted);
+            Assert.IsFalse(pageUpdate.IsCompleted);
+        }
+
+        await Task.WhenAll(themeUpdate, pageUpdate).WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        EditorPreferences reloaded = await second.LoadPreferencesAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual(ApplicationTheme.Dark, reloaded.Theme);
+        Assert.AreEqual(500, reloaded.PageSize);
     }
 
     [TestMethod]

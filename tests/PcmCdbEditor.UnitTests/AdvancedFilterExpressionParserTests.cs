@@ -67,6 +67,42 @@ public sealed class AdvancedFilterExpressionParserTests
         Assert.ThrowsExactly<FilterParseException>(() => AdvancedFilterExpressionParser.Parse("1", duplicate));
     }
 
+    [TestMethod]
+    public void ParsesTheMaximumNumberOfRulesInOrderAndRejectsAdditionalOccurrences()
+    {
+        int max = FilterExpressionLimits.MaximumRules;
+        var rules = Rules(max);
+        string expression = string.Join(" AND ", Enumerable.Range(1, max).Reverse());
+
+        var group = Assert.IsInstanceOfType<FilterGroup>(AdvancedFilterExpressionParser.Parse(expression, rules));
+        CollectionAssert.AreEqual(rules.Reverse().Select(static rule => rule.Condition).ToArray(), group.Children.ToArray());
+        Assert.ThrowsExactly<FilterParseException>(() => AdvancedFilterExpressionParser.Parse(expression + " AND 1", rules));
+        Assert.ThrowsExactly<FilterParseException>(() => AdvancedFilterExpressionParser.Parse("1", Rules(max + 1)));
+    }
+
+    [TestMethod]
+    public void RejectsOversizedTextAndDeepTextualOrLogicalNesting()
+    {
+        var rules = Rules(1);
+        string text = new string(' ', FilterExpressionLimits.MaximumTextLength - 1) + "1";
+        Assert.AreEqual(rules[0].Condition, AdvancedFilterExpressionParser.Parse(text, rules));
+        Assert.ThrowsExactly<FilterParseException>(() => AdvancedFilterExpressionParser.Parse(text + " ", rules));
+
+        int maxTextNesting = FilterExpressionLimits.MaximumRules;
+        string redundant = new string('(', maxTextNesting) + "1" + new string(')', maxTextNesting);
+        Assert.AreEqual(rules[0].Condition, AdvancedFilterExpressionParser.Parse(redundant, rules));
+        Assert.ThrowsExactly<FilterParseException>(() => AdvancedFilterExpressionParser.Parse($"({redundant})", rules));
+
+        string expression = "1";
+        for (int depth = 1; depth < FilterExpressionLimits.MaximumDepth; depth++)
+        {
+            expression = depth % 2 == 0 ? $"1 AND ({expression})" : $"1 OR ({expression})";
+        }
+
+        FilterExpressionLimits.Validate(AdvancedFilterExpressionParser.Parse(expression, rules));
+        Assert.ThrowsExactly<FilterParseException>(() => AdvancedFilterExpressionParser.Parse($"1 AND ({expression})", rules));
+    }
+
     private static NumberedFilterRule[] Rules(int count) =>
         Enumerable.Range(1, count).Select(Rule).ToArray();
 

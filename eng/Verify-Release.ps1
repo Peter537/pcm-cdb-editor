@@ -14,13 +14,28 @@ param(
 
     [string] $MetadataDirectory,
 
-    [string] $ChecksumsPath
+    [string] $ChecksumsPath,
+
+    [string] $SourceCheckout,
+
+    [switch] $RecordRestoreAssets,
+
+    [switch] $RequireReleaseEvidence,
+
+    [switch] $EmitCandidateTreeHash
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:RepositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+if ([string]::IsNullOrWhiteSpace($SourceCheckout)) {
+    $SourceCheckout = $script:RepositoryRoot
+}
+. (Join-Path $PSScriptRoot 'Release-Filesystem.ps1')
+. (Join-Path $PSScriptRoot 'Release-RuntimePolicy.ps1')
+. (Join-Path $PSScriptRoot 'Release-Source.ps1')
+. (Join-Path $PSScriptRoot 'Release-InstallerEvidence.ps1')
 $script:ExporterSha256 = '5F1F3F72C5BF5537E74DE1A0FC732B1CBDF191E6CA3A3E9A12F18BBE15C1951D'
 $script:ExporterReadmeSha256 = 'CF05919B2BDB7873F4CAFAA98126F2143195BFF1D0A937EF55B00E164EF7DED6'
 
@@ -82,19 +97,6 @@ function Get-StreamSha256 {
     $algorithm = [System.Security.Cryptography.SHA256]::Create()
     try {
         return [System.BitConverter]::ToString($algorithm.ComputeHash($Stream)).Replace('-', '')
-    }
-    finally {
-        $algorithm.Dispose()
-    }
-}
-
-function Get-StringSha256 {
-    param([Parameter(Mandatory = $true)][string] $Value)
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
-    $algorithm = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        return [System.BitConverter]::ToString($algorithm.ComputeHash($bytes)).Replace('-', '')
     }
     finally {
         $algorithm.Dispose()
@@ -215,15 +217,64 @@ function Get-LockedDependencies {
     return @($dependencies | Sort-Object -Property Id, Version, Project, Target)
 }
 
+function Get-RestoreAssets {
+    param(
+        [Parameter(Mandatory = $true)][string] $EvidencePath,
+        [switch] $Record
+    )
+
+    $projectRoots = @((Join-Path $script:RepositoryRoot 'src'), (Join-Path $script:RepositoryRoot 'tests'))
+    $projectFiles = @(Get-ChildItem -LiteralPath $projectRoots -Recurse -Force -File -Filter '*.csproj' | Sort-Object FullName)
+    $projects = [ordered]@{}
+    if ($Record) {
+        foreach ($projectFile in $projectFiles) {
+            $project = (Get-RelativePath -BasePath $script:RepositoryRoot -TargetPath $projectFile.FullName).Replace('\', '/')
+            $assetsPath = Resolve-RequiredPath -Path (Join-Path $projectFile.DirectoryName 'obj\project.assets.json') -Kind File
+            $assets = Get-Content -Raw -LiteralPath $assetsPath | ConvertFrom-Json
+            $targets = [ordered]@{}
+            foreach ($target in $assets.targets.PSObject.Properties) {
+                $libraries = [ordered]@{}
+                foreach ($library in $target.Value.PSObject.Properties) {
+                    if ([string] $library.Value.type -eq 'package' -and
+                        ($library.Name -like 'WinUI.TableView/*' -or
+                            @($library.Value.PSObject.Properties.Name | Where-Object {
+                                $_ -in @('native', 'build', 'buildMultiTargeting', 'buildTransitive', 'runtimeTargets')
+                            }).Count -gt 0)) {
+                        $libraries[$library.Name] = $library.Value
+                    }
+                }
+                $targets[$target.Name] = $libraries
+            }
+            $downloads = @(
+                foreach ($framework in $assets.project.frameworks.PSObject.Properties) {
+                    $property = $framework.Value.PSObject.Properties['downloadDependencies']
+                    if ($null -ne $property) {
+                        $property.Value
+                    }
+                }
+            )
+            $projects[$project] = [ordered]@{ Targets = $targets; DownloadDependencies = $downloads }
+        }
+        Write-JsonFile -Path $EvidencePath -Value ([ordered]@{ SchemaVersion = 1; Projects = $projects })
+    }
+
+    $evidence = Get-Content -Raw -LiteralPath (Resolve-RequiredPath -Path $EvidencePath -Kind File) | ConvertFrom-Json
+    $expectedProjects = @(
+        $projectFiles | ForEach-Object {
+            (Get-RelativePath -BasePath $script:RepositoryRoot -TargetPath $_.FullName).Replace('\', '/')
+        }
+    )
+    if ([int] $evidence.SchemaVersion -ne 1 -or
+        @($evidence.Projects.PSObject.Properties.Name).Count -ne $expectedProjects.Count -or
+        @($expectedProjects | Where-Object { $_ -cnotin @($evidence.Projects.PSObject.Properties.Name) }).Count -ne 0) {
+        throw 'Resolved restore evidence does not contain the exact source project set.'
+    }
+    return $evidence.Projects
+}
+
 function Get-ResolvedRiskyAssets {
-    $projectRoots = @(
-        (Join-Path $script:RepositoryRoot 'src'),
-        (Join-Path $script:RepositoryRoot 'tests')
-    )
-    $projectFiles = @(
-        Get-ChildItem -LiteralPath $projectRoots -Recurse -Force -File -Filter '*.csproj' |
-            Sort-Object -Property FullName
-    )
+    param([Parameter(Mandatory = $true)][object] $Projects)
+
     $riskyAssetNames = @{
         'native' = $true
         'build' = $true
@@ -233,18 +284,8 @@ function Get-ResolvedRiskyAssets {
     }
     $resolvedAssets = [System.Collections.Generic.List[object]]::new()
 
-    foreach ($projectFile in $projectFiles) {
-        $assetsPath = Join-Path $projectFile.DirectoryName 'obj\project.assets.json'
-        if (-not [System.IO.File]::Exists($assetsPath)) {
-            throw "Restored target-asset evidence is missing for $($projectFile.FullName)."
-        }
-
-        $assets = Get-Content -Raw -LiteralPath $assetsPath | ConvertFrom-Json
-        if ($null -eq $assets.targets) {
-            throw "Restored target-asset evidence has no targets object: $assetsPath"
-        }
-
-        foreach ($target in $assets.targets.PSObject.Properties) {
+    foreach ($project in $Projects.PSObject.Properties) {
+        foreach ($target in $project.Value.Targets.PSObject.Properties) {
             foreach ($library in $target.Value.PSObject.Properties) {
                 if ([string] $library.Value.type -ne 'package') {
                     continue
@@ -275,11 +316,11 @@ function Get-ResolvedRiskyAssets {
 
                 $separator = $library.Name.LastIndexOf('/')
                 if ($separator -le 0 -or $separator -eq $library.Name.Length - 1) {
-                    throw "Unable to parse restored package identity '$($library.Name)' in $assetsPath."
+                    throw "Unable to parse restored package identity '$($library.Name)' in $($project.Name)."
                 }
 
                 $resolvedAssets.Add([pscustomobject]@{
-                    Project = (Get-RelativePath -BasePath $script:RepositoryRoot -TargetPath $projectFile.FullName).Replace('\', '/')
+                    Project = $project.Name
                     Target = $target.Name
                     Id = $library.Name.Substring(0, $separator)
                     Version = $library.Name.Substring($separator + 1)
@@ -394,8 +435,8 @@ if ($nativeSqliteFiles.Count -ne 1) {
 }
 
 $runtimeConfig = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'PcmCdbEditor.runtimeconfig.json')
-if ($runtimeConfig -notmatch '"version"\s*:\s*"10\.0\.11"') {
-    throw 'The self-contained runtime configuration does not record runtime 10.0.11.'
+if ($runtimeConfig -notmatch '"version"\s*:\s*"10\.0\.15"') {
+    throw 'The self-contained runtime configuration does not record runtime 10.0.15.'
 }
 
 $publishedDependencies = Get-Content -Raw -LiteralPath (Join-Path $payloadRoot 'PcmCdbEditor.deps.json') | ConvertFrom-Json
@@ -404,8 +445,8 @@ $publishedRuntimePacks = @(
         Where-Object { $_.Name -like 'runtimepack.Microsoft.NETCore.App.Runtime.win-x64/*' }
 )
 if ($publishedRuntimePacks.Count -ne 1 -or
-    $publishedRuntimePacks[0].Name -ne 'runtimepack.Microsoft.NETCore.App.Runtime.win-x64/10.0.11') {
-    throw 'The staged self-contained payload does not resolve the win-x64 .NET runtime pack to 10.0.11 exactly.'
+    $publishedRuntimePacks[0].Name -ne 'runtimepack.Microsoft.NETCore.App.Runtime.win-x64/10.0.15') {
+    throw 'The staged self-contained payload does not resolve the win-x64 .NET runtime pack to 10.0.15 exactly.'
 }
 
 $appProjectPath = Join-Path $script:RepositoryRoot 'src\PcmCdbEditor.App\PcmCdbEditor.App.csproj'
@@ -431,12 +472,12 @@ $appHostOverride = @($appProject.SelectNodes(
 $latestPatchProperties = @($appProject.SelectNodes(
     '/Project/PropertyGroup[TargetLatestRuntimePatch]'))
 if ($runtimeFrameworkOverride.Count -ne 1 -or
-    [string] $runtimeFrameworkOverride[0].LatestRuntimeFrameworkVersion -ne '10.0.11' -or
+    [string] $runtimeFrameworkOverride[0].LatestRuntimeFrameworkVersion -ne '10.0.15' -or
     $appHostOverride.Count -ne 1 -or
-    [string] $appHostOverride[0].AppHostPackVersion -ne '10.0.11' -or
+    [string] $appHostOverride[0].AppHostPackVersion -ne '10.0.15' -or
     $latestPatchProperties.Count -ne 1 -or
     [string] $latestPatchProperties[0].TargetLatestRuntimePatch -ne 'true') {
-    throw 'The app project does not pin both the .NET runtime and apphost packs to 10.0.11 with TargetLatestRuntimePatch=true.'
+    throw 'The app project does not pin both the .NET runtime and apphost packs to 10.0.15 with TargetLatestRuntimePatch=true.'
 }
 
 if ((Get-Content -Raw -LiteralPath $appProjectPath) -match '<RuntimeFrameworkVersion>') {
@@ -448,36 +489,30 @@ if ($buildScriptText -match '(?i)-p:RuntimeFrameworkVersion') {
     throw 'Build-Release.ps1 must not pass RuntimeFrameworkVersion; it also overrides Microsoft.Windows.SDK.NET.Ref.'
 }
 
-$projectAssetsPath = Join-Path $script:RepositoryRoot 'src\PcmCdbEditor.App\obj\project.assets.json'
-if (-not [System.IO.File]::Exists($projectAssetsPath)) {
-    throw 'The restored app project.assets.json is required to verify the exact runtime and apphost packs.'
-}
-
-$projectAssets = Get-Content -Raw -LiteralPath $projectAssetsPath | ConvertFrom-Json
-$downloadDependencies = @(
-    $projectAssets.project.frameworks.PSObject.Properties |
-        ForEach-Object { @($_.Value.downloadDependencies) }
-)
+$restoreAssetsPath = Join-Path $metadataRoot 'resolved-restore-assets.json'
+$restoredProjects = Get-RestoreAssets -EvidencePath $restoreAssetsPath -Record:$RecordRestoreAssets
+$projectAssets = $restoredProjects.'src/PcmCdbEditor.App/PcmCdbEditor.App.csproj'
+$downloadDependencies = @($projectAssets.DownloadDependencies)
 $runtimePackId = 'Microsoft.NETCore.App.Runtime.win-x64'
 $resolvedRuntimePacks = @($downloadDependencies | Where-Object { $_.name -eq $runtimePackId })
-if ($resolvedRuntimePacks.Count -ne 1 -or [string] $resolvedRuntimePacks[0].version -ne '[10.0.11, 10.0.11]') {
-    throw "The restored $runtimePackId download dependency is not pinned to 10.0.11 exactly."
+if ($resolvedRuntimePacks.Count -ne 1 -or [string] $resolvedRuntimePacks[0].version -ne '[10.0.15, 10.0.15]') {
+    throw "The restored $runtimePackId download dependency is not pinned to 10.0.15 exactly."
 }
 
 $appHostPackId = 'Microsoft.NETCore.App.Host.win-x64'
 $resolvedAppHostPacks = @($downloadDependencies | Where-Object { $_.name -eq $appHostPackId })
 if ($resolvedAppHostPacks.Count -gt 0) {
-    if ($resolvedAppHostPacks.Count -ne 1 -or [string] $resolvedAppHostPacks[0].version -ne '[10.0.11, 10.0.11]') {
-        throw "The restored $appHostPackId download dependency is not pinned to 10.0.11 exactly."
+    if ($resolvedAppHostPacks.Count -ne 1 -or [string] $resolvedAppHostPacks[0].version -ne '[10.0.15, 10.0.15]') {
+        throw "The restored $appHostPackId download dependency is not pinned to 10.0.15 exactly."
     }
 }
 else {
     # Installed SDK packs are omitted from project.assets.json downloadDependencies.
     $dotnetCommand = Get-Command dotnet -CommandType Application -ErrorAction Stop
     $dotnetRoot = Split-Path -Parent $dotnetCommand.Source
-    $installedAppHost = Join-Path $dotnetRoot 'packs\Microsoft.NETCore.App.Host.win-x64\10.0.11\runtimes\win-x64\native\apphost.exe'
+    $installedAppHost = Join-Path $dotnetRoot 'packs\Microsoft.NETCore.App.Host.win-x64\10.0.15\runtimes\win-x64\native\apphost.exe'
     if (-not [System.IO.File]::Exists($installedAppHost)) {
-        throw "The restored $appHostPackId is neither an exact download dependency nor installed at version 10.0.11."
+        throw "The restored $appHostPackId is neither an exact download dependency nor installed at version 10.0.15."
     }
 }
 
@@ -635,7 +670,7 @@ $expectedRiskyAssetPackages = [ordered]@{
     'SQLitePCLRaw.lib.e_sqlite3' = '2.1.12'
     'System.Numerics.Tensors' = '9.0.0'
 }
-$resolvedRiskyAssets = @(Get-ResolvedRiskyAssets)
+$resolvedRiskyAssets = @(Get-ResolvedRiskyAssets -Projects $restoredProjects)
 
 $dependencyDenyMatches = [System.Collections.Generic.List[object]]::new()
 foreach ($expected in $expectedPackages.GetEnumerator()) {
@@ -712,11 +747,11 @@ $runtimePackEntries = @(
 )
 foreach ($runtimePackId in @('Microsoft.NETCore.App.Runtime.win-x64', 'Microsoft.NETCore.App.Host.win-x64')) {
     $packMatches = @($runtimePackEntries | Where-Object { $_.Id -eq $runtimePackId })
-    if ($packMatches.Count -gt 0 -and @($packMatches | Where-Object { $_.Version -ne '10.0.11' }).Count -gt 0) {
+    if ($packMatches.Count -gt 0 -and @($packMatches | Where-Object { $_.Version -ne '10.0.15' }).Count -gt 0) {
         $dependencyDenyMatches.Add([pscustomobject]@{
             Rule = 'runtime-pack-version-mismatch'
             Id = $runtimePackId
-            ExpectedVersion = '10.0.11'
+            ExpectedVersion = '10.0.15'
             ActualVersion = (@($packMatches.Version | Sort-Object -Unique) -join ', ')
         })
     }
@@ -913,7 +948,7 @@ $vulnerabilityFindings = @($vulnerabilityAudit.Findings)
 if ([int] $vulnerabilityAudit.SchemaVersion -ne 1 -or
     [string] $vulnerabilityAudit.Scanner -cne 'dotnet package list' -or
     [int] $vulnerabilityAudit.OutputVersion -ne 1 -or
-    [string] $vulnerabilityAudit.SdkVersion -cne '10.0.303' -or
+    [string] $vulnerabilityAudit.SdkVersion -cne '10.0.403' -or
     [string] $vulnerabilityAudit.Arguments -cne '--include-transitive --vulnerable --no-restore --format json --output-version 1' -or
     $vulnerabilityAuditSources.Count -ne 1 -or
     [string] $vulnerabilityAuditSources[0] -cne 'https://api.nuget.org/v3/index.json' -or
@@ -972,12 +1007,22 @@ if ($calculatedSourceTree -ne [string] $sourceManifest.TreeSha256) {
 }
 
 $provenance = Get-Content -Raw -LiteralPath $provenancePath | ConvertFrom-Json
-if ([int] $provenance.SchemaVersion -ne 3 -or
+if ([int] $provenance.SchemaVersion -ne 4 -or
+    [string] $provenance.Source.BuildMode -cnotin @('CommittedSnapshot', 'WorkingTreeSnapshot') -or
+    [string] $provenance.Source.GitStatusSha256 -notmatch '^[0-9A-F]{64}$' -or
     [string] $provenance.Source.Manifest -ne 'metadata/source-manifest.json' -or
     [string] $provenance.Source.TreeSha256 -ne $calculatedSourceTree -or
     [int] $provenance.Source.ManifestFileCount -ne $sourceEntries.Count -or
     [string] $provenance.Source.Commit -ne [string] $provenance.SourceCommit) {
     throw 'Release provenance does not match the deterministic source manifest.'
+}
+$runtimeSecurity = $provenance.DotNet.RuntimeSecurity
+if ([string] $runtimeSecurity.RuntimePack -ne 'Microsoft.NETCore.App.Runtime.win-x64' -or
+    [string] $runtimeSecurity.AppHostPack -ne 'Microsoft.NETCore.App.Host.win-x64' -or
+    [string] $runtimeSecurity.Version -ne '10.0.15' -or
+    [version] $runtimeSecurity.SecurityFloor -gt [version] $runtimeSecurity.Version -or
+    (ConvertFrom-ReleaseTimestamp -Value $runtimeSecurity.EndOfSupport) -le [DateTimeOffset]::UtcNow) {
+    throw 'Release provenance lacks valid support and advisory evidence for the runtime and app-host packs.'
 }
 $buildEnvironmentProperty = $provenance.PSObject.Properties['BuildEnvironment']
 if ($null -eq $buildEnvironmentProperty -or $null -eq $buildEnvironmentProperty.Value) {
@@ -1001,11 +1046,25 @@ if ($buildReleaseSource -notmatch "(?m)^\s*'/CURRENTUSER',\s*$" -or
     throw 'Build-Release must invoke the verified Inno compiler in portable current-user mode.'
 }
 
-$currentGitStatus = @(& git -C $script:RepositoryRoot status --porcelain=v1 --untracked-files=all 2>&1)
-if ($LASTEXITCODE -ne 0 -or
-    [bool] $provenance.Source.WorkingTreeDirty -ne ($currentGitStatus.Count -gt 0) -or
-    [int] $provenance.Source.GitStatusEntryCount -ne $currentGitStatus.Count) {
+$state = Get-ReleaseGitState -Root $SourceCheckout
+if (([string] $provenance.Source.BuildMode -ceq 'CommittedSnapshot') -ne ($state.Status.Count -eq 0) -or
+    [bool] $provenance.Source.WorkingTreeDirty -ne ($state.Status.Count -gt 0) -or
+    [int] $provenance.Source.GitStatusEntryCount -ne $state.Status.Count) {
     throw 'Release provenance does not match the current working-tree state.'
+}
+Assert-ReleaseSourceState -Root $SourceCheckout -Commit $provenance.SourceCommit `
+    -StatusSha256 $provenance.Source.GitStatusSha256 -TreeSha256 $calculatedSourceTree
+
+if ($RequireReleaseEvidence -and [bool] $provenance.Source.WorkingTreeDirty) {
+    throw 'Release evidence requires an isolated build from a clean source checkout.'
+}
+$installedEvidencePath = Join-Path $metadataRoot 'installed-payload.json'
+$installedEvidenceAvailable = [System.IO.File]::Exists($installedEvidencePath)
+if ($installedEvidenceAvailable) {
+    Assert-InstalledPayloadEvidence -EvidencePath $installedEvidencePath -InstallerPath $installerFullPath -PayloadFiles $payloadFiles
+}
+elseif ($RequireReleaseEvidence) {
+    throw 'Verified Windows Sandbox installation and uninstallation evidence is required.'
 }
 
 $releaseRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $metadataRoot))
@@ -1021,6 +1080,10 @@ $checksumInputs.Add($sourceManifestPath)
 $checksumInputs.Add($provenancePath)
 $checksumInputs.Add($sbomValidationPath)
 $checksumInputs.Add($vulnerabilityAuditPath)
+$checksumInputs.Add($restoreAssetsPath)
+if ($installedEvidenceAvailable) {
+    $checksumInputs.Add($installedEvidencePath)
+}
 
 $checksumLines = @(
     $checksumInputs |
@@ -1036,5 +1099,15 @@ Write-Host "Verified release payload: $($payloadFiles.Count) files"
 Write-Host "Verified locked dependency entries: $($dependencies.Count)"
 Write-Host 'Verified the auditable full-graph NuGet vulnerability report contains no findings.'
 Write-Host "Verified ZIP is byte-for-byte equivalent to the staged payload."
-Write-Host 'Verified installer is unsigned and compiled from the single staged payload source.'
+Write-Host 'Verified installer is unsigned and checked the installer source configuration.'
+if ($installedEvidenceAvailable) {
+    Write-Host 'Verified installed files, per-user shell registration, and uninstall behavior against Windows Sandbox evidence.'
+}
+else {
+    Write-Host 'Installed payload verification is pending. Run Test-InstallerPayload.ps1 in a Windows Sandbox-capable environment.'
+}
 Write-Host "Wrote checksums: $checksumsFullPath"
+
+if ($EmitCandidateTreeHash) {
+    Get-ReleaseCandidateTreeHash -Path $releaseRoot
+}

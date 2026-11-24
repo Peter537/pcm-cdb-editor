@@ -1,10 +1,20 @@
+using PcmCdbEditor.Domain;
+
 namespace PcmCdbEditor.Infrastructure.Workspace;
 
 public sealed partial class WorkspaceService
 {
     private readonly object _sessionOwnershipGate = new();
-    private readonly Dictionary<Guid, FileStream> _ownedSessions = [];
+    private readonly Dictionary<Guid, SessionOwnership> _ownedSessions = [];
     private bool _disposed;
+
+    private sealed class SessionOwnership(FileStream lease)
+    {
+        public FileStream Lease { get; } = lease;
+        public CommittedSaveReceipt? UnsynchronizedSave { get; set; }
+    }
+
+    private sealed record CommittedSaveReceipt(EditorSessionState Saving, EditorSessionState Committed);
 
     private FileStream AcquireSessionOwnership(Guid sessionId)
     {
@@ -36,7 +46,37 @@ public sealed partial class WorkspaceService
         lock (_sessionOwnershipGate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            _ownedSessions.Add(sessionId, ownership);
+            _ownedSessions.Add(sessionId, new SessionOwnership(ownership));
+        }
+    }
+
+    private void RememberUnsynchronizedSave(EditorSessionState saving, EditorSessionState committed)
+    {
+        lock (_sessionOwnershipGate)
+        {
+            if (_ownedSessions.TryGetValue(committed.SessionId, out SessionOwnership? ownership))
+            {
+                ownership.UnsynchronizedSave = new CommittedSaveReceipt(saving, committed);
+            }
+        }
+    }
+
+    private CommittedSaveReceipt? GetUnsynchronizedSave(Guid sessionId)
+    {
+        lock (_sessionOwnershipGate)
+        {
+            return _ownedSessions.GetValueOrDefault(sessionId)?.UnsynchronizedSave;
+        }
+    }
+
+    private void ClearUnsynchronizedSave(Guid sessionId)
+    {
+        lock (_sessionOwnershipGate)
+        {
+            if (_ownedSessions.TryGetValue(sessionId, out SessionOwnership? ownership))
+            {
+                ownership.UnsynchronizedSave = null;
+            }
         }
     }
 
@@ -56,9 +96,9 @@ public sealed partial class WorkspaceService
     {
         lock (_sessionOwnershipGate)
         {
-            if (_ownedSessions.Remove(sessionId, out FileStream? ownership))
+            if (_ownedSessions.Remove(sessionId, out SessionOwnership? ownership))
             {
-                ownership.Dispose();
+                ownership.Lease.Dispose();
             }
         }
     }
@@ -73,9 +113,9 @@ public sealed partial class WorkspaceService
             }
 
             _disposed = true;
-            foreach (FileStream ownership in _ownedSessions.Values)
+            foreach (SessionOwnership ownership in _ownedSessions.Values)
             {
-                ownership.Dispose();
+                ownership.Lease.Dispose();
             }
             _ownedSessions.Clear();
         }

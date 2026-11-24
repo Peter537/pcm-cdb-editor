@@ -1,5 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using Microsoft.Data.Sqlite;
+using PcmCdbEditor.Infrastructure.Sqlite;
 using PcmCdbEditor.Application;
 using PcmCdbEditor.Infrastructure.Internal;
 
@@ -59,9 +61,15 @@ public sealed class CdbConverter : ICdbConverter
         var stagedSqlite = basePath + ".sqlite";
         EnsureAvailable(stagedSqlite, stopwatch);
         Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+        using (new FileStream(stagedSqlite, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            // Reserve this path so the cleanup below owns it.
+        }
+
         try
         {
-            File.Copy(input, stagedSqlite, overwrite: false);
+            await SqliteSnapshot.CreateAsync(input, stagedSqlite, TimeRemaining(timeout, stopwatch), cancellationToken)
+                .ConfigureAwait(false);
             var diagnostics = await RunAsync(
                     ["-a", "-import", basePath],
                     [input, output, basePath, stagedSqlite],
@@ -77,7 +85,17 @@ public sealed class CdbConverter : ICdbConverter
             TryDelete(output);
             throw;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (TimeoutException exception)
+        {
+            throw Failure(ConverterFailureCategory.TimedOut,
+                "The working database snapshot exceeded the conversion time limit.", stopwatch, innerException: exception);
+        }
+        catch (OperationCanceledException exception) when (cancellationToken.IsCancellationRequested)
+        {
+            throw Failure(ConverterFailureCategory.Cancelled,
+                "The SQLite exporter operation was cancelled.", stopwatch, innerException: exception);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or SqliteException)
         {
             TryDelete(output);
             throw Failure(
@@ -116,9 +134,9 @@ public sealed class CdbConverter : ICdbConverter
                 stopwatch);
         }
 
-        var effectiveTimeout = ValidateTimeout(timeout);
         try
         {
+            var effectiveTimeout = TimeRemaining(timeout, stopwatch);
             var result = await BoundedProcessRunner.RunAsync(
                     _executablePath,
                     arguments,
@@ -150,8 +168,13 @@ public sealed class CdbConverter : ICdbConverter
                 stopwatch.Elapsed);
             throw new CdbConversionException(new ConversionFailure(
                 ConverterFailureCategory.TimedOut,
-                "The SQLite exporter exceeded the 10-minute operation limit.",
+                "The SQLite exporter exceeded the conversion time limit.",
                 diagnostics), exception);
+        }
+        catch (TimeoutException exception)
+        {
+            throw Failure(ConverterFailureCategory.TimedOut,
+                "The SQLite exporter exceeded the conversion time limit.", stopwatch, innerException: exception);
         }
         catch (OperationCanceledException exception) when (cancellationToken.IsCancellationRequested)
         {
@@ -224,6 +247,14 @@ public sealed class CdbConverter : ICdbConverter
                 "The SQLite exporter created an empty output file.",
                 diagnostics with { Duration = stopwatch.Elapsed }));
         }
+    }
+
+    private static TimeSpan TimeRemaining(TimeSpan requested, Stopwatch stopwatch)
+    {
+        TimeSpan remaining = ValidateTimeout(requested) - stopwatch.Elapsed;
+        return remaining > TimeSpan.Zero
+            ? remaining
+            : throw new TimeoutException("The conversion deadline has elapsed.");
     }
 
     private static TimeSpan ValidateTimeout(TimeSpan requested)

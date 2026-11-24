@@ -36,7 +36,7 @@ public sealed class EditHistoryRow
                 return before.Keys;
             }
 
-            return before.Keys.Union(after.Keys, StringComparer.OrdinalIgnoreCase)
+            return before.Keys.Union(after.Keys, SqliteIdentifierComparer.Instance)
                 .Where(column => !before.TryGetValue(column, out SqliteValue oldValue) ||
                     !after.TryGetValue(column, out SqliteValue newValue) || oldValue != newValue);
         }
@@ -90,5 +90,5 @@ public static class EditHistoryInspection
         new(change.TableName, change.Identity, change.BeforeValues, change.AfterValues);
 
     private static ReadOnlyDictionary<string, SqliteValue> SingleValue(string column, SqliteValue value) =>
-        new(new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase) { [column] = value });
+        new(new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance) { [column] = value });
 }

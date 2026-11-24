@@ -125,6 +125,7 @@ public sealed class VirtualTableQueryCoordinator : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            cancellationToken.ThrowIfCancellationRequested();
             if (_window.TryGetAtOffset(chunkOffset, out var cached))
             {
                 return cached;
@@ -144,19 +145,26 @@ public sealed class VirtualTableQueryCoordinator : IDisposable
                 linkedCancellation.Token)
             .ConfigureAwait(false);
         linkedCancellation.Token.ThrowIfCancellationRequested();
-        if (!slice.TableName.Equals(query.TableName, StringComparison.OrdinalIgnoreCase)
+        if (!SqliteIdentifierComparer.Instance.Equals(slice.TableName, query.TableName)
             || slice.Request.Offset != chunkOffset
-            || slice.Rows.Count > ChunkSize)
+            || slice.Request.Limit != ChunkSize
+            || slice.Rows.Count > ChunkSize
+            || (slice.HasMore && slice.Rows.Count != ChunkSize))
         {
             throw new InvalidDataException("The table data store returned an invalid virtual chunk.");
         }
 
-        var loaded = new VirtualChunk<TypedRow>(chunkOffset, slice.Rows);
+        var loaded = new VirtualChunk<TypedRow>(chunkOffset, slice.Rows, slice.HasMore);
 
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             linkedCancellation.Token.ThrowIfCancellationRequested();
+            if (lifetimeToken != _queryLifetime.Token)
+            {
+                throw new OperationCanceledException(lifetimeToken);
+            }
+
             _window.Store(loaded);
             return loaded;
         }
@@ -215,6 +223,7 @@ public sealed class VirtualTableQueryCoordinator : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            cancellationToken.ThrowIfCancellationRequested();
             query = _query;
             lifetimeToken = _queryLifetime.Token;
             _countState = TableRowCountState.Loading;
@@ -234,7 +243,18 @@ public sealed class VirtualTableQueryCoordinator : IDisposable
                 .ConfigureAwait(false);
             linkedCancellation.Token.ThrowIfCancellationRequested();
             var available = TableRowCountState.Available(count);
-            return SetCountStateIfCurrent(available, countGeneration, lifetimeToken);
+            lock (_sync)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                linkedCancellation.Token.ThrowIfCancellationRequested();
+                if (lifetimeToken != _queryLifetime.Token || countGeneration != _countGeneration)
+                {
+                    throw new OperationCanceledException("The count request was superseded.", lifetimeToken);
+                }
+
+                _countState = available;
+                return available;
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -271,20 +291,18 @@ public sealed class VirtualTableQueryCoordinator : IDisposable
         lifetime.Dispose();
     }
 
-    private TableRowCountState SetCountStateIfCurrent(
+    private void SetCountStateIfCurrent(
         TableRowCountState state,
         long countGeneration,
         CancellationToken lifetimeToken)
     {
         lock (_sync)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (lifetimeToken == _queryLifetime.Token && countGeneration == _countGeneration)
+            if (!_disposed && lifetimeToken == _queryLifetime.Token && countGeneration == _countGeneration)
             {
                 _countState = state;
             }
 
-            return state;
         }
     }
 

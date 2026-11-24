@@ -18,7 +18,7 @@ public sealed class CountryQuotaReviewProjectionTests
             700,
             1,
             1,
-            new CountryQuotaValues(8, 2, 8, 2),
+            new StoredCountryQuotaValues(8, 2, 8, 2),
             new CountryQuotaValues(8, 2, 8, 2));
         CountryQuotaChange worldOnly = Change(
             50,
@@ -27,7 +27,7 @@ public sealed class CountryQuotaReviewProjectionTests
             500,
             2,
             null,
-            Zero,
+            StoredZero,
             new CountryQuotaValues(8, 2, 0, 0));
         CountryQuotaChange europeanOnly = Change(
             30,
@@ -36,7 +36,7 @@ public sealed class CountryQuotaReviewProjectionTests
             300,
             30,
             2,
-            Zero,
+            StoredZero,
             new CountryQuotaValues(0, 0, 8, 2));
         CountryQuotaChange both = Change(
             40,
@@ -45,7 +45,7 @@ public sealed class CountryQuotaReviewProjectionTests
             400,
             3,
             3,
-            new CountryQuotaValues(6, 2, 6, 2),
+            new StoredCountryQuotaValues(6, 2, 6, 2),
             new CountryQuotaValues(8, 2, 8, 2));
         CountryQuotaChange reset = Change(
             10,
@@ -54,7 +54,7 @@ public sealed class CountryQuotaReviewProjectionTests
             0,
             0,
             null,
-            new CountryQuotaValues(4, 2, 6, 2),
+            new StoredCountryQuotaValues(4, 2, 6, 2),
             Zero);
         CountryQuotaChange[] originalOrder = [reset, europeanOnly, worldOnly, unchangedBoth, both];
         var preview = new CountryQuotaPreview("snapshot-token", new DateOnly(2027, 11, 1), originalOrder, 3, 3);
@@ -154,10 +154,10 @@ public sealed class CountryQuotaReviewProjectionTests
             1,
             "CHI",
             "CHN",
-            1234.5,
+            1234.5M,
             0,
             0,
-            new CountryQuotaValues(6, 2, 4, 2),
+            new StoredCountryQuotaValues(6, 2, 4, 2),
             new CountryQuotaValues(8, 2, 0, 0));
         CountryQuotaReviewRow row = Assert.ContainsSingle(CountryQuotaReviewProjection.Create(
             Preview(alias)).AllRows);
@@ -211,6 +211,21 @@ public sealed class CountryQuotaReviewProjectionTests
         Assert.AreEqual("4 → 0", reset.DisplayText);
     }
 
+    [TestMethod]
+    public void UnsetQuotaIsReviewedAsAChangeEvenWhenTheCalculatedQuotaIsZero()
+    {
+        CountryQuotaReviewProjection projection = CountryQuotaReviewProjection.Create(Preview(
+            Change(1, "ABC", "ABC", 0, 0, null, new StoredCountryQuotaValues(null, 0, 0, 0), Zero)));
+        CountryQuotaReviewRow row = Assert.ContainsSingle(projection.GetRows(CountryQuotaReviewScope.Changes));
+
+        Assert.AreEqual(1, projection.ChangeCount);
+        Assert.AreEqual(CountryQuotaValueChangeKind.Set, row.WorldRoadQuota.ChangeKind);
+        Assert.AreEqual("Not set → 0", row.WorldRoadQuota.DisplayText);
+        StringAssert.Contains(row.BuildAccessibleSummary(CultureInfo.InvariantCulture), "road quota Not set to 0", StringComparison.Ordinal);
+        Assert.IsFalse(row.WorldTimeTrialQuota.IsChanged);
+    }
+
+    private static readonly StoredCountryQuotaValues StoredZero = new(0, 0, 0, 0);
     private static readonly CountryQuotaValues Zero = new(0, 0, 0, 0);
 
     private static CountryQuotaPreview Preview(params CountryQuotaChange[] changes) => new(
@@ -224,10 +239,10 @@ public sealed class CountryQuotaReviewProjectionTests
         long id,
         string rawCode,
         string canonicalCode,
-        double points,
+        decimal points,
         int worldRank,
         int? europeanRank,
-        CountryQuotaValues? oldValues = null,
+        StoredCountryQuotaValues? oldValues = null,
         CountryQuotaValues? newValues = null) => new(
             id,
             rawCode,
@@ -238,7 +253,7 @@ public sealed class CountryQuotaReviewProjectionTests
             points,
             worldRank,
             europeanRank,
-            oldValues ?? Zero,
+            oldValues ?? StoredZero,
             newValues ?? new CountryQuotaValues(1, 0, 0, 0));
 
     private static void AssertOrder(

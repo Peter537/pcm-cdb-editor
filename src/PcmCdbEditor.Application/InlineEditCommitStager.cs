@@ -37,7 +37,7 @@ public sealed class InlineEditCommitStager
             pending is null ||
             pending.BindGeneration != bindGeneration ||
             !ReferenceEquals(pending.RowToken, rowToken) ||
-            !pending.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase))
+            !SqliteIdentifierComparer.Instance.Equals(pending.ColumnName, columnName))
         {
             return null;
         }

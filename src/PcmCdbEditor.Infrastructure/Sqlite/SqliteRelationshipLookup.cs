@@ -55,7 +55,7 @@ public sealed class SqliteRelationshipLookup : IRelationshipLookup
         conditions.AddRange(target.Table.StableIdentity.Columns.Select(name => $"{TargetExpression(name)} IS NOT NULL"));
         if (!string.IsNullOrWhiteSpace(search))
         {
-            command.Parameters.AddWithValue("$search", $"%{EscapeLike(search)}%");
+            command.Parameters.AddWithValue("$search", $"%{SqliteSupport.EscapeLikeLiteral(search)}%");
             IEnumerable<string> searchable = new[] { key, target.LabelExpression }
                 .Concat(target.ContextColumns.Select(column => TargetExpression(column.Name)));
             conditions.Add("(" + string.Join(" OR ", searchable.Select(expression =>
@@ -153,8 +153,8 @@ public sealed class SqliteRelationshipLookup : IRelationshipLookup
                 connection, transaction, catalog, sourceTable, column, key, cancellationToken).ConfigureAwait(false);
             RelationshipLookupOption? current = resolved.Option;
             if (current is null
-                || !current.TargetTable.Equals(choice.TargetTable, StringComparison.OrdinalIgnoreCase)
-                || !current.TargetColumn.Equals(choice.TargetColumn, StringComparison.OrdinalIgnoreCase)
+                || !SqliteIdentifierComparer.Instance.Equals(current.TargetTable, choice.TargetTable)
+                || !SqliteIdentifierComparer.Instance.Equals(current.TargetColumn, choice.TargetColumn)
                 || !current.TargetIdentity.Equals(choice.TargetIdentity)
                 || (!afterWrite && current.TargetRevision != choice.TargetRevision))
             {
@@ -179,7 +179,7 @@ public sealed class SqliteRelationshipLookup : IRelationshipLookup
         if (!RelationshipMetadata.TryGetLookupRelation(catalog, table, sourceColumn, out var relation, out string? reason))
         {
             ForeignKeyRelation[] matches = table.Relationships.Where(candidate =>
-                candidate.SourceColumn.Equals(sourceColumn, StringComparison.OrdinalIgnoreCase)).ToArray();
+                SqliteIdentifierComparer.Instance.Equals(candidate.SourceColumn, sourceColumn)).ToArray();
             RelationshipResolution resolution = matches.Length switch
             {
                 0 => RelationshipResolution.UnknownRelationship,
@@ -202,9 +202,6 @@ public sealed class SqliteRelationshipLookup : IRelationshipLookup
 
     private static string TargetExpression(string columnName) => $"__pcm_target.{Quote(columnName)}";
 
-    private static string EscapeLike(string value) => value.Replace("\\", "\\\\", StringComparison.Ordinal)
-        .Replace("%", "\\%", StringComparison.Ordinal).Replace("_", "\\_", StringComparison.Ordinal);
-
     private sealed class LookupTarget
     {
         private readonly ColumnSchema[] _columns;
@@ -213,11 +210,11 @@ public sealed class SqliteRelationshipLookup : IRelationshipLookup
         {
             Table = table;
             _columns = table.Columns.Where(static column => !column.IsHidden).ToArray();
-            KeyColumn = _columns.Single(column => column.Name.Equals(keyColumn, StringComparison.OrdinalIgnoreCase)).Name;
+            KeyColumn = _columns.Single(column => SqliteIdentifierComparer.Instance.Equals(column.Name, keyColumn)).Name;
             LabelExpression = SqliteRelationshipSql.BuildLabelExpression(displayColumn, additionalDisplayColumn, "__pcm_target.");
             ContextColumns = _columns.Where(column => column.Name != KeyColumn && !column.IsPrimaryKey
-                && !column.Name.Equals(displayColumn, StringComparison.OrdinalIgnoreCase)
-                && !column.Name.Equals(additionalDisplayColumn, StringComparison.OrdinalIgnoreCase)
+                && !SqliteIdentifierComparer.Instance.Equals(column.Name, displayColumn)
+                && !SqliteIdentifierComparer.Instance.Equals(column.Name, additionalDisplayColumn)
                 && column.Affinity != SqliteAffinity.Blob).Take(3).ToArray();
             SelectColumns = string.Join(", ", _columns.Select((column, index) => $"{TargetExpression(column.Name)} AS __pcm_value{index}"));
             if (table.StableIdentity.Kind == StableIdentityKind.RowIdFallback)
@@ -238,7 +235,7 @@ public sealed class SqliteRelationshipLookup : IRelationshipLookup
 
         public RelationshipLookupOption? ReadOption(SqliteDataReader reader)
         {
-            var values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+            var values = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
             for (int index = 0; index < _columns.Length; index++)
             {
                 values[_columns[index].Name] = ReadValue(reader, index);

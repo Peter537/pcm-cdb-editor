@@ -106,13 +106,13 @@ public sealed class NavigationSelectionSourceTests
         int reloadStart = source.IndexOf(
             "private async Task<TableQueryOutcome> LoadTableQueryAsync(",
             StringComparison.Ordinal);
-        int parseFilterStart = source.IndexOf(
-            "private static bool TryParseFilterValue(",
+        int applyFilterStart = source.IndexOf(
+            "private void ApplyTableFilter(",
             reloadStart,
             StringComparison.Ordinal);
-        Assert.IsTrue(reloadStart >= 0 && parseFilterStart > reloadStart);
+        Assert.IsTrue(reloadStart >= 0 && applyFilterStart > reloadStart);
 
-        string reloadBody = source[reloadStart..parseFilterStart];
+        string reloadBody = source[reloadStart..applyFilterStart];
         StringAssert.Contains(
             reloadBody,
             "sorts ?? context.Sorts",

@@ -30,8 +30,8 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         ArgumentException.ThrowIfNullOrWhiteSpace(sqlitePath);
         ArgumentNullException.ThrowIfNull(catalog);
         ArgumentNullException.ThrowIfNull(replay);
-        IReadOnlyList<RowTarget> targets = GetTargets(replay.Operation);
-        ValidateGuardCoverage(targets, replay.Guards);
+        IReadOnlyList<RowTarget> targets = GetTargets(catalog, replay.Operation);
+        ValidateGuardCoverage(catalog, targets, replay.Guards);
 
         await using var connection = SqliteSupport.CreateConnection(sqlitePath);
         using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
@@ -104,7 +104,7 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         IReadOnlyList<RowTarget> targets,
         CancellationToken cancellationToken)
     {
-        foreach (var group in targets.GroupBy(target => target.TableName, StringComparer.OrdinalIgnoreCase))
+        foreach (var group in targets.GroupBy(target => target.TableName, SqliteIdentifierComparer.Instance))
         {
             TableSchema table = RequireEditableTable(catalog, group.Key);
             if (group.Any(target => target.UpdatedColumns is null))
@@ -115,7 +115,7 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
             }
 
             var updatedColumns = group.SelectMany(target => target.UpdatedColumns ?? [])
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                .ToHashSet(SqliteIdentifierComparer.Instance);
             foreach (ColumnSchema column in table.Columns)
             {
                 if (column.IsGenerated || column.IsHidden || column.IsPrimaryKey)
@@ -185,7 +185,7 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
             transaction,
             RequireEditableTable(catalog, cell.TableName),
             cell.Identity,
-            new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase)
+            new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance)
             {
                 [cell.ColumnName] = direction == EditReplayDirection.Undo ? cell.OldValue : cell.NewValue
             },
@@ -341,7 +341,7 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         {
             ColumnSchema column = RequireColumn(table, pair.Key);
             RowIdentityComponent? identityComponent = identity.Components.FirstOrDefault(component =>
-                component.ColumnName.Equals(column.Name, StringComparison.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance.Equals(component.ColumnName, column.Name));
             if (identityComponent is not null)
             {
                 if (identityComponent.Value != pair.Value)
@@ -388,7 +388,7 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         CancellationToken cancellationToken)
     {
         ValidateIdentity(table, identity);
-        var insertValues = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        var insertValues = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
         foreach (KeyValuePair<string, SqliteValue> pair in values)
         {
             ColumnSchema column = RequireColumn(table, pair.Key);
@@ -482,7 +482,7 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
             return null;
         }
 
-        var values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        var values = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
         for (var ordinal = 0; ordinal < columns.Length; ordinal++)
         {
             values[columns[ordinal].Name] = ReadValue(reader, ordinal);
@@ -501,7 +501,8 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
         return row;
     }
 
-    private static System.Collections.ObjectModel.ReadOnlyCollection<RowTarget> GetTargets(EditOperation operation)
+    private static System.Collections.ObjectModel.ReadOnlyCollection<RowTarget> GetTargets(
+        DatabaseSchemaCatalog catalog, EditOperation operation)
     {
         IEnumerable<RowTarget> targets = operation switch
         {
@@ -532,8 +533,9 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
                 $"History replay does not support operation type '{operation.GetType().Name}'.")
         };
 
-        RowTarget[] copy = targets.ToArray();
-        if (copy.Select(TargetKey).Distinct(StringComparer.OrdinalIgnoreCase).Count() != copy.Length)
+        RowTarget[] copy = targets.Select(target =>
+            target with { TableName = RequireEditableTable(catalog, target.TableName).Name }).ToArray();
+        if (copy.Select(TargetKey).Distinct().Count() != copy.Length)
         {
             throw new InvalidDataException("A history operation cannot target the same row more than once.");
         }
@@ -542,19 +544,18 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
     }
 
     private static void ValidateGuardCoverage(
+        DatabaseSchemaCatalog catalog,
         IReadOnlyList<RowTarget> targets,
         IReadOnlyList<RowReplayGuard> guards)
     {
-        if (guards.Count != targets.Count
-            || guards.Select(static guard => TargetKey(new RowTarget(guard.TableName, guard.Identity)))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Count() != guards.Count)
+        var targetKeys = targets.Select(TargetKey).ToHashSet();
+        if (guards.Count != targetKeys.Count)
         {
             throw new InvalidOperationException("History replay requires exactly one row guard per target row.");
         }
 
-        var targetKeys = targets.Select(TargetKey).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        if (guards.Any(guard => !targetKeys.Contains(TargetKey(new RowTarget(guard.TableName, guard.Identity)))))
+        if (guards.Any(guard => !targetKeys.Remove(
+            (RequireEditableTable(catalog, guard.TableName).Name, guard.Identity))))
         {
             throw new InvalidOperationException("A history replay guard does not match the operation targets.");
         }
@@ -576,7 +577,7 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
     }
 
     private static ColumnSchema RequireColumn(TableSchema table, string columnName) =>
-        table.Columns.FirstOrDefault(column => column.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase))
+        table.Columns.FirstOrDefault(column => SqliteIdentifierComparer.Instance.Equals(column.Name, columnName))
         ?? throw new InvalidOperationException(
             $"Column '{columnName}' no longer exists in table '{table.Name}'.");
 
@@ -593,7 +594,7 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
             || identity.Kind != RowIdentityKind.DeclaredPrimaryKey
             || !table.StableIdentity.Columns.SequenceEqual(
                 identity.Components.Select(static component => component.ColumnName),
-                StringComparer.OrdinalIgnoreCase))
+                SqliteIdentifierComparer.Instance))
         {
             throw new InvalidOperationException(
                 "A history row identity no longer matches the discovered stable identity.");
@@ -636,7 +637,8 @@ public sealed class SqliteEditOperationReplayer : IEditOperationReplayer
 
     private static object ToDbValue(SqliteValue value) => value.ToClrValue() ?? DBNull.Value;
 
-    private static string TargetKey(RowTarget target) => $"{target.TableName}\u001f{target.Identity}";
+    private static (string TableName, RowIdentity Identity) TargetKey(RowTarget target) =>
+        (target.TableName, target.Identity);
 
     private sealed record RowTarget(string TableName, RowIdentity Identity, IEnumerable<string>? UpdatedColumns = null);
 }

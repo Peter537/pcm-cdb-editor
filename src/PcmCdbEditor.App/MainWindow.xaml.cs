@@ -38,15 +38,17 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly ICountryQuotaMaintenanceService _countryQuotaMaintenanceService;
     private readonly ISettingsStore _settingsStore;
     private readonly IFileAssociationService _fileAssociationService;
-    private readonly SqliteEditOperationReplayer _editOperationReplayer = new();
+    private readonly IEditOperationReplayer _editOperationReplayer;
     private readonly ExclusiveOperationGate _operationGate = new();
     private readonly LatestRequestGate _tableLoadGate = new();
     private readonly GridContentBindingSession _gridBindingSession = new();
     private readonly MutationWriteAhead _mutationWriteAhead;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly List<TableListItem> _allTables = [];
-    private readonly Dictionary<string, TabViewItem> _tableTabs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, TabViewItem> _tableTabs = new(SqliteIdentifierComparer.Instance);
     private readonly Dictionary<TabViewItem, CancellationTokenSource> _countCancellations = [];
+    private readonly HashSet<Task> _sessionReaders = [];
+    private CancellationTokenSource? _sessionReadLifetime = new();
     private readonly SemaphoreSlim _preferenceSaveGate = new(1, 1);
 
     private AppWindow? _appWindow;
@@ -54,7 +56,6 @@ public sealed partial class MainWindow : Window, IDisposable
     private DatabaseSchemaCatalog? _catalog;
     private ExclusiveOperationGate.ExclusiveOperationLease? _operationLease;
     private TableLoadRequest? _activeTableLoad;
-    private bool _operationMutationPrepared;
     private bool _allowClose;
     private bool _closeInProgress;
     private bool _rowEditorOpen;
@@ -108,6 +109,7 @@ public sealed partial class MainWindow : Window, IDisposable
         IWorkspaceService workspaceService,
         ITableCatalog tableCatalog,
         ITableDataStore tableDataStore,
+        IEditOperationReplayer editOperationReplayer,
         IRelationshipLookup relationshipLookup,
         IRiderRecoveryService riderRecoveryService,
         IRiderCreationService riderCreationService,
@@ -119,6 +121,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _launchPath = launchPath;
         _workspaceService = workspaceService ?? throw new ArgumentNullException(nameof(workspaceService));
         _tableCatalog = tableCatalog ?? throw new ArgumentNullException(nameof(tableCatalog));
+        _editOperationReplayer = editOperationReplayer ?? throw new ArgumentNullException(nameof(editOperationReplayer));
         _tableDataStore = tableDataStore ?? throw new ArgumentNullException(nameof(tableDataStore));
         _relationshipLookup = relationshipLookup ?? throw new ArgumentNullException(nameof(relationshipLookup));
         _riderRecoveryService = riderRecoveryService ?? throw new ArgumentNullException(nameof(riderRecoveryService));
@@ -239,68 +242,64 @@ public sealed partial class MainWindow : Window, IDisposable
         EditorSessionState? openedSession = null;
         try
         {
-            try
+            bool? discard = await ConfirmSessionReplacementAsync(cancellationToken);
+            if (discard is null)
             {
-                if (!await CloseCurrentSessionForReplacementAsync(cancellationToken))
-                {
-                    return;
-                }
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                if (!_lifetimeCancellation.IsCancellationRequested)
-                {
-                    PresentWarning("Open cancelled", "The current working session remains open.");
-                }
-                return;
-            }
-            catch (Exception exception) when (IsExpectedOperationFailure(exception))
-            {
-                PresentError(
-                    "Could not close the current session",
-                    SafeFailureMessage(exception, "The current working session remains open."));
                 return;
             }
 
-            SetBusyPresentation("Opening database", "Copying the source before conversion.");
-            ViewModel.DatabaseName = Path.GetFileName(path);
-            openedSession = await _workspaceService.OpenAsync(
-                new WorkspaceOpenRequest(path),
-                cancellationToken);
-            DatabaseSchemaCatalog catalog = await _tableCatalog.DiscoverAsync(
-                openedSession.WorkingSqlitePath,
-                cancellationToken);
-            await ActivateSessionAsync(openedSession, catalog, cancellationToken);
+            SetBusyPresentation("Opening database", "Copying and checking the new working database.");
+            openedSession = await _workspaceService.OpenAsync(new WorkspaceOpenRequest(path), cancellationToken);
+            string? remaining = await ReplaceSessionAsync(openedSession, discard.Value, cancellationToken);
             PresentWorkingCopyReady();
+            PresentRemainingSessionCleanup(remaining);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (Exception exception) when (IsWorkspaceCancellation(exception, cancellationToken))
         {
-            if (openedSession is not null)
-            {
-                await TryCloseFailedOpenAsync(openedSession);
-            }
-
             if (!_lifetimeCancellation.IsCancellationRequested)
             {
-                ResetToNoFile();
-                PresentWarning("Open cancelled", "No source file was changed.");
+                RestoreAfterFailedOpen();
+                PresentWarning("Open cancelled", "Any previously open session is still available.");
             }
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            if (openedSession is not null)
-            {
-                await TryCloseFailedOpenAsync(openedSession);
-            }
-
-            ResetToNoFile();
-            PresentError(
-                "Could not open the database",
-                SafeFailureMessage(exception, "The source file was not changed."));
+            RestoreAfterFailedOpen();
+            PresentError("Could not open the database", SafeFailureMessage(exception,
+                _session is null ? "No database was opened." : "The working session is still available."));
         }
         finally
         {
+            if (openedSession is not null && _session?.SessionId != openedSession.SessionId)
+            {
+                await TryCloseFailedOpenAsync(openedSession);
+            }
             EndOperation();
+        }
+    }
+
+    private void RestoreAfterFailedOpen()
+    {
+        if (_session is null)
+        {
+            ResetToNoFile();
+        }
+        else
+        {
+            RestoreSessionState();
+            if (TableTabs.SelectedItem is null)
+            {
+                if (_catalog?.Tables.Count > 0)
+                {
+                    ShowEmptyState("Choose a table", "Select a table or view from the list to load its rows.",
+                        allowOpen: false);
+                }
+                else
+                {
+                    ShowEmptyState("No tables found", "The working SQLite database contains no user tables or views.",
+                        allowOpen: true);
+                }
+            }
         }
     }
 
@@ -330,25 +329,25 @@ public sealed partial class MainWindow : Window, IDisposable
         return true;
     }
 
-    private async Task<bool> CloseCurrentSessionForReplacementAsync(
+    private async Task<bool?> ConfirmSessionReplacementAsync(
         CancellationToken cancellationToken)
     {
         if (_session is null)
         {
-            return true;
+            return false;
         }
 
         if (TableGrid.IsEditing)
         {
             PresentWarning("Finish the cell edit", "Press Enter to commit the value or Escape to cancel it, then try again.");
-            return false;
+            return null;
         }
 
         await PersistActiveTableStateAsync(cancellationToken);
 
         if (!await ConfirmDiscardRiderDraftAsync())
         {
-            return false;
+            return null;
         }
 
         bool discard = false;
@@ -363,40 +362,134 @@ public sealed partial class MainWindow : Window, IDisposable
             ContentDialogResult result = await dialog.ShowAsync();
             if (result == ContentDialogResult.None)
             {
-                return false;
+                return null;
             }
 
             if (result == ContentDialogResult.Primary && !await SaveCurrentAsync(cancellationToken))
             {
-                return false;
+                return null;
             }
 
             discard = result == ContentDialogResult.Secondary;
         }
 
-        EditorSessionState session = _session;
-        await _workspaceService.CloseAsync(session, discard, cancellationToken);
-        ResetToNoFile();
-        return true;
+        return discard;
     }
 
-    private async Task ActivateSessionAsync(
+    private async Task<string?> ReplaceSessionAsync(
+        EditorSessionState candidate,
+        bool discardCurrent,
+        CancellationToken cancellationToken)
+    {
+        DatabaseSchemaCatalog catalog = await _tableCatalog.DiscoverAsync(candidate.WorkingSqlitePath, cancellationToken);
+        string historyPath = Path.Combine(candidate.SessionDirectory, "edit-history.json");
+        var history = await Task.Run(() => new EditHistory(historyPath, recovering: candidate.IsDirty), cancellationToken);
+        PreparedInitialTable? firstTable = await PrepareInitialTableAsync(candidate, catalog, cancellationToken);
+        string? remainingDirectory = null;
+        try
+        {
+            if (history.State.HistoryUncertain || candidate.MutationPending ||
+                candidate.IsDirty && !history.State.IsDirty)
+            {
+                candidate = await _workspaceService.MarkDirtyAsync(
+                    candidate with { IsDirty = true, HistoryUncertain = true }, cancellationToken);
+            }
+
+            EditorSessionState? previous = _session;
+            if (previous is not null)
+            {
+                await DrainSessionReadersAsync(cancellationToken);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            // From here the previous workspace can be closed and the replacement must finish publishing.
+            CancelOperationButton.IsEnabled = false;
+            if (previous is not null)
+            {
+                WorkspaceCloseResult close = await _workspaceService.CloseAsync(previous, discardCurrent, cancellationToken);
+                remainingDirectory = close.RemainingDirectory;
+            }
+
+            // The previous workspace has now closed. Finish publishing the prepared candidate.
+            ResetToNoFile();
+            await ActivateSessionAsync(candidate, catalog, history, firstTable);
+        }
+        finally
+        {
+            if (firstTable is not null && !_tableTabs.Values.Any(tab =>
+                    tab.Tag is TableTabContext context && ReferenceEquals(context.Coordinator, firstTable.Coordinator)))
+            {
+                firstTable.Coordinator.Dispose();
+            }
+        }
+
+        return remainingDirectory;
+    }
+
+    private void PresentRemainingSessionCleanup(string? remainingDirectory)
+    {
+        if (remainingDirectory is not null)
+        {
+            PresentWarning("Previous session closed with files left for cleanup", remainingDirectory);
+        }
+    }
+
+    private async Task<PreparedInitialTable?> PrepareInitialTableAsync(
         EditorSessionState session,
         DatabaseSchemaCatalog catalog,
         CancellationToken cancellationToken)
     {
-        DisposeTableCoordinators();
+        TableSchema? table = catalog.Tables.MinBy(static table => table.Name, SqliteIdentifierComparer.Instance);
+        if (table is null)
+        {
+            return null;
+        }
+
+        var mode = _preferences.ForeignKeyDisplayMode;
+        var rowDisplay = TableRowDisplayChoice.FromPageSize(_preferences.PageSize);
+        var query = new TableQuery(table.Name, new PageRequest(0, VirtualTableQueryCoordinator.ChunkSize),
+            sorts: ForeignKeySortDescriptorMapper.Restore(catalog, table, null), foreignKeyDisplayMode: mode);
+        var coordinator = new VirtualTableQueryCoordinator(_tableDataStore, session.WorkingSqlitePath, catalog, query);
+        try
+        {
+            TableViewState? state = await _settingsStore.LoadTableViewStateAsync(
+                catalog.SchemaSignature, table.Name, cancellationToken);
+            VirtualChunk<TypedRow> chunk = await coordinator.LoadChunkContainingAsync(0, cancellationToken);
+            TypedRow[] rows = chunk.Items.Take(rowDisplay.PageSize!.Value).ToArray();
+            GridPagePresentation gridPage = await GridPagePresentation.PrepareAsync(table, rows, mode, cancellationToken);
+            return new PreparedInitialTable(coordinator, rowDisplay, mode, state, gridPage);
+        }
+        catch
+        {
+            coordinator.Dispose();
+            throw;
+        }
+    }
+
+    private sealed record PreparedInitialTable(
+        VirtualTableQueryCoordinator Coordinator,
+        TableRowDisplayChoice RowDisplay,
+        ForeignKeyDisplayMode ForeignKeyDisplayMode,
+        TableViewState? ViewState,
+        GridPagePresentation GridPage);
+
+    private async Task ActivateSessionAsync(
+        EditorSessionState session,
+        DatabaseSchemaCatalog catalog,
+        EditHistory history,
+        PreparedInitialTable? firstTable)
+    {
+        _sessionReadLifetime ??= new();
+        CancellationToken cancellationToken = CancellationToken.None;
         _session = session;
         _catalog = catalog;
         _relationshipReturn = null;
         ResetMaintenanceTargetsForSession(session.SessionId);
-        _tableTabs.Clear();
-        TableTabs.TabItems.Clear();
-        ViewModel.Tabs.Clear();
-        await AttachEditHistoryAsync(session);
+        _editHistory = history;
+        UpdateHistoryButtons();
         _allTables.Clear();
 
-        foreach (TableSchema table in catalog.Tables.OrderBy(static table => table.Name, StringComparer.OrdinalIgnoreCase))
+        foreach (TableSchema table in catalog.Tables.OrderBy(static table => table.Name, SqliteIdentifierComparer.Instance))
         {
             string kindLabel = table.ObjectKind == TableObjectKind.View
                 ? "View"
@@ -423,7 +516,8 @@ public sealed partial class MainWindow : Window, IDisposable
                 ViewModel.Tables[0].Name,
                 searchText: string.Empty,
                 cancellationToken,
-                rowDisplay: TableRowDisplayChoice.FromPageSize(_preferences.PageSize));
+                rowDisplay: firstTable!.RowDisplay,
+                initialTable: firstTable);
         }
         else
         {
@@ -467,6 +561,19 @@ public sealed partial class MainWindow : Window, IDisposable
                 EnsureTabBound(existing);
             }
             return;
+        }
+
+        if (TableTabs.SelectedItem is TabViewItem previous && _gridBindingSession.IsBoundTo(previous))
+        {
+            if (!TableGrid.TryFinishInlineEdit(out RowUpdateOperation? update))
+            {
+                SynchronizeTableSelectionToTab(previous);
+                return;
+            }
+            if (update is not null)
+            {
+                await CommitInlineEditAsync(previous, update);
+            }
         }
 
         await LoadSelectedTableAsync(selected.Name, string.Empty);
@@ -522,7 +629,8 @@ public sealed partial class MainWindow : Window, IDisposable
         TableFilterDefinition? filterDefinition = null,
         TableLoadRequest? loadRequest = null,
         TableOpenPresentation? presentation = null,
-        bool refresh = false)
+        bool refresh = false,
+        PreparedInitialTable? initialTable = null)
     {
         EditorSessionState session = _session
             ?? throw new InvalidOperationException("A working session is required.");
@@ -535,7 +643,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
         TableRowDisplayChoice effectiveRowDisplay = rowDisplay ??
             TableRowDisplayChoice.FromPageSize(TableRowDisplayOptions.DefaultPageSize);
-        ForeignKeyDisplayMode foreignKeyDisplayMode = _preferences.ForeignKeyDisplayMode;
+        ForeignKeyDisplayMode foreignKeyDisplayMode = initialTable?.ForeignKeyDisplayMode ?? _preferences.ForeignKeyDisplayMode;
         if (effectiveRowDisplay.IsAllRows)
         {
             offset = 0;
@@ -558,20 +666,20 @@ public sealed partial class MainWindow : Window, IDisposable
 
         _tableTabs.TryGetValue(table.Name, out TabViewItem? existingTab);
         TableTabContext? existingContext = existingTab?.Tag as TableTabContext;
-        TableViewState? viewState = presentation?.ViewState ?? existingContext?.ViewState;
-        if (existingContext is null && viewState is null)
+        TableViewState? viewState = initialTable?.ViewState ?? presentation?.ViewState ?? existingContext?.ViewState;
+        if (initialTable is null && existingContext is null && viewState is null)
         {
             viewState = await _settingsStore.LoadTableViewStateAsync(
                 catalog.SchemaSignature,
                 table.Name,
                 cancellationToken);
             EnsureTableLoadCurrent(loadRequest, cancellationToken);
-            if (viewState is not null &&
-                (!viewState.SchemaSignature.Equals(catalog.SchemaSignature, StringComparison.Ordinal) ||
-                 !viewState.TableName.Equals(table.Name, StringComparison.OrdinalIgnoreCase)))
-            {
-                viewState = null;
-            }
+        }
+        if (viewState is not null &&
+            (!viewState.SchemaSignature.Equals(catalog.SchemaSignature, StringComparison.Ordinal) ||
+             !SqliteIdentifierComparer.Instance.Equals(viewState.TableName, table.Name)))
+        {
+            viewState = null;
         }
 
         IReadOnlyList<SortDescriptor> effectiveSorts =
@@ -591,13 +699,9 @@ public sealed partial class MainWindow : Window, IDisposable
             ReferenceEquals(existingContext.Filter, filter) &&
             existingContext.Sorts.SequenceEqual(query.Sorts) &&
             existingContext.ForeignKeyDisplayMode == foreignKeyDisplayMode;
-        var coordinator = canReuseCoordinator
+        var coordinator = initialTable?.Coordinator ?? (canReuseCoordinator
             ? existingContext!.Coordinator
-            : new VirtualTableQueryCoordinator(
-                _tableDataStore,
-                session.WorkingSqlitePath,
-                catalog,
-                query);
+            : new VirtualTableQueryCoordinator(_tableDataStore, session.WorkingSqlitePath, catalog, query));
         bool ownsCoordinator = !canReuseCoordinator;
         try
         {
@@ -605,7 +709,7 @@ public sealed partial class MainWindow : Window, IDisposable
             TableRowCountState countState;
             if (effectiveRowDisplay.IsAllRows)
             {
-                IReadOnlyList<TypedRow> rows = await coordinator.LoadAllRowsAsync(cancellationToken);
+                IReadOnlyList<TypedRow> rows = await TrackSessionReaderAsync(coordinator.LoadAllRowsAsync(cancellationToken));
                 EnsureTableLoadCurrent(loadRequest, cancellationToken);
                 display = new TableDisplayWindow(
                     effectiveRowDisplay,
@@ -617,9 +721,9 @@ public sealed partial class MainWindow : Window, IDisposable
             else
             {
                 int pageSize = effectiveRowDisplay.PageSize!.Value;
-                VirtualChunk<TypedRow> chunk = await coordinator.LoadChunkContainingAsync(
+                VirtualChunk<TypedRow> chunk = await TrackSessionReaderAsync(coordinator.LoadChunkContainingAsync(
                     offset,
-                    cancellationToken);
+                    cancellationToken));
                 EnsureTableLoadCurrent(loadRequest, cancellationToken);
 
                 int chunkIndex = checked((int)(offset - chunk.Offset));
@@ -629,11 +733,12 @@ public sealed partial class MainWindow : Window, IDisposable
                     : TableRowCountState.Loading;
                 if (rows.Length == 0 && offset > 0)
                 {
-                    countState = await coordinator.LoadCountAsync(cancellationToken);
+                    coordinator.Invalidate();
+                    countState = await TrackSessionReaderAsync(coordinator.LoadCountAsync(cancellationToken));
                     EnsureTableLoadCurrent(loadRequest, cancellationToken);
                     long count = countState.Value ?? 0;
                     offset = count == 0 ? 0 : (count - 1) / pageSize * pageSize;
-                    chunk = await coordinator.LoadChunkContainingAsync(offset, cancellationToken);
+                    chunk = await TrackSessionReaderAsync(coordinator.LoadChunkContainingAsync(offset, cancellationToken));
                     EnsureTableLoadCurrent(loadRequest, cancellationToken);
                     chunkIndex = checked((int)(offset - chunk.Offset));
                     rows = chunk.Items.Skip(chunkIndex).Take(pageSize).ToArray();
@@ -641,15 +746,15 @@ public sealed partial class MainWindow : Window, IDisposable
                     {
                         // A concurrent working-copy change can invalidate the count before the read.
                         offset = 0;
-                        chunk = await coordinator.LoadChunkContainingAsync(offset, cancellationToken);
+                        chunk = await TrackSessionReaderAsync(coordinator.LoadChunkContainingAsync(offset, cancellationToken));
                         EnsureTableLoadCurrent(loadRequest, cancellationToken);
                         chunkIndex = 0;
                         rows = chunk.Items.Take(pageSize).ToArray();
                         countState = TableRowCountState.Unknown;
                     }
                 }
-                bool provisionalHasMore = chunkIndex + rows.Length < chunk.Items.Count ||
-                    chunk.Items.Count == VirtualTableQueryCoordinator.ChunkSize;
+                bool provisionalHasMore = chunk.HasMoreAfter(chunkIndex + rows.Length);
+                countState = countState.ReconcileWithPage(offset, rows.Length, provisionalHasMore);
                 display = new TableDisplayWindow(
                     effectiveRowDisplay,
                     offset,
@@ -663,6 +768,17 @@ public sealed partial class MainWindow : Window, IDisposable
             }
 
             EnsureTableLoadCurrent(loadRequest, cancellationToken);
+
+            GridPagePresentation gridPage = initialTable?.GridPage ?? await GridPagePresentation.PrepareAsync(
+                table,
+                display.Rows,
+                foreignKeyDisplayMode,
+                cancellationToken);
+            EnsureTableLoadCurrent(loadRequest, cancellationToken);
+            if (_session?.SessionId != session.SessionId)
+            {
+                return;
+            }
 
             var (selection, viewport) = presentation is null
                 ? (existingContext?.Selection ?? new GridSelection(null, null, []),
@@ -682,23 +798,14 @@ public sealed partial class MainWindow : Window, IDisposable
                 countState,
                 IsInvalidated: false,
                 Selection: selection,
-                Viewport: viewport);
-            if (!_tableTabs.TryGetValue(table.Name, out TabViewItem? tab))
+                Viewport: viewport,
+                GridPage: gridPage);
+            bool isNewTab = !_tableTabs.TryGetValue(table.Name, out TabViewItem? tab);
+            tab ??= new TabViewItem
             {
-                tab = new TabViewItem
-                {
-                    Header = table.Name,
-                    IsClosable = true,
-                };
-                _tableTabs.Add(table.Name, tab);
-                TableTabs.TabItems.Add(tab);
-                ViewModel.Tabs.Add(new TableTabState(
-                    table.Name,
-                    countState.Status == TableRowCountStatus.Available
-                        ? FormatCount(countState.Value ?? display.Rows.Count)
-                        : "Count pending",
-                    table.EditCapability != TableEditCapability.Editable));
-            }
+                Header = table.Name,
+                IsClosable = true,
+            };
 
             TableTabContext? staleContext = !canReuseCoordinator
                 ? tab.Tag as TableTabContext
@@ -715,6 +822,12 @@ public sealed partial class MainWindow : Window, IDisposable
             _suppressTabSelection = true;
             try
             {
+                if (isNewTab)
+                {
+                    _tableTabs.Add(table.Name, tab);
+                    TableTabs.TabItems.Add(tab);
+                }
+
                 TableTabs.SelectedItem = tab;
             }
             finally
@@ -760,7 +873,7 @@ public sealed partial class MainWindow : Window, IDisposable
             () =>
             {
                 TableGrid.SetRelationshipPickerColumns(GetRelationshipPickerColumns(context.Schema));
-                TableGrid.Bind(context.Schema, context.Display.Rows, context.ViewState, context.ForeignKeyDisplayMode);
+                TableGrid.Bind(context.GridPage, context.ViewState);
             });
         TableHeaderSortIndicator? sortIndicator = _catalog is null
             ? null
@@ -783,12 +896,6 @@ public sealed partial class MainWindow : Window, IDisposable
         BusyIndicator.Visibility = Visibility.Collapsed;
         UpdateTabChrome(tab, context);
         UpdatePresentedRow();
-        if (context.CountState.Status == TableRowCountStatus.Available)
-        {
-            UpdateTabCountLabel(
-                context.Schema.Name,
-                FormatCount(context.CountState.Value ?? context.Display.Rows.Count));
-        }
         if (!context.Display.RowDisplay.IsAllRows &&
             context.CountState.Status != TableRowCountStatus.Available &&
             !_countCancellations.ContainsKey(tab))
@@ -860,31 +967,27 @@ public sealed partial class MainWindow : Window, IDisposable
             !context.Display.RowDisplay.IsAllRows;
         PreviousPageButton.IsEnabled = canNavigatePages && context.Display.Offset > 0;
         NextPageButton.IsEnabled = canNavigatePages && context.Display.HasMore;
-        if (context.CountState.Status == TableRowCountStatus.Available &&
-            context.CountState.Value.HasValue)
-        {
-            NextPageButton.IsEnabled = canNavigatePages &&
-                context.Display.Offset + context.Display.Rows.Count <
-                context.CountState.Value.Value;
-        }
     }
 
     private void StartVirtualCount(TabViewItem tab, TableTabContext context)
     {
         CancelVirtualCount(tab);
+        if (_sessionReadLifetime is not { } lifetime)
+        {
+            return;
+        }
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
-            _lifetimeCancellation.Token);
+            _lifetimeCancellation.Token, lifetime.Token);
         _countCancellations.Add(tab, cancellation);
         if (tab.Tag is TableTabContext current &&
             ReferenceEquals(current.Coordinator, context.Coordinator))
         {
             var loading = current with { CountState = TableRowCountState.Loading };
             tab.Tag = loading;
-            UpdateTabCountLabel(loading.Schema.Name, "Count pending");
             UpdateCountAndPagingChrome(tab, loading);
         }
 
-        _ = LoadVirtualCountAsync(tab, context.Coordinator, cancellation);
+        _ = TrackSessionReaderAsync(LoadVirtualCountAsync(tab, context.Coordinator, cancellation));
     }
 
     private async Task LoadVirtualCountAsync(
@@ -901,8 +1004,11 @@ public sealed partial class MainWindow : Window, IDisposable
                 ReferenceEquals(current.Coordinator, coordinator) &&
                 IsCurrentCount(tab, cancellation))
             {
-                tab.Tag = current with { CountState = countState };
-                UpdateTabCountLabel(current.Schema.Name, FormatCount(countState.Value ?? 0));
+                tab.Tag = current with
+                {
+                    CountState = countState.ReconcileWithPage(
+                        current.Display.Offset, current.Display.Rows.Count, current.Display.HasMore),
+                };
                 if (ReferenceEquals(TableTabs.SelectedItem, tab))
                 {
                     UpdateCountAndPagingChrome(tab, (TableTabContext)tab.Tag);
@@ -925,7 +1031,6 @@ public sealed partial class MainWindow : Window, IDisposable
                     {
                         CountState = TableRowCountState.Failed("The row count could not be computed."),
                     };
-                    UpdateTabCountLabel(current.Schema.Name, "Count unavailable");
                     if (ReferenceEquals(TableTabs.SelectedItem, tab))
                     {
                         UpdateCountAndPagingChrome(tab, (TableTabContext)tab.Tag);
@@ -945,19 +1050,6 @@ public sealed partial class MainWindow : Window, IDisposable
             }
             cancellation.Dispose();
         }
-    }
-
-    private void UpdateTabCountLabel(string tableName, string countLabel)
-    {
-        TableTabState? tabState = ViewModel.Tabs.FirstOrDefault(item =>
-            item.Name.Equals(tableName, StringComparison.OrdinalIgnoreCase));
-        if (tabState is null)
-        {
-            return;
-        }
-
-        int index = ViewModel.Tabs.IndexOf(tabState);
-        ViewModel.Tabs[index] = tabState with { CountLabel = countLabel };
     }
 
     private bool IsCurrentCount(TabViewItem tab, CancellationTokenSource cancellation) =>
@@ -1035,11 +1127,21 @@ public sealed partial class MainWindow : Window, IDisposable
     private async void TableGrid_EditCommitted(object? sender, EditOperation operation)
     {
         if (operation is not RowUpdateOperation update ||
-            _session is null ||
-            _catalog is null ||
-            TableTabs.SelectedItem is not TabViewItem tab ||
+            TableTabs.SelectedItem is not TabViewItem tab || !_gridBindingSession.IsBoundTo(tab))
+        {
+            PresentWarning("Inline edit unavailable", "The table changed before the cell edit could be applied.");
+            return;
+        }
+
+        await CommitInlineEditAsync(tab, update);
+    }
+
+    private async Task CommitInlineEditAsync(TabViewItem tab, RowUpdateOperation update)
+    {
+        if (_session is not { } session ||
+            _catalog is not { } catalog ||
             tab.Tag is not TableTabContext context ||
-            !context.Schema.Name.Equals(update.TableName, StringComparison.OrdinalIgnoreCase))
+            !SqliteIdentifierComparer.Instance.Equals(context.Schema.Name, update.TableName))
         {
             PresentWarning("Inline edit unavailable", "The table changed before the cell edit could be applied.");
             return;
@@ -1056,21 +1158,24 @@ public sealed partial class MainWindow : Window, IDisposable
         if (visibleRow is null || visibleRow.Revision != update.ExpectedRevision)
         {
             PresentWarning("Row changed", "The visible row is stale. Reload it before editing.");
-            await LoadTableQueryAsync(
-                context,
-                context.SearchText,
-                context.Filter,
-                GetRequestedRowDisplay(context),
-                GetRequestedOffset(context),
-                context.Sorts,
-                context.FilterDefinition);
+            if (ReferenceEquals(TableTabs.SelectedItem, tab))
+            {
+                await LoadTableQueryAsync(
+                    context,
+                    context.SearchText,
+                    context.Filter,
+                    GetRequestedRowDisplay(context),
+                    GetRequestedOffset(context),
+                    context.Sorts,
+                    context.FilterDefinition);
+            }
             return;
         }
 
         await ExecuteEditAsync(update, async cancellationToken =>
             await _tableDataStore.UpdateRowAsync(
-                _session.WorkingSqlitePath,
-                _catalog,
+                session.WorkingSqlitePath,
+                catalog,
                 update,
                 cancellationToken));
     }
@@ -1155,7 +1260,7 @@ public sealed partial class MainWindow : Window, IDisposable
             .OrderBy(static column => column.Ordinal)
             .ToArray();
         var editors = CreateRowEditors(columns, row.Values, allowDefault: false);
-        var relationshipChoices = new Dictionary<string, RelationshipLookupOption>(StringComparer.OrdinalIgnoreCase);
+        var relationshipChoices = new Dictionary<string, RelationshipLookupOption>(SqliteIdentifierComparer.Instance);
         EditorSessionState session = _session!;
         string workingPath = session.WorkingSqlitePath;
         DatabaseSchemaCatalog catalog = _catalog!;
@@ -1172,7 +1277,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 return new RowEditResult(false);
             }
             var oldValues = values.Keys.ToDictionary(
-                static name => name, name => row.Values[name], StringComparer.OrdinalIgnoreCase);
+                static name => name, name => row.Values[name], SqliteIdentifierComparer.Instance);
             var operation = new RowUpdateOperation(
                 Guid.NewGuid(), context.Schema.Name, DateTimeOffset.UtcNow,
                 row.Identity!, oldValues, values, row.Revision,
@@ -1482,7 +1587,7 @@ public sealed partial class MainWindow : Window, IDisposable
             DefaultButton = ContentDialogButton.Primary,
         };
         if (editors.FirstOrDefault(editor =>
-                editor.Column.Name.Equals(currentColumn, StringComparison.OrdinalIgnoreCase)) is { } currentEditor)
+                SqliteIdentifierComparer.Instance.Equals(editor.Column.Name, currentColumn)) is { } currentEditor)
         {
             dialog.Opened += (_, _) =>
             {
@@ -1520,7 +1625,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 {
                     scroll.IsEnabled = true;
                     RowValueEditor? invalidEditor = editors.FirstOrDefault(editor =>
-                        editor.Column.Name.Equals(result.ColumnName, StringComparison.OrdinalIgnoreCase));
+                        SqliteIdentifierComparer.Instance.Equals(editor.Column.Name, result.ColumnName));
                     Control? focusTarget = invalidEditor is null ? null
                         : invalidEditor.TextBox.IsEnabled ? invalidEditor.TextBox
                         : invalidEditor.UseDefaultBox.IsEnabled ? invalidEditor.UseDefaultBox
@@ -1574,7 +1679,7 @@ public sealed partial class MainWindow : Window, IDisposable
         out string? error,
         out Control? invalidInput)
     {
-        values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        values = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
         invalidInput = null;
         foreach (RowValueEditor editor in editors)
         {
@@ -1673,7 +1778,6 @@ public sealed partial class MainWindow : Window, IDisposable
             return new RowEditResult(true, "Wait for the current operation, then try again.");
         }
 
-        bool mutationCommitted = false;
         try
         {
             await PrepareMutationWriteAheadAsync(_session);
@@ -1695,30 +1799,29 @@ public sealed partial class MainWindow : Window, IDisposable
                 throw new InvalidDataException("The row operation did not affect exactly one row.");
             }
 
-            mutationCommitted = true;
-            InvalidateTableCaches();
-            RecordCommittedEdit(operation, result);
-            _session = await _mutationWriteAhead.CompleteAsync(_session!);
-
-            UpdateHistoryButtons();
-            await RefreshSelectedTableAsync();
-            PresentSuccess("Working copy updated", "One row changed in the isolated database. Save to replace the CDB destination.");
+            _mutationOutcome = MutationOutcome.CommittedWithIncompleteHistory;
+            EditHistory history = RequireEditHistory();
+            await CompleteCommittedMutationAsync(() => RecordCommittedEdit(history, operation, result));
+            if (await RefreshAfterMutationAsync("The row change completed in the working copy."))
+            {
+                PresentSuccess("Working copy updated", "One row changed in the isolated database. Save to replace the CDB destination.");
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            if (mutationCommitted)
+            if (HasCommittedMutation)
             {
                 PresentCommittedRefreshCancellation(
                     "The row change completed in the working copy.");
             }
-            else if (_operationMutationPrepared)
+            else if (_mutationOutcome == MutationOutcome.CompletionUncertain)
             {
                 await HandleUnconfirmedMutationCancellationAsync(
                     "Row operation cancelled",
                     "The app could not confirm whether the database transaction finished. It kept the working session for recovery so that a change that finished late is not overlooked. Review the working copy before making more changes.");
             }
         }
-        catch (Exception exception) when (!mutationCommitted &&
+        catch (Exception exception) when (!HasCommittedMutation &&
             (exception is UnsafeRowMutationException or DBConcurrencyException ||
              exception is SqliteException { SqliteErrorCode: 19 or 20 }))
         {
@@ -1748,11 +1851,11 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            if (mutationCommitted)
+            if (HasCommittedMutation)
             {
                 await HandlePostCommitFailureAsync("The row changed, but the app could not update the session's recovery information.");
             }
-            else if (_operationMutationPrepared)
+            else if (_mutationOutcome == MutationOutcome.CompletionUncertain)
             {
                 await HandlePreparedMutationFailureAsync(
                     "Could not change the row",
@@ -1780,9 +1883,10 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         try
         {
-            if (_operationMutationPrepared && _session?.MutationPending == true)
+            if (_mutationOutcome == MutationOutcome.CompletionUncertain && _session?.MutationPending == true)
             {
                 _session = await _mutationWriteAhead.CompleteAsync(_session);
+                _mutationOutcome = MutationOutcome.NoChange;
                 await ReconcileSessionWithHistoryBaselineAsync();
             }
             return true;
@@ -1796,10 +1900,8 @@ public sealed partial class MainWindow : Window, IDisposable
         }
     }
 
-    private void RecordCommittedEdit(EditOperation operation, EditResult result)
+    private static void RecordCommittedEdit(EditHistory history, EditOperation operation, EditResult result)
     {
-        EditHistory history = _editHistory
-            ?? throw new InvalidOperationException("The active session has no edit history.");
         switch (operation)
         {
             case CellUpdateOperation or RowUpdateOperation:
@@ -1811,7 +1913,7 @@ public sealed partial class MainWindow : Window, IDisposable
                     CellUpdateOperation cell => cell with { NewValue = current.Values[cell.ColumnName] },
                     RowUpdateOperation row => new RowUpdateOperation(
                         row.OperationId, row.TableName, row.CreatedAtUtc, row.Identity, row.OldValues,
-                        row.NewValues.Keys.ToDictionary(name => name, name => current.Values[name], StringComparer.OrdinalIgnoreCase),
+                        row.NewValues.Keys.ToDictionary(name => name, name => current.Values[name], SqliteIdentifierComparer.Instance),
                         row.ExpectedRevision),
                     _ => operation
                 };
@@ -1923,10 +2025,11 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
+        EditHistory history = _editHistory;
         EditHistoryReplay pending;
         try
         {
-            pending = isUndo ? _editHistory.TakeUndoReplay() : _editHistory.TakeRedoReplay();
+            pending = await Task.Run(() => isUndo ? history.TakeUndoReplay() : history.TakeRedoReplay());
             _historyReplayActive = true;
             RefreshSessionChanges();
         }
@@ -1939,7 +2042,6 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
-        bool replayCommitted = false;
         try
         {
             await PrepareMutationWriteAheadAsync(_session);
@@ -1948,59 +2050,63 @@ public sealed partial class MainWindow : Window, IDisposable
                 _catalog,
                 pending,
                 cancellationToken);
-            replayCommitted = true;
-            UpdateRiderReceiptAfterReplay(pending.Operation, isUndo);
-            InvalidateTableCaches();
-            if (isUndo)
+            _mutationOutcome = MutationOutcome.CommittedWithIncompleteHistory;
+            await CompleteCommittedMutationAsync(() =>
             {
-                _editHistory.CompleteUndo(pending, result.OppositeGuards);
-            }
-            else
-            {
-                _editHistory.CompleteRedo(pending, result.OppositeGuards);
-            }
-
-            _session = await _mutationWriteAhead.CompleteAsync(_session!);
+                if (isUndo)
+                {
+                    history.CompleteUndo(pending, result.OppositeGuards);
+                }
+                else
+                {
+                    history.CompleteRedo(pending, result.OppositeGuards);
+                }
+            });
             await ReconcileSessionWithHistoryBaselineAsync();
-            await RefreshSelectedTableAsync();
-            string affectedRowLabel = result.AffectedRows == 1 ? "row" : "rows";
-            PresentSuccess(
-                isUndo ? "Change undone" : "Change redone",
-                $"The app updated {result.AffectedRows:N0} {affectedRowLabel} in the working copy as one transaction.");
+            UpdateRiderReceiptAfterReplay(pending.Operation, isUndo);
+            if (await RefreshAfterMutationAsync(isUndo
+                    ? "The undo completed in the working copy."
+                    : "The redo completed in the working copy."))
+            {
+                string affectedRowLabel = result.AffectedRows == 1 ? "row" : "rows";
+                PresentSuccess(
+                    isUndo ? "Change undone" : "Change redone",
+                    $"The app updated {result.AffectedRows:N0} {affectedRowLabel} in the working copy as one transaction.");
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            if (replayCommitted)
+            if (HasCommittedMutation)
             {
                 PresentCommittedRefreshCancellation(
                     isUndo
                         ? "The undo completed in the working copy."
                         : "The redo completed in the working copy.");
             }
-            else if (_operationMutationPrepared)
+            else if (_mutationOutcome == MutationOutcome.CompletionUncertain)
             {
-                if (!RestoreFailedReplay(pending, isUndo)) { return; }
+                if (!await RestoreFailedReplayAsync(pending, isUndo)) { return; }
                 await HandleUnconfirmedMutationCancellationAsync(
                     "History replay cancelled",
                     "The app could not confirm whether the undo or redo finished. Reload before trying again. The app will check the saved rows first so that it does not apply a completed change twice.");
             }
         }
-        catch (UnsafeRowMutationException exception) when (!replayCommitted)
+        catch (UnsafeRowMutationException exception) when (!HasCommittedMutation)
         {
-            if (RestoreFailedReplay(pending, isUndo) && await CompleteUnchangedMutationAsync())
+            if (await RestoreFailedReplayAsync(pending, isUndo) && await CompleteUnchangedMutationAsync())
             {
                 PresentWarning("Undo or Redo is unavailable", exception.Message);
             }
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
-            if (replayCommitted)
+            if (HasCommittedMutation)
             {
                 await HandlePostCommitFailureAsync("The undo or redo finished, but the app could not save its recovery information.");
             }
-            else if (_operationMutationPrepared)
+            else if (_mutationOutcome == MutationOutcome.CompletionUncertain)
             {
-                if (!RestoreFailedReplay(pending, isUndo)) { return; }
+                if (!await RestoreFailedReplayAsync(pending, isUndo)) { return; }
                 await HandlePreparedMutationFailureAsync(
                     isUndo ? "Could not undo the change" : "Could not redo the change",
                     SafeFailureMessage(
@@ -2009,7 +2115,7 @@ public sealed partial class MainWindow : Window, IDisposable
             }
             else
             {
-                if (!RestoreFailedReplay(pending, isUndo)) { return; }
+                if (!await RestoreFailedReplayAsync(pending, isUndo)) { return; }
                 PresentError(
                     isUndo ? "Could not undo the change" : "Could not redo the change",
                     SafeFailureMessage(exception, "The history entry remains available."));
@@ -2023,18 +2129,22 @@ public sealed partial class MainWindow : Window, IDisposable
         }
     }
 
-    private bool RestoreFailedReplay(EditHistoryReplay replay, bool isUndo)
+    private async Task<bool> RestoreFailedReplayAsync(EditHistoryReplay replay, bool isUndo)
     {
         try
         {
-            if (isUndo)
+            EditHistory history = RequireEditHistory();
+            await Task.Run(() =>
             {
-                _editHistory!.RestoreFailedUndo(replay);
-            }
-            else
-            {
-                _editHistory!.RestoreFailedRedo(replay);
-            }
+                if (isUndo)
+                {
+                    history.RestoreFailedUndo(replay);
+                }
+                else
+                {
+                    history.RestoreFailedRedo(replay);
+                }
+            });
             return true;
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
@@ -2052,19 +2162,6 @@ public sealed partial class MainWindow : Window, IDisposable
         RedoButton.IsEnabled = state?.CanRedo == true && !state.HasPendingReplay && !ViewModel.IsBusy && _operationLease is null;
     }
 
-    private async Task AttachEditHistoryAsync(EditorSessionState session)
-    {
-        string historyPath = Path.Combine(session.SessionDirectory, "edit-history.json");
-        _editHistory = new EditHistory(historyPath, recovering: session.IsDirty);
-        if (_editHistory.State.HistoryUncertain || session.MutationPending ||
-            session.IsDirty && !_editHistory.State.IsDirty)
-        {
-            _session = session with { IsDirty = true, HistoryUncertain = true };
-            _session = await _workspaceService.MarkDirtyAsync(_session, CancellationToken.None);
-        }
-        UpdateHistoryButtons();
-    }
-
     private void DetachEditHistory()
     {
         _editHistory = null;
@@ -2075,7 +2172,10 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         try
         {
-            _editHistory?.MarkSavedBaseline(retireUncertainHistory);
+            if (_editHistory is { } history)
+            {
+                await Task.Run(() => history.MarkSavedBaseline(retireUncertainHistory));
+            }
             return true;
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
@@ -2123,13 +2223,7 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
 
-        if (_workspaceService is not WorkspaceService workspaceService)
-        {
-            throw new InvalidOperationException(
-                "The workspace implementation cannot persist a clean history baseline.");
-        }
-
-        EditorSessionState persisted = await workspaceService.PersistSavedBaselineAsync(
+        EditorSessionState persisted = await _workspaceService.PersistSavedBaselineAsync(
             currentSession,
             CancellationToken.None);
         if (persisted.SessionId != currentSession.SessionId ||
@@ -2169,10 +2263,10 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.State = ShellOperationState.Dirty;
         UpdatePersistentSaveState();
         _session = await _mutationWriteAhead.PrepareAsync(currentSession);
-        _operationMutationPrepared = true;
+        _mutationOutcome = MutationOutcome.CompletionUncertain;
         if (cancellationToken.IsCancellationRequested)
         {
-            _operationMutationPrepared = !await CompleteUnchangedMutationAsync();
+            await CompleteUnchangedMutationAsync();
             cancellationToken.ThrowIfCancellationRequested();
         }
     }
@@ -2211,11 +2305,6 @@ public sealed partial class MainWindow : Window, IDisposable
                     CountState = countState,
                     IsInvalidated = true,
                 };
-                UpdateTabCountLabel(
-                    context.Schema.Name,
-                    context.Display.RowDisplay.IsAllRows
-                        ? FormatCount(context.Display.Rows.Count)
-                        : "Count pending");
             }
         }
     }
@@ -2426,15 +2515,7 @@ public sealed partial class MainWindow : Window, IDisposable
             tab.Tag is not TableTabContext context ||
             context.PendingRowDisplay is not null ||
             context.Display.RowDisplay.IsAllRows ||
-            (!context.Display.HasMore &&
-             context.CountState.Status != TableRowCountStatus.Available))
-        {
-            return;
-        }
-
-        if (context.CountState.Status == TableRowCountStatus.Available &&
-            context.CountState.Value.HasValue &&
-            context.Display.Offset + context.Display.Rows.Count >= context.CountState.Value.Value)
+            !context.Display.HasMore)
         {
             return;
         }
@@ -2725,11 +2806,15 @@ public sealed partial class MainWindow : Window, IDisposable
                     advancedRows.Select(static editor => editor.ToDraft(editor.Number)),
                     expressionBox.Text.Trim(),
                     referenceFilter);
-                outcome = new TableFilterDialogOutcome(
-                    definition,
-                    CombineWithAnd(referenceFilter is { } referenced
-                        ? quickConditions.Prepend(referenced)
-                        : quickConditions, advancedFilter));
+                FilterExpression? filter = CombineWithAnd(referenceFilter is { } referenced
+                    ? quickConditions.Prepend(referenced)
+                    : quickConditions, advancedFilter);
+                if (filter is not null)
+                {
+                    FilterExpressionLimits.Validate(filter);
+                }
+
+                outcome = new TableFilterDialogOutcome(definition, filter);
                 validationText.Text = string.Empty;
                 validationText.Visibility = Visibility.Collapsed;
             }
@@ -2934,7 +3019,8 @@ public sealed partial class MainWindow : Window, IDisposable
                 $"{editor.Label.Text} needs text for a pattern. Choose Equals for empty text.");
         }
 
-        if (!TryParseFilterValue(column.Affinity, operatorChoice.Operator, editor.ValueBox.Text, out SqliteValue value))
+        if (!SqliteValueTextParser.TryParseFilterValue(
+                column.Affinity, operatorChoice.Operator, editor.ValueBox.Text, out SqliteValue value))
         {
             editor.ValueBox.Focus(FocusState.Programmatic);
             throw new FilterParseException(
@@ -3313,49 +3399,6 @@ public sealed partial class MainWindow : Window, IDisposable
         return outcome;
     }
 
-    private static bool TryParseFilterValue(
-        SqliteAffinity affinity,
-        FilterOperator filterOperator,
-        string text,
-        out SqliteValue value)
-    {
-        if (filterOperator is FilterOperator.IsNull or FilterOperator.IsNotNull)
-        {
-            value = SqliteValue.Null;
-            return true;
-        }
-
-        if (filterOperator is FilterOperator.Contains or FilterOperator.StartsWith or FilterOperator.EndsWith)
-        {
-            value = SqliteValue.Text(text);
-            return true;
-        }
-
-        switch (affinity)
-        {
-            case SqliteAffinity.Integer when long.TryParse(
-                text,
-                System.Globalization.NumberStyles.Integer,
-                System.Globalization.CultureInfo.InvariantCulture,
-                out long integer):
-                value = SqliteValue.Integer(integer);
-                return true;
-            case SqliteAffinity.Real or SqliteAffinity.Numeric when double.TryParse(
-                text,
-                System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture,
-                out double real) && double.IsFinite(real):
-                value = SqliteValue.Real(real);
-                return true;
-            case SqliteAffinity.Text:
-                value = SqliteValue.Text(text);
-                return true;
-            default:
-                value = SqliteValue.Null;
-                return false;
-        }
-    }
-
     private void ApplyTableFilter(string text)
     {
         string? selectedName = (TablesList.SelectedItem as TableListItem)?.Name;
@@ -3378,7 +3421,7 @@ public sealed partial class MainWindow : Window, IDisposable
         TablesList.SelectedItem = selectedName is null
             ? null
             : ViewModel.Tables.FirstOrDefault(table =>
-                table.Name.Equals(selectedName, StringComparison.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance.Equals(table.Name, selectedName));
         _suppressTableSelection = false;
         NoTablesState.Visibility = ViewModel.Tables.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         NoTablesTitle.Text = ViewModel.HasDatabase ? "No matching tables" : "No tables loaded";
@@ -3403,16 +3446,44 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         Guid? sessionId = _session?.SessionId;
+        TabViewItem? selected = TableTabs.SelectedItem as TabViewItem;
         TableTabContext? stateToPersist = null;
-        if (e.RemovedItems.FirstOrDefault() is TabViewItem previous)
+        RowUpdateOperation? update = null;
+        TabViewItem? previous = e.RemovedItems.FirstOrDefault() as TabViewItem;
+        if (previous is not null && _gridBindingSession.IsBoundTo(previous))
         {
+            if (selected is not null && TableTabs.TabItems.Contains(previous) &&
+                !TableGrid.TryFinishInlineEdit(out update))
+            {
+                _suppressTabSelection = true;
+                try
+                {
+                    TableTabs.SelectedItem = previous;
+                }
+                finally
+                {
+                    _suppressTabSelection = false;
+                }
+                SynchronizeTableSelectionToTab(previous);
+                return;
+            }
+
             CaptureCurrentTabState(previous);
             stateToPersist = previous.Tag as TableTabContext;
         }
         Task persistLayout = PersistCapturedTableStateAsync(
             stateToPersist, sessionId, _lifetimeCancellation.Token);
 
-        TabViewItem? selected = TableTabs.SelectedItem as TabViewItem;
+        if (previous is not null && update is not null)
+        {
+            await CommitInlineEditAsync(previous, update);
+            if (_session?.SessionId != sessionId || !ReferenceEquals(TableTabs.SelectedItem, selected))
+            {
+                await persistLayout;
+                return;
+            }
+        }
+
         if (selected is not null)
         {
             if (selected.Tag is TableTabContext context &&
@@ -3522,6 +3593,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 return;
             }
             bool discard = false;
+            bool saveBeforeClose = false;
             if (_session.IsDirty)
             {
                 var dialog = CreateDialog(
@@ -3536,23 +3608,41 @@ public sealed partial class MainWindow : Window, IDisposable
                     return;
                 }
 
-                if (result == ContentDialogResult.Primary && !await SaveCurrentAsync(cancellationToken))
-                {
-                    return;
-                }
-
+                saveBeforeClose = result == ContentDialogResult.Primary;
                 discard = result == ContentDialogResult.Secondary;
             }
 
-            EditorSessionState session = _session;
-            await _workspaceService.CloseAsync(session, discard, cancellationToken);
+            WorkspaceCloseCompletion close = await WorkspaceCloseWorkflow.CompleteAsync(
+                saveBeforeClose ? token => SaveCurrentAsync(token) : null,
+                async token =>
+                {
+                    EditorSessionState session = _session!;
+                    await DrainSessionReadersAsync(token);
+                    return await _workspaceService.CloseAsync(session, discard, token);
+                },
+                cancellationToken);
+            if (close.Outcome == WorkspaceCloseOutcome.SaveDidNotComplete)
+            {
+                return;
+            }
+            if (close.Outcome is WorkspaceCloseOutcome.Cancelled or WorkspaceCloseOutcome.SavedButCloseCancelled)
+            {
+                PresentCloseCancelled(close.Outcome == WorkspaceCloseOutcome.SavedButCloseCancelled);
+                return;
+            }
+
             _session = null;
+            if (close.RemainingDirectory is { } remaining)
+            {
+                await CreateDialog("Session closed with files left for cleanup",
+                    $"Use Recovery to retry cleaning up {remaining}.", "", "", "OK").ShowAsync();
+            }
             _allowClose = true;
             Close();
         }
-        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Process shutdown owns cancellation.
+            PresentCloseCancelled(databaseSaved: false);
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
@@ -3565,6 +3655,25 @@ public sealed partial class MainWindow : Window, IDisposable
             _closeInProgress = false;
             EndOperation();
         }
+    }
+
+    private void PresentCloseCancelled(bool databaseSaved)
+    {
+        if (_lifetimeCancellation.IsCancellationRequested)
+        {
+            return;
+        }
+
+        RestoreSessionState();
+        if (databaseSaved && OperationInfo.IsOpen && OperationInfo.Severity == InfoBarSeverity.Warning)
+        {
+            ViewModel.Status = "Close cancelled.";
+            OperationInfo.Message += " The window remains open because closing was cancelled.";
+            return;
+        }
+        PresentInformation("Close cancelled", databaseSaved
+            ? "The database was saved and the window remains open."
+            : "The working session is still open.");
     }
 
     private void CloseInspector_Click(object sender, RoutedEventArgs e)
@@ -3779,9 +3888,11 @@ public sealed partial class MainWindow : Window, IDisposable
             MaxHeight = 150,
             SelectionMode = ListViewSelectionMode.Single,
         };
+        bool clearRecentFiles = false;
         var clearRecentButton = new Button { Content = "Clear recent files" };
         clearRecentButton.Click += (_, _) =>
         {
+            clearRecentFiles = true;
             recentFiles.ItemsSource = Array.Empty<string>();
             recentFiles.SelectedItem = null;
         };
@@ -3882,16 +3993,12 @@ public sealed partial class MainWindow : Window, IDisposable
             var density = (GridDensity)densityPicker.SelectedItem;
             int pageSize = (int)pageSizePicker.SelectedItem;
             ForeignKeyDisplayMode mode = foreignKeyModes[foreignKeyPicker.SelectedIndex].Mode;
-            var remainingRecent = recentFiles.ItemsSource as IEnumerable<string> ?? [];
-            HashSet<string> removedRecent = opening.RecentFiles
-                .Except(remainingRecent, StringComparer.OrdinalIgnoreCase)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
             EditorPreferences previous = await SavePreferencesAsync(current => new EditorPreferences(
                 theme == opening.Theme ? current.Theme : theme,
                 density == opening.Density ? current.Density : density,
                 pageSize == opening.PageSize ? current.PageSize : pageSize,
                 mode == opening.ForeignKeyDisplayMode ? current.ForeignKeyDisplayMode : mode,
-                current.RecentFiles.Where(path => !removedRecent.Contains(path))), cancellationToken);
+                clearRecentFiles ? [] : current.RecentFiles), cancellationToken);
             bool foreignKeyModeChanged = _preferences.ForeignKeyDisplayMode != previous.ForeignKeyDisplayMode;
             bool pageSizeChanged = _preferences.PageSize != previous.PageSize;
             ApplyPreferences();
@@ -4117,7 +4224,10 @@ public sealed partial class MainWindow : Window, IDisposable
         ResetRiderCreationForSession(sessionId);
     }
 
-    private async Task LoadMaintenanceTeamsAsync(
+    private Task LoadMaintenanceTeamsAsync(EditorSessionState session, CancellationToken cancellationToken) =>
+        RunSessionReaderAsync(token => LoadMaintenanceTeamsCoreAsync(session, token), cancellationToken);
+
+    private async Task LoadMaintenanceTeamsCoreAsync(
         EditorSessionState session,
         CancellationToken cancellationToken)
     {
@@ -4242,7 +4352,7 @@ public sealed partial class MainWindow : Window, IDisposable
         RiderBulkCurrentNumberBox.Value = double.NaN;
         RiderBulkLimitNumberBox.Value = double.NaN;
         RiderPotentialNumberBox.Value = 3.0;
-        RiderWageNumberBox.Value = double.NaN;
+        RiderWageTextBox.Text = string.Empty;
         RiderContractEndYearNumberBox.Value = double.NaN;
         RiderRoleComboBox.ItemsSource = null;
         RiderRoleComboBox.SelectedItem = null;
@@ -4289,10 +4399,12 @@ public sealed partial class MainWindow : Window, IDisposable
         ShowRiderCreationStep(0);
     }
 
-    private async Task InitializeRiderCreationAsync(
-        EditorSessionState session,
-        CancellationToken cancellationToken,
-        bool startAnother = false)
+    private Task InitializeRiderCreationAsync(
+        EditorSessionState session, CancellationToken cancellationToken, bool startAnother = false) =>
+        RunSessionReaderAsync(token => InitializeRiderCreationCoreAsync(session, startAnother, token), cancellationToken);
+
+    private async Task InitializeRiderCreationCoreAsync(
+        EditorSessionState session, bool startAnother, CancellationToken cancellationToken)
     {
         if (!startAnother && _riderCreationSessionId == session.SessionId && _riderCreationDraft is not null)
         {
@@ -4315,26 +4427,6 @@ public sealed partial class MainWindow : Window, IDisposable
         CancellationToken token = preparation.Token;
         try
         {
-            MaintenanceCapability capability = await _riderCreationService.CheckCapabilityAsync(
-                session.WorkingSqlitePath,
-                token);
-            if (!OwnsRiderPreparation(session, preparation))
-            {
-                return;
-            }
-
-            if (!capability.IsEnabled)
-            {
-                RiderCreationCapabilityInfo.Severity = InfoBarSeverity.Warning;
-                RiderCreationCapabilityInfo.Title = "Create Rider is unavailable for this database";
-                RiderCreationCapabilityInfo.Message = FormatCapabilityDetails(capability);
-                if (RiderCreationView.Visibility == Visibility.Visible)
-                {
-                    ViewModel.Status = "The open database does not support Create Rider.";
-                }
-                return;
-            }
-
             RiderCreationDraft draft = await _riderCreationService.PrepareAsync(
                 session.WorkingSqlitePath,
                 token);
@@ -4377,6 +4469,21 @@ public sealed partial class MainWindow : Window, IDisposable
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
             // Navigation, session replacement, or shutdown owns cancellation.
+        }
+        catch (MaintenanceCapabilityException exception)
+        {
+            if (!OwnsRiderPreparation(session, preparation))
+            {
+                return;
+            }
+
+            RiderCreationCapabilityInfo.Severity = InfoBarSeverity.Warning;
+            RiderCreationCapabilityInfo.Title = "Create Rider is unavailable for this database";
+            RiderCreationCapabilityInfo.Message = exception.Message;
+            if (RiderCreationView.Visibility == Visibility.Visible)
+            {
+                ViewModel.Status = "The open database does not support Create Rider.";
+            }
         }
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
@@ -4426,7 +4533,7 @@ public sealed partial class MainWindow : Window, IDisposable
             RiderPotentialNumberBox.Text,
             RiderPhotoTextBox.Text,
             RiderSoundNameTextBox.Text,
-            RiderWageNumberBox.Text,
+            RiderWageTextBox.Text,
             RiderContractEndYearNumberBox.Text,
             RiderBulkCurrentNumberBox.Text,
             RiderBulkLimitNumberBox.Text,
@@ -4474,31 +4581,13 @@ public sealed partial class MainWindow : Window, IDisposable
         return await dialog.ShowAsync() == ContentDialogResult.Primary;
     }
 
-    private static string FormatCapabilityDetails(MaintenanceCapability capability)
-    {
-        var details = new List<string>(capability.Reasons);
-        if (capability.MissingTables.Count != 0)
-        {
-            details.Add($"Missing tables: {string.Join(", ", capability.MissingTables)}.");
-        }
-
-        if (capability.MissingColumns.Count != 0)
-        {
-            details.Add($"Missing columns: {string.Join(", ", capability.MissingColumns)}.");
-        }
-
-        return details.Count == 0
-            ? "The required rider-creation schema is unavailable."
-            : string.Join(' ', details);
-    }
-
     private static RiderLookupTarget RequireRiderLookup(
         RiderCreationDraft draft,
         string tableName,
         string columnName) =>
         draft.Fields.FirstOrDefault(field =>
-                field.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase)
-                && field.Column.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase))?.LookupTarget
+                SqliteIdentifierComparer.Instance.Equals(field.TableName, tableName)
+                && SqliteIdentifierComparer.Instance.Equals(field.Column.Name, columnName))?.LookupTarget
             ?? throw new InvalidDataException($"The required lookup for {tableName}.{columnName} is unavailable.");
 
     private static RiderRoleOption[] CreateRiderRoleOptions() =>
@@ -4588,11 +4677,11 @@ public sealed partial class MainWindow : Window, IDisposable
         _contractAdvancedEditors.Clear();
         foreach (RiderCreationField field in draft.Fields.Where(static field =>
             field.IsEditable && !field.IsLocked &&
-            !(field.TableName.Equals("DYN_cyclist", StringComparison.OrdinalIgnoreCase) &&
-              field.Column.Name.Equals(RiderCurrentAbility.ColumnName, StringComparison.OrdinalIgnoreCase))))
+            !(SqliteIdentifierComparer.Instance.Equals(field.TableName, "DYN_cyclist") &&
+              SqliteIdentifierComparer.Instance.Equals(field.Column.Name, RiderCurrentAbility.ColumnName))))
         {
             (StackPanel panel, RiderAdvancedFieldEditor editor) = CreateRiderAdvancedFieldEditor(field);
-            if (field.TableName.Equals("DYN_cyclist", StringComparison.OrdinalIgnoreCase))
+            if (SqliteIdentifierComparer.Instance.Equals(field.TableName, "DYN_cyclist"))
             {
                 RiderAdvancedFieldsPanel.Children.Add(panel);
                 _riderAdvancedEditors.Add(editor);
@@ -4630,7 +4719,15 @@ public sealed partial class MainWindow : Window, IDisposable
                 HorizontalAlignment = HorizontalAlignment.Stretch,
             };
         }
-        else if (field.Column.Affinity is SqliteAffinity.Integer or SqliteAffinity.Real or SqliteAffinity.Numeric)
+        else if (field.Column.Affinity is SqliteAffinity.Integer or SqliteAffinity.Numeric)
+        {
+            valueEditor = new TextBox
+            {
+                Text = FormatAdvancedNumericDefault(field.Value),
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+            };
+        }
+        else if (field.Column.Affinity == SqliteAffinity.Real)
         {
             valueEditor = new NumberBox
             {
@@ -5367,10 +5464,10 @@ public sealed partial class MainWindow : Window, IDisposable
                         showError, "Choose a contract role", "Choose one labelled role and stored code.", RiderRoleComboBox);
                 }
 
-                if (!IsPositiveWholeNumber(RiderWageNumberBox.Value))
+                if (!SqliteValueTextParser.TryParsePositiveInteger(RiderWageTextBox.Text, out _))
                 {
                     return RejectRiderStep(
-                        showError, "Check contract wage", "Wage must be a positive whole number.", RiderWageNumberBox);
+                        showError, "Check contract wage", "Wage must be a positive SQLite integer.", RiderWageTextBox);
                 }
 
                 if (!IsPositiveWholeNumber(RiderContractEndYearNumberBox.Value)
@@ -5533,7 +5630,7 @@ public sealed partial class MainWindow : Window, IDisposable
             RiderAdvancedExpander.IsExpanded = true;
             PresentRiderValidation("Choose a contract preference preset", presetFailure.Message);
             RiderAdvancedFieldEditor? preset = _riderAdvancedEditors.FirstOrDefault(static editor =>
-                editor.Field.Column.Name.Equals("fkIDcontract_preference_preset", StringComparison.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance.Equals(editor.Field.Column.Name, "fkIDcontract_preference_preset"));
             Control focusTarget = preset?.UseDefaultBox ?? (Control?)preset?.ValueEditor ?? RiderAdvancedExpander;
             RiderCreationStepContentControl.UpdateLayout();
             focusTarget.Focus(FocusState.Programmatic);
@@ -5575,6 +5672,12 @@ public sealed partial class MainWindow : Window, IDisposable
             return false;
         }
 
+        if (!SqliteValueTextParser.TryParsePositiveInteger(RiderWageTextBox.Text, out long wage))
+        {
+            error = "Wage must be a positive SQLite integer.";
+            return false;
+        }
+
         try
         {
             RiderAbilityInput[] abilities = _riderAbilityEditors.Select(editor =>
@@ -5596,7 +5699,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 RiderSoundNameTextBox.Text,
                 abilities,
                 role.Role,
-                checked((long)RiderWageNumberBox.Value),
+                wage,
                 checked((int)RiderContractEndYearNumberBox.Value),
                 missingLimitsAcknowledged,
                 riderAdvanced,
@@ -5619,8 +5722,8 @@ public sealed partial class MainWindow : Window, IDisposable
         out string? error,
         out RiderAdvancedFieldEditor? invalidEditor)
     {
-        riderValues = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
-        contractValues = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        riderValues = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
+        contractValues = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
         invalidEditor = null;
         if (RiderCurrentAbilityOverrideToggle.IsChecked == true)
         {
@@ -5706,21 +5809,30 @@ public sealed partial class MainWindow : Window, IDisposable
 
                 value = SqliteValue.Null;
             }
-            else if (editor.Field.Column.Affinity == SqliteAffinity.Integer)
-            {
-                if (Math.Truncate(numberBox.Value) != numberBox.Value
-                    || numberBox.Value < long.MinValue
-                    || numberBox.Value >= 9_223_372_036_854_775_808d)
-                {
-                    error = $"{editor.Field.Label} must be a whole SQLite integer.";
-                    return false;
-                }
-
-                value = SqliteValue.Integer(checked((long)numberBox.Value));
-            }
             else
             {
                 value = SqliteValue.Real(numberBox.Value);
+            }
+        }
+        else if (editor.ValueEditor is TextBox numericText &&
+                 editor.Field.Column.Affinity is SqliteAffinity.Integer or SqliteAffinity.Numeric)
+        {
+            if (numericText.Text.Equals(FormatAdvancedNumericDefault(editor.Field.Value), StringComparison.Ordinal) &&
+                editor.Field.Value.Kind != SqliteValueKind.Null)
+            {
+                value = editor.Field.Value;
+            }
+            else if (string.IsNullOrWhiteSpace(numericText.Text) && editor.Field.Column.IsNullable)
+            {
+                value = SqliteValue.Null;
+            }
+            else if (!SqliteValueTextParser.TryParseNumeric(
+                         editor.Field.Column.Affinity, numericText.Text, out value))
+            {
+                error = editor.Field.Column.Affinity == SqliteAffinity.Integer
+                    ? $"{editor.Field.Label} must be a whole SQLite integer."
+                    : $"{editor.Field.Label} must be a finite invariant number.";
+                return false;
             }
         }
         else if (editor.ValueEditor is TextBox textBox)
@@ -5736,6 +5848,13 @@ public sealed partial class MainWindow : Window, IDisposable
         include = value != editor.Field.Value || editor.Field.UsesDatabaseDefault;
         return true;
     }
+
+    private static string FormatAdvancedNumericDefault(SqliteValue value) => value.Kind switch
+    {
+        SqliteValueKind.Integer => value.IntegerValue.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        SqliteValueKind.Real => value.RealValue.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+        _ => string.Empty,
+    };
 
     private void PopulateRiderCreationReview(RiderCreationPreview preview)
     {
@@ -5832,6 +5951,7 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         long draftGeneration = _riderDraftGeneration;
         long viewGeneration = _riderViewGeneration;
+        bool riderHistoryDurable = false;
         await RunMaintenanceAsync(
             "Rider creation",
             async cancellationToken =>
@@ -5878,10 +5998,14 @@ public sealed partial class MainWindow : Window, IDisposable
                     SetRiderReceipt(preview, result.HistoryOperation?.OperationId);
                 }
                 await CompleteMaintenanceApplyAsync(session, result);
+                riderHistoryDurable = _mutationOutcome == MutationOutcome.CommittedWithDurableHistory;
             });
         if (ReferenceEquals(_riderReceipt, preview) && OwnsRiderReview(session, draftGeneration, viewGeneration))
         {
-            ViewModel.Status = "Rider and contract created in the working copy.";
+            if (riderHistoryDurable)
+            {
+                ViewModel.Status = "Rider and contract created in the working copy.";
+            }
             CreateAnotherRiderButton.Focus(FocusState.Programmatic);
         }
     }
@@ -5930,15 +6054,6 @@ public sealed partial class MainWindow : Window, IDisposable
             "Rider recovery",
             async cancellationToken =>
             {
-                MaintenanceCapability capability = await _riderRecoveryService.CheckCapabilityAsync(
-                    session.WorkingSqlitePath,
-                    cancellationToken);
-                cancellationToken.ThrowIfCancellationRequested();
-                if (!PresentCapabilityFailure(capability))
-                {
-                    return;
-                }
-
                 RiderRecoveryPreview preview = await _riderRecoveryService.PreviewAsync(
                     session.WorkingSqlitePath,
                     target,
@@ -5996,15 +6111,6 @@ public sealed partial class MainWindow : Window, IDisposable
             "January 1 repair",
             async cancellationToken =>
             {
-                MaintenanceCapability capability = await _januaryFirstRepairService.CheckCapabilityAsync(
-                    session.WorkingSqlitePath,
-                    cancellationToken);
-                cancellationToken.ThrowIfCancellationRequested();
-                if (!PresentCapabilityFailure(capability))
-                {
-                    return;
-                }
-
                 JanuaryFirstRepairPreview preview = await _januaryFirstRepairService.PreviewAsync(
                     session.WorkingSqlitePath,
                     cancellationToken);
@@ -6046,15 +6152,6 @@ public sealed partial class MainWindow : Window, IDisposable
             "Country quota update",
             async cancellationToken =>
             {
-                MaintenanceCapability capability = await _countryQuotaMaintenanceService.CheckCapabilityAsync(
-                    session.WorkingSqlitePath,
-                    cancellationToken);
-                cancellationToken.ThrowIfCancellationRequested();
-                if (!PresentCapabilityFailure(capability))
-                {
-                    return;
-                }
-
                 CountryQuotaPreview preview = await _countryQuotaMaintenanceService.PreviewAsync(
                     session.WorkingSqlitePath,
                     cancellationToken);
@@ -6095,7 +6192,7 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            if (_operationMutationPrepared)
+            if (_mutationOutcome == MutationOutcome.CompletionUncertain)
             {
                 await HandleUnconfirmedMutationCancellationAsync(
                     "Maintenance cancelled",
@@ -6126,7 +6223,7 @@ public sealed partial class MainWindow : Window, IDisposable
         catch (Exception exception) when (IsExpectedOperationFailure(exception))
         {
             bool hasToolMessage = TryGetMaintenanceCapabilityMessage(exception, out string toolMessage);
-            if (_operationMutationPrepared)
+            if (_mutationOutcome == MutationOutcome.CompletionUncertain)
             {
                 await HandlePreparedMutationFailureAsync(
                     "Maintenance operation failed",
@@ -6172,7 +6269,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
         if (result.AffectedRows > 0)
         {
-            if (!_operationMutationPrepared || !currentSession.IsDirty)
+            if (_mutationOutcome != MutationOutcome.CompletionUncertain || !currentSession.IsDirty)
             {
                 _session = currentSession with { IsDirty = true };
                 try
@@ -6187,9 +6284,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 }
             }
 
-            ViewModel.State = ShellOperationState.Dirty;
-            InvalidateTableCaches();
-
+            _mutationOutcome = MutationOutcome.CommittedWithIncompleteHistory;
             if (result.HistoryOperation is null || result.UndoGuards is null)
             {
                 await HandlePostCommitFailureAsync(
@@ -6206,8 +6301,8 @@ public sealed partial class MainWindow : Window, IDisposable
 
             try
             {
-                _editHistory.Record(result.HistoryOperation, result.UndoGuards);
-                _session = await _mutationWriteAhead.CompleteAsync(_session!);
+                EditHistory history = RequireEditHistory();
+                await CompleteCommittedMutationAsync(() => history.Record(result.HistoryOperation, result.UndoGuards));
             }
             catch (Exception exception) when (IsExpectedOperationFailure(exception))
             {
@@ -6216,37 +6311,23 @@ public sealed partial class MainWindow : Window, IDisposable
                 return;
             }
 
-            UpdateHistoryButtons();
             PresentSuccess("Maintenance applied", result.Summary);
         }
         else
         {
-            if (_operationMutationPrepared && _session?.MutationPending == true)
+            if (_mutationOutcome == MutationOutcome.CompletionUncertain && _session?.MutationPending == true)
             {
                 _session = await _mutationWriteAhead.CompleteAsync(_session);
+                _mutationOutcome = MutationOutcome.NoChange;
                 await ReconcileSessionWithHistoryBaselineAsync();
             }
             RestoreSessionState();
             PresentInformation("No maintenance changes applied", result.Summary);
         }
 
-        try
-        {
-            await RefreshSelectedTableAsync();
-        }
-        catch (OperationCanceledException) when (
-            _operationLease?.Token.IsCancellationRequested == true)
-        {
-            PresentCommittedRefreshCancellation(
-                result.AffectedRows > 0
-                    ? "The maintenance change completed in the working copy."
-                    : "The maintenance check completed without changing the working copy.");
-        }
-        catch (Exception exception) when (IsExpectedOperationFailure(exception))
-        {
-            PresentTableQueryWarning("Could not refresh the table",
-                SafeFailureMessage(exception, "The maintenance operation completed. Use Refresh to reload the previous view."));
-        }
+        await RefreshAfterMutationAsync(result.AffectedRows > 0
+            ? "The maintenance change completed in the working copy."
+            : "The maintenance check completed without changing the working copy.");
     }
 
     private bool TryGetMaintenanceSession(out EditorSessionState session)
@@ -6259,32 +6340,6 @@ public sealed partial class MainWindow : Window, IDisposable
 
         session = null!;
         PresentWarning("Open a CDB first", "Maintenance tools operate only on an isolated working database.");
-        return false;
-    }
-
-    private bool PresentCapabilityFailure(MaintenanceCapability capability)
-    {
-        if (capability.IsEnabled)
-        {
-            return true;
-        }
-
-        var details = new List<string>(capability.Reasons);
-        if (capability.MissingTables.Count > 0)
-        {
-            details.Add($"Missing tables: {string.Join(", ", capability.MissingTables)}");
-        }
-
-        if (capability.MissingColumns.Count > 0)
-        {
-            details.Add($"Missing columns: {string.Join(", ", capability.MissingColumns)}");
-        }
-
-        PresentWarning(
-            "Tool unavailable for this database",
-            details.Count == 0
-                ? "The open database does not support this maintenance tool."
-                : string.Join(" ", details));
         return false;
     }
 
@@ -6318,13 +6373,6 @@ public sealed partial class MainWindow : Window, IDisposable
         if (tableName is not null)
         {
             _tableTabs.Remove(tableName);
-            TableTabState? state = ViewModel.Tabs.FirstOrDefault(item =>
-                item.Name.Equals(tableName, StringComparison.OrdinalIgnoreCase));
-            if (state is not null)
-            {
-                ViewModel.Tabs.Remove(state);
-            }
-
             TabCloseSelectionResolution resolution = TabCloseSelectionReconciler.Resolve(
                 openTablesBeforeClose,
                 tableName,
@@ -6426,7 +6474,7 @@ public sealed partial class MainWindow : Window, IDisposable
         $"Fit {values.Fit:G}, Injury {values.Injury:G}, Days {values.InjuryDays:N0}, " +
         $"Fatigue {values.PhysicalFatigue:G}, Freshness {values.Freshness:G}, Preparation {values.Preparation:G}";
 
-    private void SetBusyPresentation(string title, string message, bool allowCancellation = true)
+    private void SetBusyPresentation(string title, string message)
     {
         ViewModel.State = ShellOperationState.Loading;
         ViewModel.Status = message;
@@ -6434,10 +6482,8 @@ public sealed partial class MainWindow : Window, IDisposable
         SetTableLoadingSurface(isVisible: false);
         EmptyState.Visibility = Visibility.Collapsed;
         SetTableGridPresented(isPresented: false);
-        CancelOperationButton.Visibility = allowCancellation
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        CancelOperationButton.IsEnabled = allowCancellation;
+        CancelOperationButton.Visibility = Visibility.Visible;
+        CancelOperationButton.IsEnabled = true;
         PresentInformation(title, message);
     }
 
@@ -6485,7 +6531,6 @@ public sealed partial class MainWindow : Window, IDisposable
         _tableTabs.Clear();
         DetachEditHistory();
         ViewModel.Tables.Clear();
-        ViewModel.Tabs.Clear();
         ViewModel.HasDatabase = false;
         ViewModel.State = ShellOperationState.NoFile;
         ViewModel.DatabaseName = "No database open";
@@ -6495,7 +6540,15 @@ public sealed partial class MainWindow : Window, IDisposable
             .FromPageSize(_preferences.PageSize)
             .StatusLabel;
         TableSearchBox.Text = string.Empty;
-        TableTabs.TabItems.Clear();
+        _suppressTabSelection = true;
+        try
+        {
+            TableTabs.TabItems.Clear();
+        }
+        finally
+        {
+            _suppressTabSelection = false;
+        }
         TableGrid.Clear();
         SetTableGridPresented(isPresented: false);
         ResetTableWorkspaceChrome();
@@ -6535,7 +6588,7 @@ public sealed partial class MainWindow : Window, IDisposable
             TablesList.SelectedItem = tableName is null
                 ? null
                 : ViewModel.Tables.FirstOrDefault(table =>
-                    table.Name.Equals(tableName, StringComparison.OrdinalIgnoreCase));
+                    SqliteIdentifierComparer.Instance.Equals(table.Name, tableName));
         }
         finally
         {
@@ -6605,7 +6658,7 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         _operationLease = lease;
-        _operationMutationPrepared = false;
+        _mutationOutcome = MutationOutcome.NotStarted;
         cancellationToken = lease!.Token;
         ViewModel.IsOperationExclusive = true;
         if (operationName is "Close" or "Open database" or "Resume session")
@@ -6623,10 +6676,19 @@ public sealed partial class MainWindow : Window, IDisposable
         CancelOperationButton.Visibility = Visibility.Collapsed;
         _operationLease?.Dispose();
         _operationLease = null;
-        _operationMutationPrepared = false;
+        _mutationOutcome = MutationOutcome.NotStarted;
         if (_disposed)
         {
             return;
+        }
+
+        bool restartReaders = _sessionReadLifetime is null;
+        _sessionReadLifetime ??= new CancellationTokenSource();
+        if (restartReaders && _session is not null &&
+            TableTabs.SelectedItem is TabViewItem { Tag: TableTabContext context } tab &&
+            !context.Display.RowDisplay.IsAllRows && context.CountState.Status == TableRowCountStatus.Loading)
+        {
+            StartVirtualCount(tab, context);
         }
 
         ViewModel.IsOperationExclusive = false;
@@ -6790,7 +6852,7 @@ public sealed partial class MainWindow : Window, IDisposable
             try
             {
                 TablesList.SelectedItem = ViewModel.Tables.FirstOrDefault(item =>
-                    item.Name.Equals(previousContext.Schema.Name, StringComparison.OrdinalIgnoreCase));
+                    SqliteIdentifierComparer.Instance.Equals(item.Name, previousContext.Schema.Name));
             }
             finally
             {
@@ -6958,6 +7020,9 @@ public sealed partial class MainWindow : Window, IDisposable
         _operationLease?.Dispose();
         _operationLease = null;
         _operationGate.Dispose();
+        _sessionReadLifetime?.Cancel();
+        _sessionReadLifetime?.Dispose();
+        _sessionReadLifetime = null;
         _lifetimeCancellation.Cancel();
         _lifetimeCancellation.Dispose();
     }
@@ -7007,6 +7072,11 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         try
         {
+            if (_session?.SessionId == session.SessionId)
+            {
+                await DrainSessionReadersAsync(CancellationToken.None);
+            }
+
             await _workspaceService.CloseAsync(
                 session,
                 discardDirtySession: session.IsDirty,
@@ -7025,8 +7095,6 @@ public sealed partial class MainWindow : Window, IDisposable
     private static bool IsCdbPath(string? path) =>
         !string.IsNullOrWhiteSpace(path) &&
         Path.GetExtension(path).Equals(".cdb", StringComparison.OrdinalIgnoreCase);
-
-    private static string FormatCount(long count) => $"{count:N0} rows";
 
     private static TableRowDisplayChoice GetRequestedRowDisplay(TableTabContext context) =>
         context.PendingRowDisplay ?? context.Display.RowDisplay;
@@ -7076,6 +7144,10 @@ public sealed partial class MainWindow : Window, IDisposable
         InvalidOperationException or
         ArgumentException;
 
+    private static bool IsWorkspaceCancellation(Exception exception, CancellationToken cancellationToken) =>
+        cancellationToken.IsCancellationRequested && exception is
+            (OperationCanceledException or CdbConversionException { Failure.Category: ConverterFailureCategory.Cancelled });
+
     private static string SafeFailureMessage(Exception exception, string fallback) => exception switch
     {
         PcmCdbEditor.Application.CdbConversionException conversion =>
@@ -7098,6 +7170,20 @@ public sealed partial class MainWindow : Window, IDisposable
         Exception exception,
         out string message)
     {
+        if (exception is MaintenanceCapabilityException unavailable)
+        {
+            message = unavailable.Message;
+            return true;
+        }
+
+        if (exception is InvalidDataException invalidData &&
+            (invalidData.Message.StartsWith("Rider recovery cannot read ", StringComparison.Ordinal) ||
+             invalidData.Message.StartsWith("Country quota update cannot read ", StringComparison.Ordinal)))
+        {
+            message = invalidData.Message;
+            return true;
+        }
+
         if (exception is InvalidOperationException januaryGate &&
             januaryGate.Message.StartsWith(
                 "The season-stage repair is available only on January 1.",
@@ -7277,5 +7363,6 @@ public sealed partial class MainWindow : Window, IDisposable
         TableRowCountState CountState,
         bool IsInvalidated,
         GridSelection Selection,
-        GridViewport Viewport);
+        GridViewport Viewport,
+        GridPagePresentation GridPage);
 }

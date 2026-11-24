@@ -32,7 +32,6 @@ public sealed class ShellState : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public ObservableCollection<TableTabState> Tabs { get; } = [];
 
     public ObservableCollection<TableListItem> Tables { get; } = [];
 
@@ -164,8 +163,6 @@ public sealed class ShellState : INotifyPropertyChanged
     private void OnPropertyChanged([CallerMemberName] string? name = null) =>
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
-
-public sealed record TableTabState(string Name, string CountLabel, bool IsReadOnly);
 
 public sealed record TableListItem(string Name, string KindLabel, bool IsReadOnly);
 

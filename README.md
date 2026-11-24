@@ -24,7 +24,7 @@ Rider recovery accepts an entire current team roster or manually entered rider I
 
 ## Quick start
 
-Use Windows x64 and the .NET SDK selected by `global.json`. The first command must report `10.0.303`.
+Use Windows x64 and the .NET SDK selected by `global.json`. The first command must report `10.0.403`.
 
 ```powershell
 dotnet --version

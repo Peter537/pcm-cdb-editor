@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text;
 
 namespace PcmCdbEditor.Infrastructure.Internal;
@@ -35,35 +34,16 @@ internal static class BoundedProcessRunner
             throw new ArgumentOutOfRangeException(nameof(timeout), "The process timeout must be positive.");
         }
 
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = executablePath,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            WindowStyle = ProcessWindowStyle.Hidden,
-            WorkingDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory
-        };
-
-        foreach (var argument in arguments)
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
-
-        using var process = new Process { StartInfo = startInfo };
-        if (!process.Start())
-        {
-            throw new InvalidOperationException("The converter process could not be started.");
-        }
-
+        using var process = WindowsConverterProcess.Start(executablePath, arguments);
         var sensitive = sensitiveValues
             .Where(static item => !string.IsNullOrWhiteSpace(item))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderByDescending(static item => item.Length)
             .ToArray();
-        var outputTask = ReadBoundedAndSanitizedAsync(process.StandardOutput, sensitive);
-        var errorTask = ReadBoundedAndSanitizedAsync(process.StandardError, sensitive);
+        using var readerCancellation = new CancellationTokenSource();
+        var outputTask = ReadBoundedAndSanitizedAsync(process.StandardOutput, sensitive, readerCancellation.Token);
+        var errorTask = ReadBoundedAndSanitizedAsync(process.StandardError, sensitive, readerCancellation.Token);
+        var completion = Task.WhenAll(process.WaitForExitAsync(readerCancellation.Token), outputTask, errorTask);
         using var timeoutSource = new CancellationTokenSource(timeout);
         using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
@@ -71,35 +51,40 @@ internal static class BoundedProcessRunner
 
         try
         {
-            await process.WaitForExitAsync(linkedSource.Token).ConfigureAwait(false);
+            await completion.WaitAsync(linkedSource.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (linkedSource.IsCancellationRequested)
         {
-            KillProcessTree(process);
-            var diagnostics = await DrainReadersAsync(outputTask, errorTask).ConfigureAwait(false);
+            process.Stop();
+
+            readerCancellation.CancelAfter(TimeSpan.FromSeconds(1));
+            try
+            {
+                await completion.WaitAsync(TimeSpan.FromSeconds(2), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is TimeoutException or OperationCanceledException or IOException)
+            {
+                if (!completion.IsCompleted)
+                {
+                    _ = completion.ContinueWith(static task => _ = task.Exception,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+                }
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
             throw new BoundedProcessTimeoutException(
                 $"The converter did not finish within {timeout.TotalMinutes:0.##} minutes.",
-                diagnostics.StandardOutput,
-                diagnostics.StandardError);
-        }
-        catch (OperationCanceledException)
-        {
-            KillProcessTree(process);
-            await DrainReadersAsync(outputTask, errorTask).ConfigureAwait(false);
-            throw;
+                outputTask.IsCompletedSuccessfully ? outputTask.Result : string.Empty,
+                errorTask.IsCompletedSuccessfully ? errorTask.Result : string.Empty);
         }
 
-        var output = await outputTask.ConfigureAwait(false);
-        var error = await errorTask.ConfigureAwait(false);
-        return new ProcessExecutionResult(
-            process.ExitCode,
-            output,
-            error);
+        return new ProcessExecutionResult(process.ExitCode, outputTask.Result, errorTask.Result);
     }
 
     private static async Task<string> ReadBoundedAndSanitizedAsync(
         StreamReader reader,
-        string[] sensitiveValues)
+        string[] sensitiveValues,
+        CancellationToken cancellationToken)
     {
         var buffer = new char[2048];
         var builder = new StringBuilder(Math.Min(DiagnosticCharacterLimit, 4096));
@@ -111,7 +96,7 @@ internal static class BoundedProcessRunner
 
         while (true)
         {
-            var read = await reader.ReadAsync(buffer.AsMemory(), CancellationToken.None).ConfigureAwait(false);
+            var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
             if (read == 0)
             {
                 break;
@@ -243,37 +228,5 @@ internal static class BoundedProcessRunner
         }
 
         wasTruncated |= value.Length > remaining;
-    }
-
-    private static void KillProcessTree(Process process)
-    {
-        try
-        {
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-                process.WaitForExit();
-            }
-        }
-        catch (InvalidOperationException)
-        {
-            // The process exited between the state check and the kill request.
-        }
-    }
-
-    private static async Task<(string StandardOutput, string StandardError)> DrainReadersAsync(
-        Task<string> outputTask,
-        Task<string> errorTask)
-    {
-        try
-        {
-            await Task.WhenAll(outputTask, errorTask).ConfigureAwait(false);
-            return (await outputTask.ConfigureAwait(false), await errorTask.ConfigureAwait(false));
-        }
-        catch (OperationCanceledException)
-        {
-            // The caller receives the timeout or cancellation exception from the process wait.
-            return (string.Empty, string.Empty);
-        }
     }
 }

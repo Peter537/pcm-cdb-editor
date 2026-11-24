@@ -2,9 +2,9 @@
     x:Class="PcmCdbEditor.App.Controls.TableGridAdapterControl"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    xmlns:tv="using:WinUI.TableView">
+    xmlns:local="using:PcmCdbEditor.App.Controls">
   <Grid Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
-    <tv:TableView
+    <local:NativeTableView
         x:Name="GridControl"
         AutomationProperties.Name="Current table rows"
         AutomationProperties.HelpText="Use arrow keys to move between cells. Press F2 to edit. Enter opens a supported relationship picker or commits an inline edit. Click or tap a column header to make it the primary sort. A newly selected sort target starts descending. Repeating the same target toggles direction. Use Sort to edit or clear the full sort order."
@@ -17,11 +17,11 @@
         SelectionMode="Multiple"
         SelectionChanged="GridControl_SelectionChanged"
         Sorting="GridControl_Sorting">
-      <tv:TableView.ItemsPanel>
+      <local:NativeTableView.ItemsPanel>
         <ItemsPanelTemplate>
           <ItemsStackPanel Orientation="Vertical" CacheLength="0" />
         </ItemsPanelTemplate>
-      </tv:TableView.ItemsPanel>
-    </tv:TableView>
+      </local:NativeTableView.ItemsPanel>
+    </local:NativeTableView>
   </Grid>
 </UserControl>

@@ -1,4 +1,5 @@
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
 using PcmCdbEditor.Infrastructure.Sqlite;
 
@@ -170,7 +171,7 @@ public sealed class SqliteRelationshipQueryTests
             new TableQuery("data", new PageRequest(0, 1),
                 sorts: [new SortDescriptor("fkIDkey", SortDirection.Ascending, (QueryValueTarget)42)]),
             CancellationToken.None)).ConfigureAwait(false);
-        await Assert.ThrowsExactlyAsync<ArgumentException>(() => store.QueryRowsAsync(database.Path, catalog,
+        await Assert.ThrowsExactlyAsync<UnknownSchemaIdentifierException>(() => store.QueryRowsAsync(database.Path, catalog,
             new TableQuery("data", new PageRequest(0, 1),
                 sorts: [new SortDescriptor("fkIDkey__display", SortDirection.Ascending)]),
             CancellationToken.None)).ConfigureAwait(false);

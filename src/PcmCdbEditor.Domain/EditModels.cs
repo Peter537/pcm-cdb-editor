@@ -228,9 +228,9 @@ public sealed record MaintenanceRowChange
         var frozenAfter = afterValues is null ? null : ModelCollections.FreezeDictionary(afterValues);
         if (frozenBefore is not null
             && frozenAfter is not null
-            && !frozenBefore.Keys.Order(StringComparer.OrdinalIgnoreCase).SequenceEqual(
-                frozenAfter.Keys.Order(StringComparer.OrdinalIgnoreCase),
-                StringComparer.OrdinalIgnoreCase))
+            && !frozenBefore.Keys.Order(SqliteIdentifierComparer.Instance).SequenceEqual(
+                frozenAfter.Keys.Order(SqliteIdentifierComparer.Instance),
+                SqliteIdentifierComparer.Instance))
         {
             throw new ArgumentException("Maintenance update snapshots must contain the same columns.", nameof(afterValues));
         }
@@ -314,8 +314,8 @@ public sealed record MaintenanceEditOperation : EditOperation
         }
 
         if (Changes
-            .Select(static change => $"{change.TableName}\u001f{change.Identity}")
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(static change => (SqliteIdentifierComparer.ToLowerAscii(change.TableName), change.Identity))
+            .Distinct()
             .Count() != Changes.Count)
         {
             throw new ArgumentException("A maintenance command cannot change the same row more than once.", nameof(changes));

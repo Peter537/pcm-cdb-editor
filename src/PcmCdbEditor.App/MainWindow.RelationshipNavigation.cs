@@ -58,7 +58,7 @@ public sealed partial class MainWindow
     private static IEnumerable<ReferenceChoice> GetReferenceChoices(DatabaseSchemaCatalog catalog, TableSchema table, TypedRow row)
     {
         foreach (string column in table.Relationships.Select(static relation => relation.SourceColumn)
-                     .Distinct(StringComparer.OrdinalIgnoreCase))
+                     .Distinct(SqliteIdentifierComparer.Instance))
         {
             if (row.Values.TryGetValue(column, out SqliteValue key)
                 && (key.Kind is SqliteValueKind.Integer or SqliteValueKind.Text
@@ -87,7 +87,7 @@ public sealed partial class MainWindow
         ReferenceChoice[] choices = GetReferenceChoices(catalog, context.Schema, row).ToArray();
         string? currentColumn = TableGrid.GetCurrentColumnForRow(row);
         ReferenceChoice? choice = choices.FirstOrDefault(candidate =>
-            candidate.ColumnName.Equals(currentColumn, StringComparison.OrdinalIgnoreCase));
+            SqliteIdentifierComparer.Instance.Equals(candidate.ColumnName, currentColumn));
         if (choice is null && choices.Length != 0)
         {
             choice = await ChooseReferenceAsync(choices);
@@ -112,8 +112,8 @@ public sealed partial class MainWindow
                 session.SessionId, captured.Schema.Name, captured.SearchText, captured.Filter, captured.FilterDefinition,
                 captured.Sorts, captured.Display.RowDisplay, captured.Display.Offset, captured.ViewState,
                 captured.Selection, captured.Viewport);
-            RelationshipLookupResult lookup = await _relationshipLookup.ResolveAsync(
-                session.WorkingSqlitePath, catalog, context.Schema.Name, choice.ColumnName, choice.Key, request.Token);
+            RelationshipLookupResult lookup = await TrackSessionReaderAsync(_relationshipLookup.ResolveAsync(
+                session.WorkingSqlitePath, catalog, context.Schema.Name, choice.ColumnName, choice.Key, request.Token));
             request.Lease.ThrowIfSuperseded(request.Token);
             if (lookup.Option is not { } target)
             {

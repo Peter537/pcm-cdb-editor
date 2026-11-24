@@ -26,7 +26,9 @@ Run the release build on Windows x64 with Git, GitHub CLI, network access, and t
 ./eng/Build-Release.ps1 -Version 0.1.0
 ```
 
-The script removes and recreates an existing `artifacts/release/<version>` directory before it validates or builds the replacement candidate. Preserve any needed evidence elsewhere before rerunning the same version.
+The script captures Git HEAD, the working-tree status, and the complete source file manifest before restoring packages. From a clean checkout it exports the recorded commit through a private Git index. A dirty checkout produces a local verification candidate from an isolated copy of its captured files. Use `-RequireCleanSource` to reject a dirty checkout before building.
+
+Build, test, publish, and tool installation run in a unique scratch directory below `artifacts`. The script checks the captured inputs and live checkout again before writing provenance and promoting the verified candidate. Failed builds leave the current version in place. When a new candidate passes, the previous version is retained under `<version>.previous-<run-id>`. Review that directory after accepting the new version. The script prints its size and leaves its removal to the owner.
 
 The script:
 
@@ -43,7 +45,7 @@ The script:
 11. writes source, dependency, content, vulnerability, provenance, SBOM, and checksum evidence; and
 12. invokes the independent release verifier against the generated candidate artifacts.
 
-The command downloads and executes a validated external build tool. Review `Build-Release.ps1` and approve that network and execution boundary before running it. Source provenance records the current commit and working-tree state; use a clean checkout for any candidate considered for publication. It also records the local operating system, OS and process architectures, and PowerShell version so the build environment can be reviewed with the candidate.
+The command downloads and executes a validated external build tool. Source provenance records the initial commit, working-tree status digest, source manifest, snapshot mode, and local build environment. It records the serviced .NET runtime and app-host versions against Microsoft's runtime security metadata. The synthetic integration gate excludes owner-authorized real-CDB smoke tests.
 
 ## Candidate output and verification
 
@@ -63,6 +65,8 @@ artifacts/release/<version>/
 |   |-- dependency-vulnerabilities.json
 |   |-- release-provenance.json
 |   |-- source-manifest.json
+|   |-- resolved-restore-assets.json
+|   |-- installed-payload.json       added after Windows Sandbox verification
 |   |-- sbom-validation.json
 |   `-- sbom/_manifest/spdx_2.2/manifest.spdx.json
 `-- SHA256SUMS.txt
@@ -76,21 +80,30 @@ artifacts/release/<version>/
 - the SPDX document and its required application and package components;
 - source-manifest hashes, source-tree digest, commit, and dirty-tree provenance;
 - exact equality between the staged payload and every ZIP entry;
-- installer identity, per-user scope, file association, and unsigned status;
+- installer identity, unsigned status, and static per-user registration settings;
 - local build-environment provenance, NuGet source policy, and release-script publication boundaries; and
 - absence of source files, symbols, databases, logs, private paths, build trees, legacy components, and other denied payload content.
 
-A failed or unavailable check is a failed candidate gate. Do not replace it with a documentation claim or remove the check to produce an artifact.
+The standalone verifier reads candidate-specific resolved restore evidence after build scratch is removed. Use the captured checkout to reverify. `-RequireReleaseEvidence` fails if the candidate lacks a clean, committed snapshot or passing Windows Sandbox evidence bound to this installer.
 
 ## Installer behavior
 
 The installer is per user and does not require elevation. It installs below `%LOCALAPPDATA%\Programs\PcmCdbEditor`, creates a Start Menu shortcut and optional desktop shortcut, and registers an HKCU **Open with** handler without taking over the current `.cdb` default. Uninstall removes application files and registration while preserving settings, sessions, and backups below `%LOCALAPPDATA%\PcmCdbEditor`.
 
-The ZIP and installer must use the same verified payload. Do not rebuild, add, or remove payload files between packaging steps.
+Verify actual installation in Windows Sandbox on a compatible Windows x64 host with Windows Sandbox enabled:
+
+```powershell
+./eng/Test-InstallerPayload.ps1 -CandidateDirectory ./artifacts/release/0.1.0
+./eng/Verify-Release.ps1 -Version 0.1.0 -RequireReleaseEvidence
+```
+
+The probe disables guest networking and maps only the read-only installer input and an isolated result directory. It compares every installed payload path, size, and SHA-256 against the ZIP-verified staging directory, allowing the two Inno-generated uninstall files. It verifies HKCU registration, the Start Menu shortcut, preservation of a seeded `.cdb` default, uninstall cleanup, and survival of synthetic user data. The release verifier checks the result against the current installer checksum and adds it to `SHA256SUMS.txt`.
+
+Run `./eng/Test-ReleaseTooling.ps1` to check source capture, candidate promotion, and installer manifest rejection against synthetic fixtures. Windows Sandbox is needed for actual installation evidence. If a host or VM is forcibly terminated, close the task-owned process or Sandbox before removing only the scratch path printed for that run.
 
 ## Local candidate handling
 
-Candidates are built and verified locally. The release script writes them only under `artifacts/release/<version>` and does not create a tag, GitHub Release, or public asset. Review the recorded local build environment and external-tool provenance before treating a candidate as publishable.
+Candidates are built and verified locally. The release script promotes the verified current candidate under `artifacts/release/<version>` by default and does not create a tag, GitHub Release, or public asset. Review the recorded local build environment and external-tool provenance before treating a candidate as publishable.
 
 ## Signing and publication
 
@@ -99,7 +112,7 @@ The current verifier requires the application and installer to remain unsigned. 
 Before I publish a release, I will:
 
 - review the generated dependency, vulnerability, SBOM, license, notice, content, and provenance evidence;
-- build the candidate from a clean checkout;
+- build from a clean checkout and pass the installer evidence gate;
 - complete the [manual Windows and accessibility checks](testing.md#manual-windows-and-accessibility-checks), including the nonzero-offset wide-table header-sort regression and session-only sort-lifetime checks; reject the candidate if headers and rows misalign, the application crashes, or a closed table's or previous editor's sort reappears;
 - test the installed application, file association, uninstall behavior, and representative CDB round trips;
 - review the recorded local build environment and external-tool provenance; and

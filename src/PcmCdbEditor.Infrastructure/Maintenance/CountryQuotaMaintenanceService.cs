@@ -17,7 +17,7 @@ public sealed class CountryQuotaMaintenanceService : ICountryQuotaMaintenanceSer
     private static readonly string[] CountryDisplayColumns =
         ["gene_sz_name", "gene_sz_full_name", "value_sz_name", "name"];
     private static readonly IReadOnlyDictionary<string, IReadOnlyCollection<string>> Requirements =
-        new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        new Dictionary<string, IReadOnlyCollection<string>>(SqliteIdentifierComparer.Instance)
         {
             ["GAM_config"] = new[] { "gene_i_date" },
             ["DYN_result_season"] = new[]
@@ -44,12 +44,10 @@ public sealed class CountryQuotaMaintenanceService : ICountryQuotaMaintenanceSer
     public Task<MaintenanceCapability> CheckCapabilityAsync(
         string sqlitePath,
         CancellationToken cancellationToken) =>
-        MaintenanceSupport.CheckAsync(
-            sqlitePath,
-            MaintenanceToolKind.CountryChampionshipQuota,
-            Requirements,
-            ["STA_country"],
-            cancellationToken);
+        MaintenanceSupport.CheckAsync(sqlitePath, CheckCapability, cancellationToken);
+
+    private static MaintenanceCapability CheckCapability(DatabaseSchemaCatalog catalog) =>
+        MaintenanceSupport.Check(catalog, MaintenanceToolKind.CountryChampionshipQuota, Requirements, ["STA_country"]);
 
     public Task<CountryQuotaPreview> PreviewAsync(
         string sqlitePath,
@@ -82,16 +80,13 @@ public sealed class CountryQuotaMaintenanceService : ICountryQuotaMaintenanceSer
             () => ApplyCoreAsync(sqlitePath, preview, cancellationToken),
             cancellationToken);
 
-    private async Task<MaintenanceApplyResult> ApplyCoreAsync(
+    private static async Task<MaintenanceApplyResult> ApplyCoreAsync(
         string sqlitePath,
         CountryQuotaPreview preview,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(preview);
-        var capability = await CheckCapabilityAsync(sqlitePath, cancellationToken).ConfigureAwait(false);
-        MaintenanceSupport.RequireEnabled(capability);
-        DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
-            .DiscoverAsync(sqlitePath, cancellationToken)
+        DatabaseSchemaCatalog catalog = await MaintenanceSupport.RequireCatalogAsync(sqlitePath, CheckCapability, cancellationToken)
             .ConfigureAwait(false);
         TableSchema historyTable = MaintenanceHistoryCapture.RequireEditableTable(catalog, "STA_country");
         await using var connection = SqliteSupport.CreateConnection(sqlitePath);
@@ -114,7 +109,7 @@ public sealed class CountryQuotaMaintenanceService : ICountryQuotaMaintenanceSer
             }
 
             CountryQuotaChange[] changed = current.Changes
-                .Where(static change => change.OldValues != change.NewValues)
+                .Where(static change => change.HasChanges)
                 .ToArray();
             if (changed.Length == 0)
             {
@@ -351,17 +346,17 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
         return rows;
     }
 
-    private static Dictionary<long, double> CalculateCountryPoints(
+    private static Dictionary<long, decimal> CalculateCountryPoints(
         IReadOnlyList<ResultRow> rows,
         IReadOnlyDictionary<(string RaceClass, string Source, string Type), int[]> bonuses)
     {
         var teamCounts = rows.Where(static row => row.TeamResultId.HasValue)
             .GroupBy(static row => (row.StageId, row.TeamResultId!.Value))
             .ToDictionary(static group => group.Key, static group => group.Count());
-        var totals = new Dictionary<long, double>();
+        var totals = new Dictionary<long, decimal>();
         foreach (var row in rows)
         {
-            var points = 0D;
+            var points = 0M;
             if (row.IsFinal && row.StageNumber == 1)
             {
                 points += ResolvePoints(bonuses, row.RaceClass, "RACE_FINAL", "TIME", row.StageRank);
@@ -382,7 +377,7 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
                 && teamCounts.TryGetValue((row.StageId, row.TeamResultId.Value), out var count)
                 && count > 0)
             {
-                stagePoints = Math.Round(stagePoints / count, 2, MidpointRounding.ToEven);
+                stagePoints = decimal.Round(stagePoints / count, 2, MidpointRounding.ToEven);
             }
 
             points += stagePoints;
@@ -411,10 +406,10 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
                    COALESCE(c.CONSTANT, '') AS raw_code,
                    COALESCE(ct.CONSTANT, '') AS continent_code,
                    {nameExpression} AS country_name,
-                   COALESCE(c.gene_i_num_cyclist_WC, 0) AS world_road,
-                   COALESCE(c.gene_i_num_cyclist_WC_ITT, 0) AS world_time_trial,
-                   COALESCE(c.gene_i_num_cyclist_EC, 0) AS european_road,
-                   COALESCE(c.gene_i_num_cyclist_EC_ITT, 0) AS european_time_trial
+                   c.gene_i_num_cyclist_WC AS world_road,
+                   c.gene_i_num_cyclist_WC_ITT AS world_time_trial,
+                   c.gene_i_num_cyclist_EC AS european_road,
+                   c.gene_i_num_cyclist_EC_ITT AS european_time_trial
             FROM STA_country AS c
             LEFT JOIN STA_continent AS ct ON ct.IDcontinent = c.fkIDcontinent
             """;
@@ -440,20 +435,27 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
             reader.GetString(reader.GetOrdinal("raw_code")),
             reader.GetString(reader.GetOrdinal("continent_code")).Trim(),
             reader.IsDBNull(reader.GetOrdinal("country_name")) ? null : reader.GetString(reader.GetOrdinal("country_name")),
-            new CountryQuotaValues(
-                reader.GetInt64(reader.GetOrdinal("world_road")),
-                reader.GetInt64(reader.GetOrdinal("world_time_trial")),
-                reader.GetInt64(reader.GetOrdinal("european_road")),
-                reader.GetInt64(reader.GetOrdinal("european_time_trial"))));
+            new StoredCountryQuotaValues(
+                ReadStoredQuota(reader, "world_road"),
+                ReadStoredQuota(reader, "world_time_trial"),
+                ReadStoredQuota(reader, "european_road"),
+                ReadStoredQuota(reader, "european_time_trial")));
 
-    private static List<CountryRow> RankPositive(IEnumerable<CountryRow> countries, IReadOnlyDictionary<long, double> points) =>
+    private static long? ReadStoredQuota(SqliteDataReader reader, string field) => reader.GetValue(reader.GetOrdinal(field)) switch
+    {
+        DBNull => null,
+        long value => value,
+        _ => throw new InvalidDataException($"Country quota update cannot read {field} for country ID {reader.GetInt64(0)}. Expected a SQLite integer or NULL.")
+    };
+
+    private static List<CountryRow> RankPositive(IEnumerable<CountryRow> countries, IReadOnlyDictionary<long, decimal> points) =>
         countries.Where(country => points.GetValueOrDefault(country.Id) > 0)
             .OrderByDescending(country => points.GetValueOrDefault(country.Id))
             .ThenBy(static country => country.RawCode, StringComparer.OrdinalIgnoreCase)
             .ThenBy(static country => country.Id)
             .ToList();
 
-    private static double ResolvePoints(
+    private static decimal ResolvePoints(
         IReadOnlyDictionary<(string, string, string), int[]> bonuses,
         string raceClass,
         string source,
@@ -570,13 +572,18 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
     private static string CanonicalChange(CountryQuotaChange change) => string.Join(':',
         change.CountryId,
         Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(change.RawCode)),
-        MaintenanceSupport.CanonicalNumber(change.UciPoints),
+        change.UciPoints.ToString("G29", CultureInfo.InvariantCulture),
         change.WorldRank,
         change.EuropeanRank?.ToString(CultureInfo.InvariantCulture) ?? "N",
-        change.OldValues.WorldRoad, change.OldValues.WorldTimeTrial,
-        change.OldValues.EuropeanRoad, change.OldValues.EuropeanTimeTrial,
+        CanonicalStoredQuota(change.OldValues.WorldRoad),
+        CanonicalStoredQuota(change.OldValues.WorldTimeTrial),
+        CanonicalStoredQuota(change.OldValues.EuropeanRoad),
+        CanonicalStoredQuota(change.OldValues.EuropeanTimeTrial),
         change.NewValues.WorldRoad, change.NewValues.WorldTimeTrial,
         change.NewValues.EuropeanRoad, change.NewValues.EuropeanTimeTrial);
+
+    private static string CanonicalStoredQuota(long? value) =>
+        value?.ToString(CultureInfo.InvariantCulture) ?? "N";
 
     private static string CanonicalResult(ResultRow row) => string.Join(':',
         "result",
@@ -622,5 +629,5 @@ LEFT JOIN DYN_result_season_stage stage_result ON stage_result.IDresult_season_s
         string RaceClass,
         long CountryId);
 
-    private sealed record CountryRow(long Id, string RawCode, string Continent, string? Name, CountryQuotaValues Current);
+    private sealed record CountryRow(long Id, string RawCode, string Continent, string? Name, StoredCountryQuotaValues Current);
 }

@@ -835,7 +835,7 @@
                       <TextBlock FontSize="18" FontWeight="SemiBold" Text="Contract" />
                       <TextBlock x:Name="RiderContractTeamText" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="The selected team is written to the rider, current team, and previous team fields." />
                       <ComboBox x:Name="RiderRoleComboBox" Header="Role" SelectionChanged="RiderDraftRole_Changed" HorizontalAlignment="Stretch" AutomationProperties.AutomationId="RiderCreationRole" AutomationProperties.Name="Contract role" AutomationProperties.HelpText="Shows the English contract role and stored iRole code." />
-                      <NumberBox x:Name="RiderWageNumberBox" Header="Wage" Minimum="1" ValueChanged="RiderDraftNumber_Changed" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="RiderCreationWage" AutomationProperties.Name="Contract wage" />
+                      <TextBox x:Name="RiderWageTextBox" Header="Wage" TextChanged="RiderDraftText_Changed" AutomationProperties.AutomationId="RiderCreationWage" AutomationProperties.Name="Contract wage" />
                       <NumberBox x:Name="RiderContractEndYearNumberBox" Header="Contract end year" Minimum="1" ValueChanged="RiderDraftNumber_Changed" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="RiderCreationContractEndYear" AutomationProperties.Name="Contract end year" />
                       <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Contract start is stored as 0 and the new contract is active. These values match the open save's contract model." />
                     </StackPanel>

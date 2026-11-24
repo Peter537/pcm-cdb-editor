@@ -1,7 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
-using Microsoft.Data.Sqlite;
+using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
 using PcmCdbEditor.Infrastructure.Sqlite;
 
@@ -9,71 +9,83 @@ namespace PcmCdbEditor.Infrastructure.Maintenance;
 
 internal static class MaintenanceSupport
 {
-    public static Task<MaintenanceCapability> CheckAsync(
+    public static async Task<MaintenanceCapability> CheckAsync(
         string sqlitePath,
-        MaintenanceToolKind tool,
-        IReadOnlyDictionary<string, IReadOnlyCollection<string>> requirements,
-        IReadOnlyCollection<string> mutationTargets,
-        CancellationToken cancellationToken) =>
-        SqliteOperationRunner.RunAsync(
-            () => CheckCoreAsync(sqlitePath, tool, requirements, mutationTargets, cancellationToken),
-            cancellationToken);
-
-    private static async Task<MaintenanceCapability> CheckCoreAsync(
-        string sqlitePath,
-        MaintenanceToolKind tool,
-        IReadOnlyDictionary<string, IReadOnlyCollection<string>> requirements,
-        IReadOnlyCollection<string> mutationTargets,
+        Func<DatabaseSchemaCatalog, MaintenanceCapability> check,
         CancellationToken cancellationToken)
     {
-        await using var connection = SqliteSupport.CreateConnection(sqlitePath, SqliteOpenMode.ReadOnly);
-        using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
-                connection,
-                cancellationToken)
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(sqlitePath, cancellationToken)
             .ConfigureAwait(false);
-        var tables = await SqliteSupport.ReadTableNamesAsync(connection, cancellationToken).ConfigureAwait(false);
-        var missingTables = requirements.Keys.Where(table => !tables.Contains(table)).Order().ToArray();
+        return check(catalog);
+    }
+
+    public static async Task<DatabaseSchemaCatalog> RequireCatalogAsync(
+        string sqlitePath,
+        Func<DatabaseSchemaCatalog, MaintenanceCapability> check,
+        CancellationToken cancellationToken)
+    {
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(sqlitePath, cancellationToken)
+            .ConfigureAwait(false);
+        RequireEnabled(check(catalog));
+        return catalog;
+    }
+
+    public static MaintenanceCapability Check(
+        DatabaseSchemaCatalog catalog,
+        MaintenanceToolKind tool,
+        IReadOnlyDictionary<string, IReadOnlyCollection<string>> requirements,
+        IReadOnlyCollection<string> mutationTargets,
+        Func<TableSchema, string?>? validateTarget = null)
+    {
+        var missingTables = new List<string>();
         var missingColumns = new List<string>();
-        foreach (var requirement in requirements.Where(pair => tables.Contains(pair.Key)))
+        foreach (var (tableName, requiredColumns) in requirements)
         {
-            var columns = await SqliteSupport.ReadColumnNamesAsync(connection, requirement.Key, cancellationToken)
-                .ConfigureAwait(false);
-            missingColumns.AddRange(requirement.Value
+            if (!catalog.TryGetTable(tableName, out TableSchema? table))
+            {
+                missingTables.Add(tableName);
+                continue;
+            }
+
+            var columns = table.Columns.Select(static column => column.Name)
+                .ToHashSet(SqliteIdentifierComparer.Instance);
+            missingColumns.AddRange(requiredColumns
                 .Where(column => !columns.Contains(column))
-                .Select(column => $"{requirement.Key}.{column}"));
+                .Select(column => $"{tableName}.{column}"));
         }
 
         var reasons = new List<string>();
-        if (missingTables.Length != 0 || missingColumns.Count != 0)
+        if (missingTables.Count != 0 || missingColumns.Count != 0)
         {
             reasons.Add("The database does not expose the complete schema required by this tool.");
         }
 
-        DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
-            .DiscoverAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
-        foreach (string target in mutationTargets.Where(target => tables.Contains(target)))
+        foreach (string target in mutationTargets)
         {
-            if (!catalog.TryGetTable(target, out TableSchema? table) ||
-                table.ObjectKind != TableObjectKind.Table ||
-                table.EditCapability != TableEditCapability.Editable)
+            if (!catalog.TryGetTable(target, out TableSchema? table))
+            {
+                continue;
+            }
+
+            if (table.ObjectKind != TableObjectKind.Table || table.EditCapability != TableEditCapability.Editable)
             {
                 reasons.Add(
                     $"The mutation target '{target}' must be an ordinary editable table with a stable row identity.");
             }
+            else if (validateTarget?.Invoke(table) is { } reason)
+            {
+                reasons.Add(reason);
+            }
         }
 
-        var enabled = missingTables.Length == 0 && missingColumns.Count == 0 && reasons.Count == 0;
-        return new MaintenanceCapability(tool, enabled, reasons, missingTables, missingColumns.Order());
+        return new MaintenanceCapability(tool, reasons.Count == 0, reasons, missingTables.Order(), missingColumns.Order());
     }
 
     public static void RequireEnabled(MaintenanceCapability capability)
     {
         if (!capability.IsEnabled)
         {
-            throw new InvalidOperationException(string.Join(
-                " ",
-                capability.Reasons.Concat(capability.MissingTables).Concat(capability.MissingColumns)));
+            throw new MaintenanceCapabilityException(capability);
         }
     }
 

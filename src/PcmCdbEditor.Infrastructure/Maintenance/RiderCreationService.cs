@@ -63,7 +63,7 @@ public sealed class RiderCreationService : IRiderCreationService
             "fkIDyear_progression"
         }.Concat(AbilityDefinitions.SelectMany(static ability =>
             new[] { ability.CurrentColumn, ability.LimitColumn })),
-        StringComparer.OrdinalIgnoreCase);
+        SqliteIdentifierComparer.Instance);
 
     private static readonly HashSet<string> CoreContractColumns = new(
         [
@@ -77,7 +77,7 @@ public sealed class RiderCreationService : IRiderCreationService
             "gene_b_active_contract",
             "iRole"
         ],
-        StringComparer.OrdinalIgnoreCase);
+        SqliteIdentifierComparer.Instance);
 
     private static readonly HashSet<string> KnownRiderColumns = new(
         new[]
@@ -101,14 +101,14 @@ public sealed class RiderCreationService : IRiderCreationService
             "gene_i_nb_lombardia"
         }.Concat(AbilityDefinitions.SelectMany(static ability =>
             new[] { ability.CurrentColumn, ability.LimitColumn })),
-        StringComparer.OrdinalIgnoreCase);
+        SqliteIdentifierComparer.Instance);
 
     private static readonly HashSet<string> KnownContractColumns = new(
         [
             ContractIdentity, "fkIDcyclist", "fkIDteam", "fkIDprevteam", "finan_i_period_wage",
             "iYearBegin", "iYearEnd", "gene_b_active_contract", "iRole"
         ],
-        StringComparer.OrdinalIgnoreCase);
+        SqliteIdentifierComparer.Instance);
 
     private static readonly string[] PreferenceWeightColumns =
         ["iWeight_Salary", "iWeight_Nationality", "iWeight_Role"];
@@ -120,7 +120,7 @@ public sealed class RiderCreationService : IRiderCreationService
         string sqlitePath,
         CancellationToken cancellationToken) =>
         SqliteOperationRunner.RunAsync(
-            () => CheckCapabilityCoreAsync(sqlitePath, cancellationToken),
+            async () => (await InspectAsync(sqlitePath, cancellationToken).ConfigureAwait(false)).Capability,
             cancellationToken);
 
     public Task<RiderCreationDraft> PrepareAsync(
@@ -156,30 +156,45 @@ public sealed class RiderCreationService : IRiderCreationService
             () => ApplyCoreAsync(sqlitePath, preview, cancellationToken),
             cancellationToken);
 
-    private static async Task<MaintenanceCapability> CheckCapabilityCoreAsync(
+    private static async Task<(DatabaseSchemaCatalog Catalog, MaintenanceCapability Capability)> InspectAsync(
         string sqlitePath,
         CancellationToken cancellationToken)
     {
         DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
             .DiscoverAsync(sqlitePath, cancellationToken)
             .ConfigureAwait(false);
+        MaintenanceCapability capability = await CheckCapabilityCoreAsync(sqlitePath, catalog, cancellationToken)
+            .ConfigureAwait(false);
+        return (catalog, capability);
+    }
+
+    private static async Task<DatabaseSchemaCatalog> RequireCatalogAsync(
+        string sqlitePath,
+        CancellationToken cancellationToken)
+    {
+        (DatabaseSchemaCatalog catalog, MaintenanceCapability capability) = await InspectAsync(sqlitePath, cancellationToken)
+            .ConfigureAwait(false);
+        MaintenanceSupport.RequireEnabled(capability);
+        return catalog;
+    }
+
+    private static async Task<MaintenanceCapability> CheckCapabilityCoreAsync(
+        string sqlitePath,
+        DatabaseSchemaCatalog catalog,
+        CancellationToken cancellationToken)
+    {
         var requirements = Requirements.ToDictionary(
             static pair => pair.Key,
             static pair => pair.Value,
-            StringComparer.OrdinalIgnoreCase);
+            SqliteIdentifierComparer.Instance);
         if (catalog.TryGetTable(RiderTable, out TableSchema? rider)
-            && rider.Columns.Any(static column => column.Name.Equals(PreferenceColumn, StringComparison.OrdinalIgnoreCase)))
+            && rider.Columns.Any(static column => SqliteIdentifierComparer.Instance.Equals(column.Name, PreferenceColumn)))
         {
             requirements.Add(PreferenceTable, ["IDcontract_preference_preset"]);
         }
 
-        MaintenanceCapability basic = await MaintenanceSupport.CheckAsync(
-                sqlitePath,
-                MaintenanceToolKind.RiderCreation,
-                requirements,
-                [RiderTable, ContractTable],
-                cancellationToken)
-            .ConfigureAwait(false);
+        MaintenanceCapability basic = MaintenanceSupport.Check(
+            catalog, MaintenanceToolKind.RiderCreation, requirements, [RiderTable, ContractTable]);
         if (!basic.IsEnabled)
         {
             return basic;
@@ -225,7 +240,7 @@ public sealed class RiderCreationService : IRiderCreationService
             _ = await ReadSaveDateAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
             _ = await ReadFreeStateIdAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
             ColumnSchema? preferenceColumn = riderSchema.Columns.FirstOrDefault(static column =>
-                column.Name.Equals(PreferenceColumn, StringComparison.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance.Equals(column.Name, PreferenceColumn));
             if (preferenceColumn is not null)
             {
                 if (preferenceColumn.IsGenerated || preferenceColumn.IsHidden)
@@ -253,16 +268,11 @@ public sealed class RiderCreationService : IRiderCreationService
                 basic.MissingColumns);
     }
 
-    private async Task<RiderCreationDraft> PrepareCoreAsync(
+    private static async Task<RiderCreationDraft> PrepareCoreAsync(
         string sqlitePath,
         CancellationToken cancellationToken)
     {
-        MaintenanceCapability capability = await CheckCapabilityAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
-        MaintenanceSupport.RequireEnabled(capability);
-        DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
-            .DiscoverAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
+        DatabaseSchemaCatalog catalog = await RequireCatalogAsync(sqlitePath, cancellationToken).ConfigureAwait(false);
         await using var connection = SqliteSupport.CreateConnection(sqlitePath, SqliteOpenMode.ReadOnly);
         using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
                 connection,
@@ -291,7 +301,7 @@ public sealed class RiderCreationService : IRiderCreationService
             maximumWeight);
     }
 
-    private async Task<IReadOnlyList<RiderLookupOption>> SearchLookupCoreAsync(
+    private static async Task<IReadOnlyList<RiderLookupOption>> SearchLookupCoreAsync(
         string sqlitePath,
         RiderLookupTarget target,
         string query,
@@ -304,17 +314,12 @@ public sealed class RiderCreationService : IRiderCreationService
             throw new ArgumentOutOfRangeException(nameof(maxResults), "Lookup searches return between 1 and 50 rows.");
         }
 
-        MaintenanceCapability capability = await CheckCapabilityAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
-        MaintenanceSupport.RequireEnabled(capability);
-        DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
-            .DiscoverAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
+        DatabaseSchemaCatalog catalog = await RequireCatalogAsync(sqlitePath, cancellationToken).ConfigureAwait(false);
         ValidateLookupTarget(catalog, target);
         TableSchema targetSchema = RequireTable(catalog, target.TargetTable);
         string? displayColumn = target.DisplayColumn;
         if (displayColumn is not null && !targetSchema.Columns.Any(column =>
-                column.Name.Equals(displayColumn, StringComparison.OrdinalIgnoreCase)))
+                SqliteIdentifierComparer.Instance.Equals(column.Name, displayColumn)))
         {
             throw new ArgumentException("The lookup display column is no longer available.", nameof(target));
         }
@@ -332,12 +337,12 @@ public sealed class RiderCreationService : IRiderCreationService
             : $"COALESCE(CAST(target.{SqliteSupport.QuoteIdentifier(displayColumn)} AS TEXT), '')";
         string contextExpression = "NULL";
         var textSearchExpressions = new List<string> { displayExpression };
-        if (target.TargetTable.Equals(RaceTable, StringComparison.OrdinalIgnoreCase))
+        if (SqliteIdentifierComparer.Instance.Equals(target.TargetTable, RaceTable))
         {
             foreach (string optionalSearchColumn in new[] { "gene_sz_abbreviation", "CONSTANT" })
             {
                 if (targetSchema.Columns.Any(column =>
-                        column.Name.Equals(optionalSearchColumn, StringComparison.OrdinalIgnoreCase)))
+                        SqliteIdentifierComparer.Instance.Equals(column.Name, optionalSearchColumn)))
                 {
                     textSearchExpressions.Add(
                         $"COALESCE(CAST(target.{SqliteSupport.QuoteIdentifier(optionalSearchColumn)} AS TEXT), '')");
@@ -346,13 +351,13 @@ public sealed class RiderCreationService : IRiderCreationService
 
             contextExpression = BuildRaceLookupContext(catalog, targetSchema, "target");
         }
-        else if (target.TargetTable.Equals(RegionTable, StringComparison.OrdinalIgnoreCase))
+        else if (SqliteIdentifierComparer.Instance.Equals(target.TargetTable, RegionTable))
         {
             contextExpression = OptionalLookupLabel(catalog, targetSchema, "target", "fkIDcountry", CountryTable, "IDcountry");
         }
-        else if (target.TargetTable.Equals(PreferenceTable, StringComparison.OrdinalIgnoreCase)
+        else if (SqliteIdentifierComparer.Instance.Equals(target.TargetTable, PreferenceTable)
                  && PreferenceWeightColumns.All(name =>
-                     targetSchema.Columns.Any(column => column.Name.Equals(name, StringComparison.OrdinalIgnoreCase))))
+                     targetSchema.Columns.Any(column => SqliteIdentifierComparer.Instance.Equals(column.Name, name))))
         {
             displayExpression = $"'Preset ' || CAST(target.{quotedId} AS TEXT)";
             contextExpression = "'Salary ' || target.iWeight_Salary || ', nationality ' || target.iWeight_Nationality || ', role ' || target.iWeight_Role";
@@ -372,7 +377,7 @@ public sealed class RiderCreationService : IRiderCreationService
         else if (!string.IsNullOrWhiteSpace(query))
         {
             predicate = $"({string.Join(" OR ", textSearchExpressions.Select(static expression => $"{expression} LIKE $query ESCAPE '\\' COLLATE NOCASE"))})";
-            command.Parameters.AddWithValue("$query", $"%{EscapeLike(query.Trim())}%");
+            command.Parameters.AddWithValue("$query", $"%{SqliteSupport.EscapeLikeLiteral(query.Trim())}%");
         }
         else
         {
@@ -405,18 +410,13 @@ public sealed class RiderCreationService : IRiderCreationService
         return options.AsReadOnly();
     }
 
-    private async Task<RiderCreationPreview> PreviewCoreAsync(
+    private static async Task<RiderCreationPreview> PreviewCoreAsync(
         string sqlitePath,
         RiderCreationInput input,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
-        MaintenanceCapability capability = await CheckCapabilityAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
-        MaintenanceSupport.RequireEnabled(capability);
-        DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
-            .DiscoverAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
+        DatabaseSchemaCatalog catalog = await RequireCatalogAsync(sqlitePath, cancellationToken).ConfigureAwait(false);
         await using var connection = SqliteSupport.CreateConnection(sqlitePath, SqliteOpenMode.ReadOnly);
         using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
                 connection,
@@ -427,7 +427,7 @@ public sealed class RiderCreationService : IRiderCreationService
             .ConfigureAwait(false);
     }
 
-    private async Task<MaintenanceApplyResult> ApplyCoreAsync(
+    private static async Task<MaintenanceApplyResult> ApplyCoreAsync(
         string sqlitePath,
         RiderCreationPreview preview,
         CancellationToken cancellationToken)
@@ -440,12 +440,7 @@ public sealed class RiderCreationService : IRiderCreationService
                 "Acknowledge the unverified in-game handling of blank ability limits before creating the rider.");
         }
 
-        MaintenanceCapability capability = await CheckCapabilityAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
-        MaintenanceSupport.RequireEnabled(capability);
-        DatabaseSchemaCatalog catalog = await new SqliteTableCatalog()
-            .DiscoverAsync(sqlitePath, cancellationToken)
-            .ConfigureAwait(false);
+        DatabaseSchemaCatalog catalog = await RequireCatalogAsync(sqlitePath, cancellationToken).ConfigureAwait(false);
         TableSchema riderSchema = RequireTable(catalog, RiderTable);
         TableSchema contractSchema = RequireTable(catalog, ContractTable);
 
@@ -673,7 +668,7 @@ public sealed class RiderCreationService : IRiderCreationService
         if (riderValues.TryGetValue(PreferenceColumn, out SqliteValue preferenceValue))
         {
             ColumnSchema preferenceColumn = riderSchema.Columns.First(static column =>
-                column.Name.Equals(PreferenceColumn, StringComparison.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance.Equals(column.Name, PreferenceColumn));
             ValidatePreferenceValue(preferenceColumn, preferenceValue);
             preferenceRevision = "NULL";
             if (preferenceValue.Kind == SqliteValueKind.Integer)
@@ -794,7 +789,7 @@ public sealed class RiderCreationService : IRiderCreationService
         var revisions = new List<string>();
         foreach ((string columnName, SqliteValue value) in overrides.OrderBy(
                      static pair => pair.Key,
-                     StringComparer.OrdinalIgnoreCase))
+                     SqliteIdentifierComparer.Instance))
         {
             if (value.Kind != SqliteValueKind.Integer || value.IntegerValue <= 0)
             {
@@ -802,7 +797,7 @@ public sealed class RiderCreationService : IRiderCreationService
             }
 
             ColumnSchema? column = sourceSchema.Columns.FirstOrDefault(candidate =>
-                candidate.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance.Equals(candidate.Name, columnName));
             if (column is null)
             {
                 continue;
@@ -839,7 +834,7 @@ public sealed class RiderCreationService : IRiderCreationService
     {
         TableSchema raceSchema = RequireTable(catalog, RaceTable);
         string displayColumn = raceSchema.Columns.First(column =>
-            column.Name.Equals("gene_sz_race_name", StringComparison.OrdinalIgnoreCase)).Name;
+            SqliteIdentifierComparer.Instance.Equals(column.Name, "gene_sz_race_name")).Name;
         string contextExpression = BuildRaceLookupContext(catalog, raceSchema, "race");
         var options = new List<RiderLookupOption>(raceIds.Count);
         foreach (long raceId in raceIds)
@@ -902,7 +897,7 @@ public sealed class RiderCreationService : IRiderCreationService
 
     private static Dictionary<string, SqliteValue> CreateDefaultValues(TableSchema schema, long freeStateId)
     {
-        var values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+        var values = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
         foreach (ColumnSchema column in schema.Columns.Where(static column => !column.IsGenerated && !column.IsHidden))
         {
             bool isPreference = IsPreferenceColumn(schema.Name, column.Name);
@@ -920,8 +915,8 @@ public sealed class RiderCreationService : IRiderCreationService
     }
 
     private static bool IsPreferenceColumn(string tableName, string columnName) =>
-        tableName.Equals(RiderTable, StringComparison.OrdinalIgnoreCase)
-        && columnName.Equals(PreferenceColumn, StringComparison.OrdinalIgnoreCase);
+        SqliteIdentifierComparer.Instance.Equals(tableName, RiderTable)
+        && SqliteIdentifierComparer.Instance.Equals(columnName, PreferenceColumn);
 
     private static SqliteValue ResolvePreferenceDefault(ColumnSchema column)
     {
@@ -995,8 +990,8 @@ public sealed class RiderCreationService : IRiderCreationService
             string targetColumn = reader.IsDBNull(1)
                 ? targetPrimaryKey.Length == 1 ? targetPrimaryKey[0].Name : string.Empty
                 : reader.GetString(1);
-            if (!reader.GetString(0).Equals(PreferenceTable, StringComparison.OrdinalIgnoreCase)
-                || !targetColumn.Equals("IDcontract_preference_preset", StringComparison.OrdinalIgnoreCase))
+            if (!SqliteIdentifierComparer.Instance.Equals(reader.GetString(0), PreferenceTable)
+                || !SqliteIdentifierComparer.Instance.Equals(targetColumn, "IDcontract_preference_preset"))
             {
                 throw new InvalidDataException(
                     $"Create Rider cannot safely resolve the declared foreign key for '{RiderTable}.{PreferenceColumn}'. "
@@ -1012,9 +1007,9 @@ public sealed class RiderCreationService : IRiderCreationService
             return SqliteValue.Null;
         }
 
-        if (tableName.Equals(ContractTable, StringComparison.OrdinalIgnoreCase))
+        if (SqliteIdentifierComparer.Instance.Equals(tableName, ContractTable))
         {
-            return column.Name.ToLowerInvariant() switch
+            return SqliteIdentifierComparer.ToLowerAscii(column.Name) switch
             {
                 "iyearbegin" => SqliteValue.Integer(0),
                 "gene_b_active_contract" => SqliteValue.Integer(1),
@@ -1027,7 +1022,7 @@ public sealed class RiderCreationService : IRiderCreationService
             return SqliteValue.Null;
         }
 
-        return column.Name.ToLowerInvariant() switch
+        return SqliteIdentifierComparer.ToLowerAscii(column.Name) switch
         {
             "gene_sz_firstname" or "gene_sz_lastname" or "gene_sz_firstlastname"
                 or "gene_sz_photo" or "gene_sz_soundname" or "constant" => SqliteValue.Text(string.Empty),
@@ -1054,7 +1049,7 @@ public sealed class RiderCreationService : IRiderCreationService
     {
         Dictionary<string, ColumnSchema> insertable = schema.Columns
             .Where(static column => !column.IsGenerated && !column.IsHidden)
-            .ToDictionary(static column => column.Name, StringComparer.OrdinalIgnoreCase);
+            .ToDictionary(static column => column.Name, SqliteIdentifierComparer.Instance);
         foreach ((string name, SqliteValue value) in overrides)
         {
             if (!insertable.TryGetValue(name, out ColumnSchema? column))
@@ -1111,13 +1106,13 @@ public sealed class RiderCreationService : IRiderCreationService
         ColumnSchema column)
     {
         ForeignKeyRelation[] relations = source.Relationships.Where(candidate =>
-                candidate.SourceColumn.Equals(column.Name, StringComparison.OrdinalIgnoreCase))
+                SqliteIdentifierComparer.Instance.Equals(candidate.SourceColumn, column.Name))
             .Take(2)
             .ToArray();
         if (relations is [{ IsComposite: false } relation]
             && catalog.TryGetTable(relation.TargetTable, out TableSchema? target)
             && target.Columns.Any(candidate => !candidate.IsHidden
-                && candidate.Name.Equals(relation.TargetColumn, StringComparison.OrdinalIgnoreCase)))
+                && SqliteIdentifierComparer.Instance.Equals(candidate.Name, relation.TargetColumn)))
         {
             return new RiderLookupTarget(
                 source.Name,
@@ -1133,7 +1128,7 @@ public sealed class RiderCreationService : IRiderCreationService
             return null;
         }
 
-        (string Table, string Id)? known = column.Name.ToLowerInvariant() switch
+        (string Table, string Id)? known = SqliteIdentifierComparer.ToLowerAscii(column.Name) switch
         {
             "fkidteam" => (TeamTable, "IDteam"),
             "fkidregion" => (RegionTable, "IDregion"),
@@ -1161,7 +1156,7 @@ public sealed class RiderCreationService : IRiderCreationService
     {
         TableSchema rider = RequireTable(catalog, RiderTable);
         ColumnSchema column = rider.Columns.First(candidate =>
-            candidate.Name.Equals("gene_ilist_fkIDfavorite_races", StringComparison.OrdinalIgnoreCase));
+            SqliteIdentifierComparer.Instance.Equals(candidate.Name, "gene_ilist_fkIDfavorite_races"));
         return ResolveLookupTarget(catalog, rider, column)
             ?? throw new InvalidDataException("The favorite-race lookup relationship is unavailable.");
     }
@@ -1170,7 +1165,7 @@ public sealed class RiderCreationService : IRiderCreationService
     {
         TableSchema source = RequireTable(catalog, target.SourceTable);
         ColumnSchema? sourceColumn = source.Columns.FirstOrDefault(column =>
-            column.Name.Equals(target.SourceColumn, StringComparison.OrdinalIgnoreCase));
+            SqliteIdentifierComparer.Instance.Equals(column.Name, target.SourceColumn));
         if (sourceColumn is null)
         {
             throw new ArgumentException("The lookup source column is unavailable.", nameof(target));
@@ -1178,8 +1173,8 @@ public sealed class RiderCreationService : IRiderCreationService
 
         RiderLookupTarget? discovered = ResolveLookupTarget(catalog, source, sourceColumn);
         if (discovered is null
-            || !discovered.TargetTable.Equals(target.TargetTable, StringComparison.OrdinalIgnoreCase)
-            || !discovered.TargetColumn.Equals(target.TargetColumn, StringComparison.OrdinalIgnoreCase))
+            || !SqliteIdentifierComparer.Instance.Equals(discovered.TargetTable, target.TargetTable)
+            || !SqliteIdentifierComparer.Instance.Equals(discovered.TargetColumn, target.TargetColumn))
         {
             throw new ArgumentException("The lookup relationship is unavailable or ambiguous.", nameof(target));
         }
@@ -1194,7 +1189,7 @@ public sealed class RiderCreationService : IRiderCreationService
                  })
         {
             ColumnSchema? match = table.Columns.FirstOrDefault(column =>
-                column.Name.Equals(candidate, StringComparison.OrdinalIgnoreCase));
+                SqliteIdentifierComparer.Instance.Equals(column.Name, candidate));
             if (match is not null)
             {
                 return match.Name;
@@ -1215,9 +1210,9 @@ public sealed class RiderCreationService : IRiderCreationService
         DatabaseSchemaCatalog catalog, TableSchema source, string sourceAlias, string sourceColumn,
         string targetTable, string targetColumn)
     {
-        if (!source.Columns.Any(column => column.Name.Equals(sourceColumn, StringComparison.OrdinalIgnoreCase)) ||
+        if (!source.Columns.Any(column => SqliteIdentifierComparer.Instance.Equals(column.Name, sourceColumn)) ||
             !catalog.TryGetTable(targetTable, out TableSchema? target) ||
-            !target.Columns.Any(column => column.Name.Equals(targetColumn, StringComparison.OrdinalIgnoreCase)) ||
+            !target.Columns.Any(column => SqliteIdentifierComparer.Instance.Equals(column.Name, targetColumn)) ||
             ResolveDisplayColumn(target) is not { } label)
         {
             return "NULL";
@@ -1258,7 +1253,7 @@ public sealed class RiderCreationService : IRiderCreationService
         List<string> reasons)
     {
         ColumnSchema? column = schema.Columns.FirstOrDefault(candidate =>
-            candidate.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+            SqliteIdentifierComparer.Instance.Equals(candidate.Name, columnName));
         if (column is not null && !allowedAffinities.Contains(column.Affinity))
         {
             reasons.Add(
@@ -1274,7 +1269,7 @@ public sealed class RiderCreationService : IRiderCreationService
     {
         TableSchema table = RequireTable(catalog, tableName);
         ColumnSchema? identity = table.Columns.FirstOrDefault(column =>
-            column.Name.Equals(identityColumn, StringComparison.OrdinalIgnoreCase));
+            SqliteIdentifierComparer.Instance.Equals(column.Name, identityColumn));
         if (identity?.Affinity != SqliteAffinity.Integer)
         {
             reasons.Add($"'{tableName}.{identityColumn}' must have integer affinity.");
@@ -1473,7 +1468,7 @@ public sealed class RiderCreationService : IRiderCreationService
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            var values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase);
+            var values = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance);
             for (var ordinal = 0; ordinal < columns.Length; ordinal++)
             {
                 values.Add(columns[ordinal].Name, MaintenanceHistoryCapture.ReadValue(reader, ordinal));
@@ -1605,7 +1600,7 @@ public sealed class RiderCreationService : IRiderCreationService
             "fkIDyear_progression",
             .. AbilityDefinitions.SelectMany(static ability => new[] { ability.CurrentColumn, ability.LimitColumn })
         ];
-        return new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        return new Dictionary<string, IReadOnlyCollection<string>>(SqliteIdentifierComparer.Instance)
         {
             [RiderTable] = riderColumns,
             [ContractTable] =
@@ -1671,11 +1666,7 @@ public sealed class RiderCreationService : IRiderCreationService
     private static IEnumerable<string> CanonicalMap(
         string prefix,
         IReadOnlyDictionary<string, SqliteValue> values) =>
-        values.OrderBy(static pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+        values.OrderBy(static pair => pair.Key, SqliteIdentifierComparer.Instance)
             .Select(pair => $"{prefix}:{pair.Key}:{MaintenanceSupport.CanonicalValue(pair.Value)}");
 
-    private static string EscapeLike(string value) =>
-        value.Replace("\\", "\\\\", StringComparison.Ordinal)
-            .Replace("%", "\\%", StringComparison.Ordinal)
-            .Replace("_", "\\_", StringComparison.Ordinal);
 }

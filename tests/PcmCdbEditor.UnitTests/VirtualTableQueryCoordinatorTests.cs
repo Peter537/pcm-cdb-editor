@@ -332,6 +332,69 @@ public sealed class VirtualTableQueryCoordinatorTests
         Assert.AreEqual(222L, secondResult.Value);
     }
 
+    [TestMethod]
+    public async Task AnOlderCountCannotReplaceOrReturnAfterANewerCount()
+    {
+        var store = new RecordingTableDataStore { BlockCount = true, IgnoreCountCancellation = true };
+        using var coordinator = CreateCoordinator(store);
+        Task<TableRowCountState> older = coordinator.LoadCountAsync(CancellationToken.None);
+        await store.CountStarted.Task.ConfigureAwait(false);
+
+        store.BlockCount = false;
+        store.CountResult = 222;
+        Assert.AreEqual(222L, (await coordinator.LoadCountAsync(CancellationToken.None).ConfigureAwait(false)).Value);
+
+        store.CountResult = 111;
+        store.ReleaseCount.TrySetResult();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => older).ConfigureAwait(false);
+        Assert.AreEqual(222L, coordinator.CountState.Value);
+    }
+
+    [TestMethod]
+    public async Task CancelledCallCannotReadOrMutateACachedChunkOrCount()
+    {
+        var store = new RecordingTableDataStore();
+        using var coordinator = CreateCoordinator(store);
+        var chunk = await coordinator.LoadChunkContainingAsync(0, CancellationToken.None).ConfigureAwait(false);
+        var count = await coordinator.LoadCountAsync(CancellationToken.None).ConfigureAwait(false);
+        var cancelled = new CancellationToken(canceled: true);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => coordinator.LoadChunkContainingAsync(0, cancelled))
+            .ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => coordinator.LoadCountAsync(cancelled))
+            .ConfigureAwait(false);
+        Assert.AreSame(chunk, coordinator.Chunks.Single());
+        Assert.AreSame(count, coordinator.CountState);
+        Assert.AreEqual(1, store.RowQueryCalls);
+        Assert.AreEqual(1, store.CountCalls);
+    }
+
+    [TestMethod]
+    public async Task ExactlyFullChunkRetainsTheStoreContinuationEvidence()
+    {
+        var store = new RecordingTableDataStore { ChunkHasMore = false };
+        using var coordinator = CreateCoordinator(store);
+        var finalChunk = await coordinator.LoadChunkContainingAsync(0, CancellationToken.None).ConfigureAwait(false);
+
+        int size = VirtualTableQueryCoordinator.ChunkSize;
+        Assert.AreEqual(size, finalChunk.Items.Count);
+        Assert.IsTrue(finalChunk.HasMoreAfter(size - 1));
+        Assert.IsFalse(finalChunk.HasMoreAfter(size));
+        Assert.AreSame(finalChunk, await coordinator.LoadChunkContainingAsync(size - 1, CancellationToken.None)
+            .ConfigureAwait(false));
+        Assert.AreEqual(TableRowCountStatus.Unknown,
+            TableRowCountState.Available(size + 1).ReconcileWithPage(0, size, finalChunk.HasMore).Status);
+        Assert.AreEqual(TableRowCountStatus.Available,
+            TableRowCountState.Available(size).ReconcileWithPage(0, size, finalChunk.HasMore).Status);
+
+        coordinator.Invalidate();
+        store.ChunkHasMore = true;
+        var nonfinalChunk = await coordinator.LoadChunkContainingAsync(0, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsTrue(nonfinalChunk.HasMoreAfter(size));
+        Assert.AreEqual(TableRowCountStatus.Unknown,
+            TableRowCountState.Available(size).ReconcileWithPage(0, size, nonfinalChunk.HasMore).Status);
+    }
+
     private static VirtualTableQueryCoordinator CreateCoordinator(
         RecordingTableDataStore store,
         TableQuery? query = null)
@@ -381,6 +444,8 @@ public sealed class VirtualTableQueryCoordinatorTests
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         public bool BlockCount { get; set; }
+
+        public bool ChunkHasMore { get; set; } = true;
 
         public bool BlockRows { get; set; }
 
@@ -434,7 +499,7 @@ public sealed class VirtualTableQueryCoordinatorTests
             var rows = Enumerable.Range(0, query.Page.Limit)
                 .Select(index => CreateRow(query.Page.Offset + index))
                 .ToArray();
-            return new TableSlice(query.TableName, query.Page, rows, hasMore: true);
+            return new TableSlice(query.TableName, query.Page, rows, ChunkHasMore);
         }
 
         public async Task<IReadOnlyList<TypedRow>> QueryAllRowsAsync(

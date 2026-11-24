@@ -2,17 +2,26 @@ namespace PcmCdbEditor.Application;
 
 public sealed class VirtualChunk<T>
 {
-    public VirtualChunk(long offset, IEnumerable<T> items)
+    public VirtualChunk(long offset, IEnumerable<T> items, bool hasMore = false)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
 
         Offset = offset;
         Items = Array.AsReadOnly((items ?? throw new ArgumentNullException(nameof(items))).ToArray());
+        HasMore = hasMore;
     }
 
     public long Offset { get; }
 
     public IReadOnlyList<T> Items { get; }
+
+    public bool HasMore { get; }
+
+    public bool HasMoreAfter(int consumedItems)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(consumedItems);
+        return consumedItems < Items.Count || HasMore;
+    }
 }
 
 public sealed class BoundedVirtualWindow<T>

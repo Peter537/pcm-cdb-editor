@@ -12,6 +12,32 @@ namespace PcmCdbEditor.IntegrationTests;
 [TestClass]
 public sealed class RiderCreationServiceTests
 {
+    [TestMethod]
+    public async Task PersistedWageAndAdvancedNumericValuesKeepTheFullIntegerRange()
+    {
+        const long exactNumeric = 9_007_199_254_740_993L;
+        await using var database = await CreateDatabaseAsync(
+            riderExtraColumn: "edge_integer INTEGER, edge_numeric NUMERIC").ConfigureAwait(false);
+        var service = new RiderCreationService();
+        RiderCreationInput input = CreateInput(true,
+            riderAdvanced:
+            [
+                KeyValuePair.Create("edge_integer", SqliteValue.Integer(long.MinValue)),
+                KeyValuePair.Create("edge_numeric", SqliteValue.Integer(exactNumeric)),
+            ],
+            wage: long.MaxValue);
+        RiderCreationPreview preview = await service.PreviewAsync(database.Path, input, CancellationToken.None)
+            .ConfigureAwait(false);
+        await service.ApplyAsync(database.Path, preview, CancellationToken.None).ConfigureAwait(false);
+
+        Assert.AreEqual(long.MinValue, await database.ScalarAsync<long>(
+            "SELECT edge_integer FROM DYN_cyclist WHERE edge_integer IS NOT NULL").ConfigureAwait(false));
+        Assert.AreEqual(exactNumeric, await database.ScalarAsync<long>(
+            "SELECT edge_numeric FROM DYN_cyclist WHERE edge_numeric IS NOT NULL").ConfigureAwait(false));
+        Assert.AreEqual(long.MaxValue, await database.ScalarAsync<long>(
+            "SELECT MAX(finan_i_period_wage) FROM DYN_contract_cyclist").ConfigureAwait(false));
+    }
+
     private static readonly string[] AbilityKeys =
     [
         "plain", "mountain", "medium_mountain", "downhilling", "cobble", "timetrial",
@@ -500,9 +526,9 @@ public sealed class RiderCreationServiceTests
         Assert.IsTrue(capability.Reasons.Any(static reason =>
             reason.Contains("cannot safely resolve the database default expression", StringComparison.Ordinal)
             && reason.Contains("DYN_cyclist.fkIDcontract_preference_preset", StringComparison.Ordinal)));
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.PrepareAsync(
+        await Assert.ThrowsExactlyAsync<MaintenanceCapabilityException>(() => service.PrepareAsync(
             database.Path, CancellationToken.None)).ConfigureAwait(false);
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.PreviewAsync(
+        await Assert.ThrowsExactlyAsync<MaintenanceCapabilityException>(() => service.PreviewAsync(
             database.Path, CreateInput(true), CancellationToken.None)).ConfigureAwait(false);
         Assert.AreEqual(0L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
     }
@@ -573,9 +599,9 @@ public sealed class RiderCreationServiceTests
         Assert.IsFalse(capability.IsEnabled);
         Assert.IsTrue(capability.Reasons.Any(reason => reason.Contains(expectedReason, StringComparison.Ordinal)
             && reason.Contains("DYN_cyclist.fkIDcontract_preference_preset", StringComparison.Ordinal)));
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.PrepareAsync(
+        await Assert.ThrowsExactlyAsync<MaintenanceCapabilityException>(() => service.PrepareAsync(
             database.Path, CancellationToken.None)).ConfigureAwait(false);
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.PreviewAsync(
+        await Assert.ThrowsExactlyAsync<MaintenanceCapabilityException>(() => service.PreviewAsync(
             database.Path, CreateInput(true), CancellationToken.None)).ConfigureAwait(false);
         Assert.AreEqual(0L, await database.ScalarAsync<long>("SELECT COUNT(*) FROM DYN_cyclist").ConfigureAwait(false));
     }
@@ -844,6 +870,26 @@ public sealed class RiderCreationServiceTests
             && field.Column.Name.Equals(column, StringComparison.OrdinalIgnoreCase)).LookupTarget
         ?? throw new AssertFailedException($"{table}.{column} should expose a lookup target.");
 
+    [TestMethod]
+    public async Task DistinctNonAsciiAdvancedColumnsRemainSeparateThroughPreviewAndApply()
+    {
+        await using var database = await CreateDatabaseAsync(riderExtraColumn: """
+            "É" TEXT, "é" TEXT
+            """).ConfigureAwait(false);
+        var service = new RiderCreationService();
+        var input = CreateInput(acknowledgeMissingLimits: true,
+            riderAdvanced: [KeyValuePair.Create("É", SqliteValue.Text("upper")), KeyValuePair.Create("é", SqliteValue.Text("lower"))]);
+        RiderCreationPreview preview = await service.PreviewAsync(database.Path, input, CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.AreEqual(SqliteValue.Text("upper"), preview.RiderValues["É"]);
+        Assert.AreEqual(SqliteValue.Text("lower"), preview.RiderValues["é"]);
+
+        await service.ApplyAsync(database.Path, preview, CancellationToken.None).ConfigureAwait(false);
+        Assert.AreEqual("upper|lower", await database.ScalarAsync<string>("""
+            SELECT "É" || '|' || "é" FROM DYN_cyclist WHERE IDcyclist = (SELECT MAX(IDcyclist) FROM DYN_cyclist)
+            """).ConfigureAwait(false));
+    }
+
     private static RiderCreationInput CreateInput(
         bool acknowledgeMissingLimits,
         IEnumerable<RiderAbilityInput>? abilities = null,
@@ -852,7 +898,8 @@ public sealed class RiderCreationServiceTests
         IEnumerable<KeyValuePair<string, SqliteValue>>? riderAdvanced = null,
         string? gameDisplayName = null,
         double potential = 3.0,
-        IEnumerable<long>? favoriteRaceIds = null) =>
+        IEnumerable<long>? favoriteRaceIds = null,
+        long wage = 12000) =>
         new(
             "Ada",
             "Lovelace",
@@ -866,7 +913,7 @@ public sealed class RiderCreationServiceTests
             soundName: "ada",
             abilities ?? CreateAbilities(),
             RiderContractRole.LuxuryTeammate,
-            wage: 12000,
+            wage,
             contractEndYear,
             acknowledgeMissingLimits,
             riderAdvanced,

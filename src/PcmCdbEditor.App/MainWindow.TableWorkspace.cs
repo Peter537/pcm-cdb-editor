@@ -314,7 +314,7 @@ public sealed partial class MainWindow
             GridViewport viewport = context.Viewport with { HorizontalOffset = 0 };
             tab.Tag = context with { ViewState = layout, Viewport = viewport };
             if (_relationshipReturn is { } source &&
-                source.TableName.Equals(context.Schema.Name, StringComparison.OrdinalIgnoreCase))
+                SqliteIdentifierComparer.Instance.Equals(source.TableName, context.Schema.Name))
             {
                 _relationshipReturn = source with
                 {
@@ -370,9 +370,7 @@ public sealed partial class MainWindow
         try
         {
             EditorPreferences previous = _preferences;
-            EditorPreferences updated = update(previous);
-            await _settingsStore.SavePreferencesAsync(updated, cancellationToken);
-            _preferences = updated;
+            _preferences = await _settingsStore.UpdatePreferencesAsync(update, cancellationToken);
             return previous;
         }
         finally

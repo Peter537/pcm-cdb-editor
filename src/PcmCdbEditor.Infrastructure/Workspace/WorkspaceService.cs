@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using Microsoft.Data.Sqlite;
@@ -5,6 +6,7 @@ using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
 using PcmCdbEditor.Infrastructure.Internal;
 using PcmCdbEditor.Infrastructure.Sqlite;
+using SQLitePCL;
 
 namespace PcmCdbEditor.Infrastructure.Workspace;
 
@@ -124,7 +126,9 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
         try
         {
             EditorSessionState state = await ReadReviewedRecoveryAsync(
-                sessionId, expectedUpdatedAtUtc, cancellationToken).ConfigureAwait(false);
+                sessionId, expectedUpdatedAtUtc, resume: true, cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            state = ReconcileInterruptedSave(state, allowDeferredCleanup: true);
             EditorSessionState recovered = await PersistAsync(
                 state with
                 {
@@ -187,7 +191,7 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
         CancellationToken cancellationToken) =>
         PersistRecoveryStateAsync(session, isDirty: true, cancellationToken);
 
-    internal Task<EditorSessionState> PersistSavedBaselineAsync(
+    public Task<EditorSessionState> PersistSavedBaselineAsync(
         EditorSessionState session,
         CancellationToken cancellationToken)
     {
@@ -199,7 +203,7 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
         return PersistRecoveryStateAsync(session, isDirty: false, cancellationToken);
     }
 
-    private Task<EditorSessionState> PersistRecoveryStateAsync(
+    private async Task<EditorSessionState> PersistRecoveryStateAsync(
         EditorSessionState session,
         bool isDirty,
         CancellationToken cancellationToken)
@@ -207,17 +211,21 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
         ArgumentNullException.ThrowIfNull(session);
         ValidateSessionPaths(session);
         RequireSessionOwnership(session.SessionId);
-        return PersistAsync(
+        EditorSessionState? persisted = await LoadSessionAsync(session.SessionId, cancellationToken)
+            .ConfigureAwait(false);
+        return await PersistAsync(
             session with
             {
+                PendingSaveAttempt = session.PendingSaveAttempt ?? persisted?.PendingSaveAttempt,
+                DeferredSaveAttempts = persisted?.DeferredSaveAttempts ?? session.DeferredSaveAttempts,
                 IsDirty = isDirty,
                 Lifecycle = EditorSessionLifecycle.Ready,
                 UpdatedAtUtc = DateTimeOffset.UtcNow
             },
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task CloseAsync(
+    public async Task<WorkspaceCloseResult> CloseAsync(
         EditorSessionState session,
         bool discardDirtySession,
         CancellationToken cancellationToken)
@@ -225,23 +233,72 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
         ArgumentNullException.ThrowIfNull(session);
         ValidateSessionPaths(session);
         RequireSessionOwnership(session.SessionId);
-        if (session.IsDirty && !discardDirtySession)
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!discardDirtySession)
+        {
+            await ConfirmCloseWithoutDiscardAsync(session, cancellationToken).ConfigureAwait(false);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        string completedPath = MoveToCompletedDirectory(session.SessionId, session.SessionDirectory);
+        try
+        {
+            return new WorkspaceCloseResult(await TryDeleteCompletedDirectoryAsync(completedPath)
+                .ConfigureAwait(false) ? null : completedPath);
+        }
+        finally
+        {
+            ReleaseSession(session.SessionId);
+        }
+    }
+
+    private async Task ConfirmCloseWithoutDiscardAsync(EditorSessionState session, CancellationToken cancellationToken)
+    {
+        EditorSessionState? persisted = await LoadSessionAsync(session.SessionId, cancellationToken).ConfigureAwait(false);
+        CommittedSaveReceipt? receipt = GetUnsynchronizedSave(session.SessionId);
+        if (HasRecoverableWork(session))
         {
             throw new InvalidOperationException("The session has unsaved changes and was not approved for discard.");
         }
 
-        cancellationToken.ThrowIfCancellationRequested();
-        await PersistAsync(
-                session with
-                {
-                    Lifecycle = EditorSessionLifecycle.Closed,
-                    UpdatedAtUtc = DateTimeOffset.UtcNow
-                },
-                cancellationToken)
-            .ConfigureAwait(false);
-        DeleteSessionDirectory(session.SessionDirectory);
-        ReleaseSession(session.SessionId);
+        if (receipt is not null && ReferenceEquals(receipt.Committed, session))
+        {
+            bool matchesCommitted = persisted is not null && MatchesCommittedBaseline(persisted, receipt.Committed);
+            if (persisted is not null && !matchesCommitted && !SessionStatesMatch(persisted, receipt.Saving))
+            {
+                throw new InvalidOperationException("The recovery information changed before the working session could close.");
+            }
+
+            // Only the lease that saw this exact save commit can reconcile the stale state.
+            SaveDestinationSnapshot destination = await InspectSaveDestinationAsync(
+                session.SaveTargetCdbPath, cancellationToken).ConfigureAwait(false);
+            if (session.SaveDestinationBaseline is not { } baseline || !HaveSameContents(baseline, destination))
+            {
+                throw new InvalidOperationException("The saved destination changed before the working session could close.");
+            }
+            if (!matchesCommitted)
+            {
+                await PersistAsync(session, cancellationToken).ConfigureAwait(false);
+            }
+            return;
+        }
+
+        if ((persisted is not null && HasRecoverableWork(persisted)) ||
+            (receipt is not null && (persisted is null || MatchesCommittedBaseline(persisted, receipt.Committed))))
+        {
+            throw new InvalidOperationException("The session has unsaved changes and was not approved for discard.");
+        }
     }
+
+    private static bool MatchesCommittedBaseline(EditorSessionState persisted, EditorSessionState committed) =>
+        // A later failed save can update cleanup information while leaving the committed baseline intact.
+        SessionStatesMatch(persisted with
+        {
+            UpdatedAtUtc = committed.UpdatedAtUtc,
+            PendingSaveAttempt = committed.PendingSaveAttempt,
+            DeferredSaveAttempts = committed.DeferredSaveAttempts,
+            LastBackupPath = committed.LastBackupPath
+        }, committed);
 
     public async Task<IReadOnlyList<RecoverableSession>> GetRecoverableSessionsAsync(
         CancellationToken cancellationToken)
@@ -275,14 +332,16 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
                 }
                 ValidateSessionPaths(state);
                 EnsureNonEmpty(state.WorkingCdbPath, "recoverable working CDB");
-                await ValidateSqliteAsync(state.WorkingSqlitePath, cancellationToken).ConfigureAwait(false);
+                bool requiresJournalRecovery = await ValidateRecoverySqliteAsync(
+                    state.WorkingSqlitePath, resume: false, cancellationToken).ConfigureAwait(false);
 
                 var description = string.Create(
                     CultureInfo.InvariantCulture,
                     $"Unsaved {Path.GetFileName(state.SourceCdbPath)} session from {state.UpdatedAtUtc:yyyy-MM-dd HH:mm} UTC");
                 recoverable.Add(new RecoverableSession(
                     state with { Lifecycle = EditorSessionLifecycle.Recoverable },
-                    description));
+                    description,
+                    requiresJournalRecovery));
             }
             catch (Exception exception) when (exception is IOException
                                               or UnauthorizedAccessException
@@ -300,7 +359,7 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
             .ToArray();
     }
 
-    public async Task DiscardRecoverableSessionAsync(
+    public async Task<WorkspaceCloseResult> DiscardRecoverableSessionAsync(
         Guid sessionId,
         DateTimeOffset expectedUpdatedAtUtc,
         CancellationToken cancellationToken)
@@ -308,14 +367,17 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
         cancellationToken.ThrowIfCancellationRequested();
         using FileStream ownership = AcquireSessionOwnership(sessionId);
         EditorSessionState state = await ReadReviewedRecoveryAsync(
-            sessionId, expectedUpdatedAtUtc, cancellationToken).ConfigureAwait(false);
+            sessionId, expectedUpdatedAtUtc, resume: false, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
-        DeleteSessionDirectory(state.SessionDirectory);
+        string completedPath = MoveToCompletedDirectory(sessionId, state.SessionDirectory);
+        return new WorkspaceCloseResult(await TryDeleteCompletedDirectoryAsync(completedPath)
+            .ConfigureAwait(false) ? null : completedPath);
     }
 
     private async Task<EditorSessionState> ReadReviewedRecoveryAsync(
         Guid sessionId,
         DateTimeOffset? expectedUpdatedAtUtc,
+        bool resume,
         CancellationToken cancellationToken)
     {
         EditorSessionState state = await LoadSessionAsync(sessionId, cancellationToken).ConfigureAwait(false)
@@ -332,15 +394,23 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
 
         ValidateSessionPaths(state);
         EnsureNonEmpty(state.WorkingCdbPath, "recoverable working CDB");
-        await ValidateSqliteAsync(state.WorkingSqlitePath, cancellationToken).ConfigureAwait(false);
-        if (expectedUpdatedAtUtc.HasValue &&
-            await LoadSessionAsync(sessionId, cancellationToken).ConfigureAwait(false) != state)
+        await ValidateRecoverySqliteAsync(state.WorkingSqlitePath, resume, cancellationToken)
+            .ConfigureAwait(false);
+        if (expectedUpdatedAtUtc.HasValue)
         {
-            throw new InvalidOperationException("The working session changed since it was listed. Refresh to review it again.");
+            EditorSessionState? latest = await LoadSessionAsync(sessionId, cancellationToken).ConfigureAwait(false);
+            if (latest is null || !SessionStatesMatch(latest, state))
+            {
+                throw new InvalidOperationException("The working session changed since it was listed. Refresh to review it again.");
+            }
         }
 
         return state;
     }
+
+    private static bool SessionStatesMatch(EditorSessionState left, EditorSessionState right) =>
+        left with { DeferredSaveAttempts = null } == right with { DeferredSaveAttempts = null } &&
+        (left.DeferredSaveAttempts ?? []).SequenceEqual(right.DeferredSaveAttempts ?? []);
 
     private static bool HasRecoverableWork(EditorSessionState state) =>
         state.IsDirty || state.MutationPending || state.HistoryUncertain == true ||
@@ -356,7 +426,9 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
         foreach (var directory in Directory.EnumerateDirectories(_sessionsRoot))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!Guid.TryParseExact(Path.GetFileName(directory), "N", out var sessionId))
+            string name = Path.GetFileName(directory);
+            bool completed = name.StartsWith(".closed-", StringComparison.Ordinal);
+            if (!Guid.TryParseExact(completed ? name[8..] : name, "N", out var sessionId))
             {
                 continue;
             }
@@ -364,13 +436,22 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
             try
             {
                 using FileStream ownership = AcquireSessionOwnership(sessionId);
+                if (completed)
+                {
+                    _ = await TryDeleteCompletedDirectoryAsync(CompletedDirectory(sessionId)).ConfigureAwait(false);
+                    continue;
+                }
+
                 EditorSessionState? state = await LoadSessionAsync(sessionId, cancellationToken).ConfigureAwait(false);
                 if (state is not null && state.SessionId == sessionId && !HasRecoverableWork(state)
-                    && state.Lifecycle is EditorSessionLifecycle.Closed or EditorSessionLifecycle.Cancelled)
+                    && (state.Lifecycle is EditorSessionLifecycle.Closed or EditorSessionLifecycle.Cancelled ||
+                        state is { Lifecycle: EditorSessionLifecycle.Ready, HistoryUncertain: false }
+                        && state.SaveDestinationBaseline is { } baseline && IsValidSnapshot(baseline, state.SaveTargetCdbPath)))
                 {
                     ValidateSessionPaths(state);
                     cancellationToken.ThrowIfCancellationRequested();
-                    DeleteSessionDirectory(directory);
+                    string completedPath = MoveToCompletedDirectory(sessionId, directory);
+                    _ = await TryDeleteCompletedDirectoryAsync(completedPath).ConfigureAwait(false);
                 }
             }
             catch (Exception exception) when (exception is IOException
@@ -406,12 +487,35 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
         EnsureNonEmpty(session.WorkingCdbPath, "working CDB");
         await ValidateSqliteAsync(session.WorkingSqlitePath, cancellationToken).ConfigureAwait(false);
         string destinationDirectory = Path.GetDirectoryName(destination)!;
-        Directory.CreateDirectory(destinationDirectory);
-        var saving = await TransitionAsync(session, EditorSessionLifecycle.Saving, cancellationToken)
+        EditorSessionState? previousSave = await LoadSessionAsync(session.SessionId, cancellationToken)
             .ConfigureAwait(false);
-        var stagedCdb = Path.Combine(
-            destinationDirectory,
-            $".{Path.GetFileNameWithoutExtension(destination)}.{Guid.NewGuid():N}.cdb");
+        if (previousSave is not null)
+        {
+            session = session with
+            {
+                PendingSaveAttempt = previousSave.PendingSaveAttempt,
+                DeferredSaveAttempts = previousSave.DeferredSaveAttempts
+            };
+        }
+        session = ReconcileInterruptedSave(session, allowDeferredCleanup: true);
+        if (session.PendingSaveAttempt is { } unfinished)
+        {
+            session = session with
+            {
+                PendingSaveAttempt = null,
+                DeferredSaveAttempts = [.. session.DeferredSaveAttempts ?? [], unfinished]
+            };
+        }
+        Directory.CreateDirectory(destinationDirectory);
+        string physicalDirectory = ResolveDirectoryLinks(destinationDirectory);
+        var attempt = new WorkspaceSaveAttempt(Guid.NewGuid(), destination, physicalDirectory)
+        {
+            StagingDirectoryIdentity = WindowsDirectoryIdentity.Read(physicalDirectory)
+        };
+        var saving = await TransitionAsync(session with { PendingSaveAttempt = attempt },
+                EditorSessionLifecycle.Saving, cancellationToken)
+            .ConfigureAwait(false);
+        var (stagedCdb, backupCandidate) = GetAttemptPaths(attempt);
         string? displacedBackup = null;
         SaveDestinationSnapshot stagedBaseline;
         try
@@ -435,6 +539,7 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
             }
 
             _ = ValidateSaveDestination(destination);
+            ValidateStagingDirectory(attempt);
             // Recheck after conversion under a handle that denies writes and rename.
             using (FileStream? destinationStream = OpenDestinationIfPresent(destination))
             {
@@ -448,9 +553,7 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
             {
                 // The handle must be released to replace. Let the atomic operation
                 // itself preserve whichever destination exists at the handoff.
-                displacedBackup = Path.Combine(destinationDirectory, string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"{Path.GetFileNameWithoutExtension(destination)}-backup-{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}.cdb"));
+                displacedBackup = backupCandidate;
                 ReplaceDestination(stagedCdb, destination, displacedBackup);
             }
             else
@@ -470,6 +573,31 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
                 }
             }
         }
+        catch (IOException exception) when (displacedBackup is not null &&
+            ((exception.HResult & 0xffff) == 1177 || File.Exists(displacedBackup)))
+        {
+            string? backupPathAfterFailure = displacedBackup;
+            if (await VerifyDisplacedDestinationAsync(displacedBackup, expected).ConfigureAwait(false))
+            {
+                try
+                {
+                    // Move never overwrites a destination that appeared during the handoff.
+                    File.Move(displacedBackup, destination);
+                    backupPathAfterFailure = null;
+                }
+                catch (Exception moveFailure) when (moveFailure is IOException or UnauthorizedAccessException)
+                {
+                    // Keep the displaced original at its recorded backup path.
+                }
+            }
+
+            throw new WorkspaceSaveHandoffException(saving with
+            {
+                IsDirty = true,
+                HistoryUncertain = true,
+                LastBackupPath = backupPathAfterFailure ?? session.LastBackupPath
+            }, destination, stagedCdb, backupPathAfterFailure, exception);
+        }
         catch
         {
             TryDeleteFile(stagedCdb);
@@ -477,6 +605,7 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
                     saving with
                     {
                         Lifecycle = EditorSessionLifecycle.Ready,
+                        PendingSaveAttempt = GetOutstandingSaveAttempt(attempt, stagedCdb),
                         UpdatedAtUtc = DateTimeOffset.UtcNow
                     },
                     CancellationToken.None)
@@ -510,6 +639,7 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
                 MutationPending = false,
                 HistoryUncertain = false,
                 Lifecycle = EditorSessionLifecycle.Ready,
+                PendingSaveAttempt = GetOutstandingSaveAttempt(attempt, stagedCdb),
                 UpdatedAtUtc = DateTimeOffset.UtcNow,
                 LastBackupPath = backupPath
             },
@@ -524,10 +654,12 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
                     committedSave.Session,
                     CancellationToken.None)
                 .ConfigureAwait(false);
+            ClearUnsynchronizedSave(session.SessionId);
             return committedSave with { Session = ready };
         }
         catch (Exception exception)
         {
+            RememberUnsynchronizedSave(saving, committedSave.Session);
             throw new WorkspaceSaveCommitException(committedSave, exception);
         }
     }
@@ -686,20 +818,63 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
 
     private static Task ValidateSqliteAsync(string path, CancellationToken cancellationToken) =>
         SqliteOperationRunner.RunAsync(
-            () => ValidateSqliteCoreAsync(path, cancellationToken),
+            () => ValidateSqliteCoreAsync(path, SqliteOpenMode.ReadOnly, cancellationToken),
             cancellationToken);
 
-    private static async Task ValidateSqliteCoreAsync(string path, CancellationToken cancellationToken)
+    private static Task<bool> ValidateRecoverySqliteAsync(
+        string path, bool resume, CancellationToken cancellationToken) =>
+        SqliteOperationRunner.RunAsync(async () =>
+        {
+            try
+            {
+                await ValidateSqliteCoreAsync(path, SqliteOpenMode.ReadOnly, cancellationToken).ConfigureAwait(false);
+                return false;
+            }
+            catch (SqliteException exception) when (exception.SqliteExtendedErrorCode is 776 or 264)
+            {
+                // SQLITE_READONLY_ROLLBACK / SQLITE_READONLY_RECOVERY.
+                // The caller holds the session lease. Listing leaves the journal for explicit resume.
+                if (resume)
+                {
+                    await ValidateSqliteCoreAsync(path, SqliteOpenMode.ReadWrite, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                return true;
+            }
+        }, cancellationToken);
+
+    private static async Task ValidateSqliteCoreAsync(
+        string path, SqliteOpenMode mode, CancellationToken cancellationToken)
     {
         EnsureNonEmpty(path, "working SQLite database");
-        await using var connection = SqliteSupport.CreateConnection(path, SqliteOpenMode.ReadOnly);
+        await using var connection = SqliteSupport.CreateConnection(path, mode);
         using var interruptRegistration = await SqliteOperationRunner.OpenInterruptiblyAsync(
                 connection,
                 cancellationToken)
             .ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT COUNT(*) FROM sqlite_schema";
-        _ = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        // The provider retries busy statements synchronously. Check cancellation between
+        // short attempts while keeping the original lock wait budget for validation.
+        TimeSpan lockWait = TimeSpan.FromSeconds(command.CommandTimeout);
+        command.CommandTimeout = 1;
+        long started = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                _ = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                return;
+            }
+            catch (SqliteException exception) when (
+                (exception.SqliteErrorCode is raw.SQLITE_BUSY or raw.SQLITE_LOCKED) &&
+                (cancellationToken.IsCancellationRequested || Stopwatch.GetElapsedTime(started) < lockWait))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+        }
     }
 
     private static FileStream OpenReadStream(string path) =>
@@ -759,6 +934,224 @@ public sealed partial class WorkspaceService : IWorkspaceService, IDisposable
     private static bool HaveSameContents(SaveDestinationSnapshot expected, SaveDestinationSnapshot observed) =>
         expected.Length == observed.Length &&
         string.Equals(expected.Sha256, observed.Sha256, StringComparison.OrdinalIgnoreCase);
+
+    private static (string Stage, string Backup) GetAttemptPaths(WorkspaceSaveAttempt attempt)
+    {
+        string folder = attempt.StagingDirectory;
+        string name = Path.GetFileNameWithoutExtension(attempt.DestinationPath);
+        return (Path.Combine(folder, $".{name}.{attempt.Id:N}.cdb"),
+            Path.Combine(folder, $"{name}-backup-{attempt.Id:N}.cdb"));
+    }
+
+    private EditorSessionState ReconcileInterruptedSave(EditorSessionState state, bool allowDeferredCleanup)
+    {
+        List<WorkspaceSaveAttempt>? stillDeferred = null;
+        string? backupPath = state.LastBackupPath;
+        foreach (WorkspaceSaveAttempt deferred in state.DeferredSaveAttempts ?? [])
+        {
+            EditorSessionState result = ReconcileCurrentSaveAttempt(
+                state with { PendingSaveAttempt = deferred, LastBackupPath = backupPath }, allowDeferredCleanup);
+            backupPath = result.LastBackupPath;
+            if (result.PendingSaveAttempt is { } pending)
+            {
+                (stillDeferred ??= []).Add(pending);
+            }
+        }
+
+        return ReconcileCurrentSaveAttempt(
+            state with { DeferredSaveAttempts = stillDeferred, LastBackupPath = backupPath }, allowDeferredCleanup);
+    }
+
+    private EditorSessionState ReconcileCurrentSaveAttempt(EditorSessionState state, bool allowDeferredCleanup)
+    {
+        if (state.PendingSaveAttempt is not { } attempt)
+        {
+            return state;
+        }
+
+        try
+        {
+            if (attempt.Id == Guid.Empty || !Path.IsPathFullyQualified(attempt.DestinationPath) ||
+                string.IsNullOrWhiteSpace(attempt.StagingDirectory) ||
+                !Path.IsPathFullyQualified(attempt.StagingDirectory))
+            {
+                throw new InvalidDataException("The interrupted save has invalid staging ownership.");
+            }
+
+            VerifyAttemptDirectory(attempt);
+            var (stage, backup) = GetAttemptPaths(attempt);
+            _ = ValidateSaveDestination(stage);
+            bool foundOwnedFile = false;
+            if (GetAttributesIfPresent(backup) is { } backupAttributes &&
+                (backupAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0)
+            {
+                state = state with { LastBackupPath = backup };
+                foundOwnedFile = true;
+            }
+            foreach (string path in EnumerateSaveStages(stage))
+            {
+                if (GetAttributesIfPresent(path) is not { } attributes)
+                {
+                    continue;
+                }
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    throw new InvalidDataException("The interrupted save stage now points to another file.");
+                }
+                File.Delete(path);
+                foundOwnedFile = true;
+            }
+            if (attempt.CleanupNeedsEvidence && !foundOwnedFile)
+            {
+                throw new IOException("The previous save's staging files could not be verified in this directory.");
+            }
+            return state with { PendingSaveAttempt = null };
+        }
+        catch (Exception exception) when (allowDeferredCleanup &&
+            exception is IOException or UnauthorizedAccessException or ArgumentException or InvalidDataException)
+        {
+            // Private SQLite recovery can proceed while the tracked external stage is unavailable.
+            return state with { PendingSaveAttempt = MarkCleanupUnverified(attempt) };
+        }
+    }
+
+    private static FileAttributes? GetAttributesIfPresent(string path)
+    {
+        try
+        {
+            return File.GetAttributes(path);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    private static WorkspaceSaveAttempt? GetOutstandingSaveAttempt(WorkspaceSaveAttempt attempt, string stage)
+    {
+        try
+        {
+            VerifyAttemptDirectory(attempt);
+            return EnumerateSaveStages(stage).Any(path => GetAttributesIfPresent(path).HasValue) ? attempt : null;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
+        {
+            return MarkCleanupUnverified(attempt);
+        }
+    }
+
+    private static WorkspaceSaveAttempt MarkCleanupUnverified(WorkspaceSaveAttempt attempt) =>
+        attempt.StagingDirectoryIdentity is null && !attempt.CleanupNeedsEvidence
+            ? attempt with { CleanupNeedsEvidence = true }
+            : attempt;
+
+    private static void VerifyAttemptDirectory(WorkspaceSaveAttempt attempt)
+    {
+        string directory = attempt.StagingDirectory;
+        // A path can name a different directory when a drive or folder has been replaced.
+        if ((File.GetAttributes(directory) & FileAttributes.Directory) == 0 ||
+            !ResolveDirectoryLinks(directory).Equals(directory, StringComparison.OrdinalIgnoreCase) ||
+            attempt.StagingDirectoryIdentity is { } identity &&
+            !string.Equals(WindowsDirectoryIdentity.Read(directory), identity, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("The save staging directory no longer identifies the original folder.");
+        }
+    }
+
+    private void ValidateStagingDirectory(WorkspaceSaveAttempt attempt)
+    {
+        string destination = ValidateSaveDestination(attempt.DestinationPath);
+        if (string.IsNullOrWhiteSpace(attempt.StagingDirectory) ||
+            !Path.IsPathFullyQualified(attempt.StagingDirectory) ||
+            !ResolveDirectoryLinks(Path.GetDirectoryName(destination)!)
+                .Equals(attempt.StagingDirectory, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("The save destination directory has changed since staging began.");
+        }
+        VerifyAttemptDirectory(attempt);
+    }
+
+    private static string[] EnumerateSaveStages(string cdbStage)
+    {
+        string sqliteStage = Path.ChangeExtension(cdbStage, ".sqlite");
+        return [cdbStage, sqliteStage, sqliteStage + "-journal", sqliteStage + "-wal", sqliteStage + "-shm"];
+    }
+
+    private string CompletedDirectory(Guid sessionId) => Path.Combine(_sessionsRoot, $".closed-{sessionId:N}");
+
+    private string CompletionMarker(string completedPath) =>
+        Path.Combine(_sessionsRoot, ".leases", Path.GetFileName(completedPath));
+
+    private string MoveToCompletedDirectory(Guid sessionId, string sessionDirectory)
+    {
+        string completedPath = CompletedDirectory(sessionId);
+        string marker = CompletionMarker(completedPath);
+        if (Directory.Exists(completedPath) || File.Exists(completedPath))
+        {
+            throw new IOException("The completed session path is already occupied.");
+        }
+
+        using (new FileStream(marker, FileMode.Create, FileAccess.Write, FileShare.None, 1, FileOptions.WriteThrough))
+        {
+            // The lease excludes other editor instances for this session ID.
+        }
+
+        try
+        {
+            Directory.Move(sessionDirectory, completedPath);
+            return completedPath;
+        }
+        catch
+        {
+            TryDeleteFile(marker);
+            throw;
+        }
+    }
+
+    private async Task<bool> TryDeleteCompletedDirectoryAsync(string path)
+    {
+        string marker = CompletionMarker(path);
+        try
+        {
+            if (!File.Exists(marker))
+            {
+                return false;
+            }
+
+            if (Directory.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0)
+            {
+                EditorSessionState? state = await AtomicJsonFile.ReadOrCreateAsync<EditorSessionState?>(
+                    Path.Combine(path, "session.json"), static () => null, CancellationToken.None,
+                    quarantineCorruptFile: false).ConfigureAwait(false);
+                if (state is not null)
+                {
+                    ValidateSessionPaths(state);
+                    if (!path.Equals(CompletedDirectory(state.SessionId), StringComparison.OrdinalIgnoreCase))
+                    {
+                        return false;
+                    }
+                    _ = ReconcileInterruptedSave(state, allowDeferredCleanup: false);
+                }
+                DeleteCompletedDirectory(path);
+            }
+
+            if (Directory.Exists(path))
+            {
+                return false;
+            }
+
+            TryDeleteFile(marker);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+            InvalidDataException or ArgumentException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    internal Action<string> DeleteCompletedDirectory { get; init; } =
+        static path => Directory.Delete(path, recursive: true);
 
     private void DeleteSessionDirectory(string sessionDirectory)
     {

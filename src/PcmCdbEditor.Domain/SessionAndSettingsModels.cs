@@ -30,6 +30,15 @@ public sealed record EditorSessionState(
     bool? HistoryUncertain = null)
 {
     public SaveDestinationSnapshot? SaveDestinationBaseline { get; init; }
+    public WorkspaceSaveAttempt? PendingSaveAttempt { get; init; }
+
+    public IReadOnlyList<WorkspaceSaveAttempt>? DeferredSaveAttempts { get; init; }
+}
+
+public sealed record WorkspaceSaveAttempt(Guid Id, string DestinationPath, string StagingDirectory)
+{
+    public string? StagingDirectoryIdentity { get; init; }
+    public bool CleanupNeedsEvidence { get; init; }
 }
 
 public sealed record SaveDestinationSnapshot(string Path, long? Length, string? Sha256);

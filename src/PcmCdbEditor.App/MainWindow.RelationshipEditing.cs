@@ -33,9 +33,9 @@ public sealed partial class MainWindow
         if (_relationshipCellEditorOpen || _operationLease is not null || _activeTableLoad is not null ||
             _session is not { } session || _catalog is not { } catalog ||
             TableTabs.SelectedItem is not TabViewItem { Tag: TableTabContext context } ||
-            !context.Schema.Name.Equals(request.TableName, StringComparison.OrdinalIgnoreCase) ||
+            !SqliteIdentifierComparer.Instance.Equals(context.Schema.Name, request.TableName) ||
             context.Schema.Columns.FirstOrDefault(column =>
-                column.Name.Equals(request.ColumnName, StringComparison.OrdinalIgnoreCase)) is not { } column ||
+                SqliteIdentifierComparer.Instance.Equals(column.Name, request.ColumnName)) is not { } column ||
             !CanChooseRelationship(catalog, context.Schema, column) ||
             !context.Display.Rows.Any(row => request.Identity.Equals(row.Identity) && row.Revision == request.Revision))
         {
@@ -105,7 +105,7 @@ public sealed partial class MainWindow
             if (outcome == ContentDialogResult.Secondary)
             {
                 picker.Dispose();
-                var values = new Dictionary<string, SqliteValue>(StringComparer.OrdinalIgnoreCase)
+                var values = new Dictionary<string, SqliteValue>(SqliteIdentifierComparer.Instance)
                 {
                     [column.Name] = request.OldValue,
                 };
@@ -131,7 +131,7 @@ public sealed partial class MainWindow
     {
         if (_session?.SessionId != session.SessionId || !ReferenceEquals(_catalog, catalog) ||
             TableTabs.SelectedItem is not TabViewItem { Tag: TableTabContext context } ||
-            !context.Schema.Name.Equals(request.TableName, StringComparison.OrdinalIgnoreCase))
+            !SqliteIdentifierComparer.Instance.Equals(context.Schema.Name, request.TableName))
         {
             return Task.FromResult(new RowEditResult(true, "The active table changed. Reopen this cell to edit it."));
         }
@@ -223,8 +223,8 @@ public sealed partial class MainWindow
         DatabaseSchemaCatalog catalog,
         TableSchema table,
         ColumnSchema column) => new(column.Name, (search, cancellationToken) =>
-            _relationshipLookup.SearchAsync(workingPath, catalog, table.Name, column.Name, search,
-                limit: 60, cancellationToken), _lifetimeCancellation.Token);
+            TrackSessionReaderAsync(_relationshipLookup.SearchAsync(workingPath, catalog, table.Name, column.Name, search,
+                limit: 60, cancellationToken)), _lifetimeCancellation.Token);
 
     private static string DescribeRelationshipKey(SqliteValue value) =>
         value.Kind == SqliteValueKind.Text

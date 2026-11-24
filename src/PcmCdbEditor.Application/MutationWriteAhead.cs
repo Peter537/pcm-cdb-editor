@@ -33,15 +33,22 @@ public sealed class MutationWriteAhead(IWorkspaceService workspaceService)
         return persisted;
     }
 
-    // Only call after the history record or replay completion is durable, or
-    // when the caller knows that no database mutation occurred.
+    public async Task<EditorSessionState> CompleteCommittedAsync(
+        EditorSessionState session,
+        Action persistHistory)
+    {
+        ArgumentNullException.ThrowIfNull(persistHistory);
+        RequirePendingMutation(session);
+
+        // The database already committed. Cancellation cannot skip the history record.
+        await Task.Run(persistHistory).ConfigureAwait(false);
+        return await CompleteAsync(session).ConfigureAwait(false);
+    }
+
+    // When no SQLite mutation occurred there is no history record to persist.
     public async Task<EditorSessionState> CompleteAsync(EditorSessionState session)
     {
-        ArgumentNullException.ThrowIfNull(session);
-        if (!session.MutationPending || !session.IsDirty)
-        {
-            throw new InvalidOperationException("There is no prepared mutation to complete.");
-        }
+        RequirePendingMutation(session);
 
         EditorSessionState persisted = await _workspaceService.MarkDirtyAsync(
                 session with { MutationPending = false }, CancellationToken.None)
@@ -55,5 +62,14 @@ public sealed class MutationWriteAhead(IWorkspaceService workspaceService)
         }
 
         return persisted;
+    }
+
+    private static void RequirePendingMutation(EditorSessionState session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        if (!session.MutationPending || !session.IsDirty)
+        {
+            throw new InvalidOperationException("There is no prepared mutation to complete.");
+        }
     }
 }

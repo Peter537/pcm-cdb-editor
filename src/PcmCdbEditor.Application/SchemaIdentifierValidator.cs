@@ -33,7 +33,7 @@ public static class SchemaIdentifierValidator
         RequireWellFormed(requestedColumn, nameof(requestedColumn));
 
         var column = table.Columns.FirstOrDefault(
-            candidate => candidate.Name.Equals(requestedColumn, StringComparison.OrdinalIgnoreCase));
+            candidate => SqliteIdentifierComparer.Instance.Equals(candidate.Name, requestedColumn));
         if (column is null)
         {
             throw new UnknownSchemaIdentifierException(
@@ -70,6 +70,12 @@ public static class SchemaIdentifierValidator
 
     public static void ValidateFilter(TableSchema table, FilterExpression expression)
     {
+        FilterExpressionLimits.Validate(expression);
+        ValidateFilterColumns(table, expression);
+    }
+
+    private static void ValidateFilterColumns(TableSchema table, FilterExpression expression)
+    {
         switch (expression)
         {
             case FilterCondition condition:
@@ -78,7 +84,7 @@ public static class SchemaIdentifierValidator
             case FilterGroup group:
                 foreach (var child in group.Children)
                 {
-                    ValidateFilter(table, child);
+                    ValidateFilterColumns(table, child);
                 }
 
                 break;
