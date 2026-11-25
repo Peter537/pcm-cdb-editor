@@ -707,6 +707,8 @@ public sealed class WorkspaceServiceTests
             Assert.AreEqual(EditorSessionLifecycle.Ready, session.Lifecycle);
 
             var dirty = await service.MarkDirtyAsync(session, CancellationToken.None).ConfigureAwait(false);
+            Assert.IsFalse(session.IsDirty);
+            Assert.AreEqual(EditorSessionLifecycle.Ready, session.Lifecycle);
             Assert.IsTrue(dirty.IsDirty);
             Assert.IsTrue((await ReadSessionMetadataAsync(dirty).ConfigureAwait(false)).IsDirty);
             var result = await service.SaveAsAsync(dirty, destination, CancellationToken.None).ConfigureAwait(false);
@@ -989,10 +991,15 @@ public sealed class WorkspaceServiceTests
         {
             EditorSessionState session = await service.OpenAsync(new WorkspaceOpenRequest(source), CancellationToken.None).ConfigureAwait(false);
             session = await writeAhead.PrepareAsync(session).ConfigureAwait(false);
+            var persisted = await ReadSessionMetadataAsync(session).ConfigureAwait(false);
+            Assert.IsTrue(persisted.IsDirty);
+            Assert.IsTrue(persisted.MutationPending);
             await using (var connection = new SqliteConnection($"Data Source={session.WorkingSqlitePath};Pooling=False"))
             {
                 await connection.OpenAsync().ConfigureAwait(false);
                 await using var command = connection.CreateCommand();
+                command.CommandText = "SELECT COUNT(*) FROM neutral";
+                Assert.AreEqual(0L, await command.ExecuteScalarAsync().ConfigureAwait(false));
                 command.CommandText = "INSERT INTO neutral VALUES (1, 'unrecorded')";
                 await command.ExecuteNonQueryAsync().ConfigureAwait(false);
             }

@@ -28,6 +28,18 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
             [Table] = new[] { "IDcyclist" }.Concat(PresetColumns).ToArray()
         };
 
+    private readonly Action<long>? _afterRowUpdate;
+
+    public RiderRecoveryService()
+    {
+    }
+
+    internal RiderRecoveryService(Action<long> afterRowUpdate)
+    {
+        ArgumentNullException.ThrowIfNull(afterRowUpdate);
+        _afterRowUpdate = afterRowUpdate;
+    }
+
     public Task<MaintenanceCapability> CheckCapabilityAsync(
         string sqlitePath,
         CancellationToken cancellationToken) =>
@@ -145,7 +157,7 @@ public sealed class RiderRecoveryService : IRiderRecoveryService
             () => ApplyCoreAsync(sqlitePath, preview, cancellationToken),
             cancellationToken);
 
-    private static async Task<MaintenanceApplyResult> ApplyCoreAsync(
+    private async Task<MaintenanceApplyResult> ApplyCoreAsync(
         string sqlitePath,
         RiderRecoveryPreview preview,
         CancellationToken cancellationToken)
@@ -234,6 +246,7 @@ SET value_f_FIT = $fit,
 WHERE IDcyclist = $cyclistId";
                 AddPresetParameters(command, change.CyclistId);
                 affected += await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                _afterRowUpdate?.Invoke(change.CyclistId);
             }
 
             if (affected != changedIds.Length)

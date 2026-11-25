@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using PcmCdbEditor.Domain;
 using PcmCdbEditor.Infrastructure.History;
@@ -190,7 +191,7 @@ public sealed class HistoryAndSettingsTests
     }
 
     [TestMethod]
-    public async Task SettingsAreAtomicNormalizedAndContainNoDatabaseRowContent()
+    public async Task SettingsPersistOnlyNormalizedPreferencesAndColumnLayout()
     {
         var directory = Path.Combine(Path.GetTempPath(), "PcmCdbEditorTests", Guid.NewGuid().ToString("N"));
         var path = Path.Combine(directory, "settings.json");
@@ -216,8 +217,21 @@ public sealed class HistoryAndSettingsTests
                     GridDensity.Compact,
                     frozenColumnCount: 0),
                 CancellationToken.None).ConfigureAwait(false);
-            var json = await File.ReadAllTextAsync(path).ConfigureAwait(false);
-            Assert.IsFalse(json.Contains("database-row-secret", StringComparison.Ordinal));
+            using var json = JsonDocument.Parse(
+                await File.ReadAllTextAsync(path).ConfigureAwait(false));
+            var root = json.RootElement;
+            AssertJsonProperties(root, "Preferences", "TableViewStates");
+            var persisted = root.GetProperty("Preferences");
+            AssertJsonProperties(persisted, "Theme", "Density", "PageSize", "ForeignKeyDisplayMode", "RecentFiles");
+            Assert.AreEqual(100, persisted.GetProperty("PageSize").GetInt32());
+            Assert.AreEqual(12, persisted.GetProperty("RecentFiles").GetArrayLength());
+            var layout = Assert.ContainsSingle(root.GetProperty("TableViewStates").EnumerateObject()).Value;
+            AssertJsonProperties(layout, "SchemaSignature", "TableName", "Columns", "Density", "FrozenColumnCount");
+            Assert.AreEqual("signature", layout.GetProperty("SchemaSignature").GetString());
+            Assert.AreEqual("DYN_table", layout.GetProperty("TableName").GetString());
+            var column = Assert.ContainsSingle(layout.GetProperty("Columns").EnumerateArray());
+            AssertJsonProperties(column, "ColumnName", "Width", "DisplayIndex", "IsVisible", "IsFrozen");
+            Assert.AreEqual("value", column.GetProperty("ColumnName").GetString());
             Assert.IsFalse(Directory.EnumerateFiles(directory).Any(file => file.EndsWith(".tmp", StringComparison.Ordinal)));
         }
         finally
@@ -524,11 +538,13 @@ public sealed class HistoryAndSettingsTests
             EditorPreferences reloaded = await store
                 .LoadPreferencesAsync(CancellationToken.None)
                 .ConfigureAwait(false);
-            string json = await File.ReadAllTextAsync(path).ConfigureAwait(false);
+            using var json = JsonDocument.Parse(
+                await File.ReadAllTextAsync(path).ConfigureAwait(false));
 
             Assert.AreEqual(500, reloaded.PageSize);
-            StringAssert.Contains(json, "\"PageSize\": 500", StringComparison.Ordinal);
-            Assert.IsFalse(json.Contains("All rows", StringComparison.OrdinalIgnoreCase));
+            var persisted = json.RootElement.GetProperty("Preferences");
+            Assert.AreEqual(500, persisted.GetProperty("PageSize").GetInt32());
+            AssertJsonProperties(persisted, "Theme", "Density", "PageSize", "ForeignKeyDisplayMode", "RecentFiles");
         }
         finally
         {
@@ -538,6 +554,9 @@ public sealed class HistoryAndSettingsTests
             }
         }
     }
+
+    private static void AssertJsonProperties(JsonElement value, params string[] expected) =>
+        CollectionAssert.AreEquivalent(expected, value.EnumerateObject().Select(property => property.Name).ToArray());
 
     [TestMethod]
     public async Task DiskHistoryReplaysUpdateInsertAndDeleteWithSavedBaselineAndTypedRows()

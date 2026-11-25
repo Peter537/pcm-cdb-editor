@@ -91,18 +91,6 @@ function Get-Sha256 {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
 }
 
-function Get-StreamSha256 {
-    param([Parameter(Mandatory = $true)][System.IO.Stream] $Stream)
-
-    $algorithm = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        return [System.BitConverter]::ToString($algorithm.ComputeHash($Stream)).Replace('-', '')
-    }
-    finally {
-        $algorithm.Dispose()
-    }
-}
-
 function Get-RelativePath {
     param(
         [Parameter(Mandatory = $true)][string] $BasePath,
@@ -334,64 +322,6 @@ function Get-ResolvedRiskyAssets {
         $resolvedAssets |
             Sort-Object -Property Id, Version, Project, Target
     )
-}
-
-function Assert-ZipMatchesPayload {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object[]] $PayloadFiles,
-
-        [Parameter(Mandatory = $true)]
-        [string] $ArchivePath
-    )
-
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $payloadMap = @{}
-    foreach ($file in $PayloadFiles) {
-        $payloadMap[$file.Path] = $file.Sha256
-    }
-
-    $zipMap = @{}
-    $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
-    try {
-        foreach ($entry in $archive.Entries) {
-            if ([string]::IsNullOrEmpty($entry.Name)) {
-                continue
-            }
-
-            $entryPath = $entry.FullName.Replace('\', '/')
-            if ($entryPath.StartsWith('/') -or $entryPath.Contains('../') -or $entryPath.Contains('/..')) {
-                throw "ZIP contains an unsafe path: $entryPath"
-            }
-
-            if ($zipMap.ContainsKey($entryPath)) {
-                throw "ZIP contains a duplicate path: $entryPath"
-            }
-
-            $stream = $entry.Open()
-            try {
-                $zipMap[$entryPath] = Get-StreamSha256 -Stream $stream
-            }
-            finally {
-                $stream.Dispose()
-            }
-        }
-    }
-    finally {
-        $archive.Dispose()
-    }
-
-    $missing = @($payloadMap.Keys | Where-Object { -not $zipMap.ContainsKey($_) } | Sort-Object)
-    $extra = @($zipMap.Keys | Where-Object { -not $payloadMap.ContainsKey($_) } | Sort-Object)
-    $different = @(
-        $payloadMap.Keys |
-            Where-Object { $zipMap.ContainsKey($_) -and $zipMap[$_] -ne $payloadMap[$_] } |
-            Sort-Object
-    )
-
-    if ($missing.Count -gt 0 -or $extra.Count -gt 0 -or $different.Count -gt 0) {
-        throw "ZIP/payload mismatch. Missing: [$($missing -join ', ')]; extra: [$($extra -join ', ')]; hash mismatch: [$($different -join ', ')]"
-    }
 }
 
 $payloadRoot = Resolve-RequiredPath -Path $PayloadDirectory -Kind Directory

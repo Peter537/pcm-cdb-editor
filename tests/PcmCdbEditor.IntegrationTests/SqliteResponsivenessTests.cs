@@ -339,6 +339,8 @@ SELECT value, value, 501 - value FROM sequence;",
         await connection.OpenAsync().ConfigureAwait(false);
         using var cancellation = new CancellationTokenSource();
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        RegisterSqlStartGate(connection, started, resume);
         var stopwatch = Stopwatch.StartNew();
         var dispatchStopwatch = Stopwatch.StartNew();
         Task<long> operation = SqliteOperationRunner.RunAsync(
@@ -350,25 +352,32 @@ SELECT value, value, 501 - value FROM sequence;",
                 await using var command = connection.CreateCommand();
                 command.CommandText = @"
 WITH RECURSIVE sequence(value) AS (
-  VALUES(1)
+  VALUES(pause_at_sql_start(1))
   UNION ALL
-  SELECT value + 1 FROM sequence WHERE value < 100000000
+  SELECT value + 1 FROM sequence WHERE value < 100000
 )
 SELECT SUM(value) FROM sequence";
-                started.TrySetResult();
                 return Convert.ToInt64(
                     await command.ExecuteScalarAsync(cancellation.Token).ConfigureAwait(false),
                     System.Globalization.CultureInfo.InvariantCulture);
             },
             cancellation.Token);
         dispatchStopwatch.Stop();
-        Assert.IsLessThan(TimeSpan.FromMilliseconds(500), dispatchStopwatch.Elapsed);
-        Assert.IsFalse(operation.IsCompleted);
-
-        await started.Task.ConfigureAwait(false);
         var interruptStopwatch = Stopwatch.StartNew();
-        cancellation.Cancel();
-        await Assert.ThrowsAsync<OperationCanceledException>(() => operation).ConfigureAwait(false);
+        try
+        {
+            Assert.IsLessThan(TimeSpan.FromMilliseconds(500), dispatchStopwatch.Elapsed);
+            Assert.IsFalse(operation.IsCompleted);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            interruptStopwatch.Restart();
+        }
+        finally
+        {
+            await CancelAndDrainStatementAsync(cancellation, resume, operation).ConfigureAwait(false);
+        }
+        OperationCanceledException canceled = await Assert.ThrowsAsync<OperationCanceledException>(() => operation)
+            .ConfigureAwait(false);
+        Assert.IsInstanceOfType<SqliteException>(canceled.InnerException);
         interruptStopwatch.Stop();
         stopwatch.Stop();
         Assert.IsTrue(cancellation.IsCancellationRequested);
@@ -411,6 +420,7 @@ SELECT SUM(value) FROM sequence";
             .ConfigureAwait(false);
         using var cancellation = new CancellationTokenSource();
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         Task operation = SqliteOperationRunner.RunAsync(
             async () =>
             {
@@ -419,6 +429,7 @@ SELECT SUM(value) FROM sequence";
                         connection,
                         cancellation.Token)
                     .ConfigureAwait(false);
+                RegisterSqlStartGate(connection, started, resume);
                 await using var transaction = await connection.BeginTransactionAsync(cancellation.Token)
                     .ConfigureAwait(false);
                 var sqliteTransaction = (SqliteTransaction)transaction;
@@ -437,14 +448,13 @@ SELECT SUM(value) FROM sequence";
 UPDATE neutral
 SET value = (
   WITH RECURSIVE sequence(value) AS (
-    VALUES(1)
+    VALUES(pause_at_sql_start(1))
     UNION ALL
-    SELECT value + 1 FROM sequence WHERE value < 100000000
+    SELECT value + 1 FROM sequence WHERE value < 100000
   )
   SELECT SUM(value) FROM sequence
 )
 WHERE IDneutral = 1";
-                    started.TrySetResult();
                     await update.ExecuteNonQueryAsync(cancellation.Token).ConfigureAwait(false);
                     await transaction.CommitAsync(cancellation.Token).ConfigureAwait(false);
                 }
@@ -457,9 +467,14 @@ WHERE IDneutral = 1";
             },
             cancellation.Token);
 
-        await started.Task.ConfigureAwait(false);
-        await Task.Delay(TimeSpan.FromMilliseconds(50)).ConfigureAwait(false);
-        cancellation.Cancel();
+        try
+        {
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        }
+        finally
+        {
+            await CancelAndDrainStatementAsync(cancellation, resume, operation).ConfigureAwait(false);
+        }
         OperationCanceledException canceled = await Assert.ThrowsAsync<OperationCanceledException>(
                 () => operation)
             .ConfigureAwait(false);
@@ -488,6 +503,35 @@ WHERE IDneutral = 1";
         Assert.AreEqual(42L, Convert.ToInt64(
             await query.ExecuteScalarAsync().ConfigureAwait(false),
             System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    private static async Task CancelAndDrainStatementAsync(
+        CancellationTokenSource cancellation, TaskCompletionSource resume, Task statement)
+    {
+        try
+        {
+            cancellation.Cancel();
+        }
+        finally
+        {
+            resume.TrySetResult();
+            await statement.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        }
+    }
+
+    private static void RegisterSqlStartGate(
+        SqliteConnection connection, TaskCompletionSource started, TaskCompletionSource resume)
+    {
+        connection.CreateFunction<long, long>("pause_at_sql_start", value =>
+        {
+            started.TrySetResult();
+            if (!resume.Task.Wait(TimeSpan.FromSeconds(5)))
+            {
+                throw new TimeoutException("The SQLite cancellation test did not release the statement.");
+            }
+
+            return value;
+        });
     }
 
     private static async Task<IReadOnlyList<string>> ReadQueryPlanAsync(

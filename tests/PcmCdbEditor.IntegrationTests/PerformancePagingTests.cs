@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using Microsoft.Data.Sqlite;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using PcmCdbEditor.Application;
 using PcmCdbEditor.Domain;
@@ -11,11 +10,16 @@ namespace PcmCdbEditor.IntegrationTests;
 [TestCategory("Performance")]
 public sealed class PerformancePagingTests
 {
+    public TestContext TestContext { get; set; } = null!;
+
     [TestMethod]
     [Timeout(120_000)]
     public async Task MillionRowsAndHundredTablesRemainDatabaseSideBoundedAndRecoverAfterCancellation()
     {
+        var setup = Stopwatch.StartNew();
         await using var database = await CreatePerformanceFixtureAsync().ConfigureAwait(false);
+        setup.Stop();
+        TestContext.WriteLine($"Fixture setup: {setup.Elapsed.TotalSeconds:F3} s");
         var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None)
             .ConfigureAwait(false);
         Assert.IsGreaterThanOrEqualTo(100, catalog.Tables.Count);
@@ -30,21 +34,21 @@ public sealed class PerformancePagingTests
         var stopwatch = Stopwatch.StartNew();
         using var coordinator = new VirtualTableQueryCoordinator(store, database.Path, catalog, query);
         Assert.AreEqual(TableRowCountStatus.Unknown, coordinator.CountState.Status);
-        var page = await coordinator.LoadChunkContainingAsync(500_000, CancellationToken.None)
-            .ConfigureAwait(false);
-        foreach (var offset in new long[] { 500_500, 501_000, 501_500, 502_000 })
+        foreach (var offset in new long[] { 500_000, 500_500, 501_000, 501_500, 502_000 })
         {
-            await coordinator.LoadChunkContainingAsync(offset, CancellationToken.None).ConfigureAwait(false);
+            var page = await coordinator.LoadChunkContainingAsync(offset, CancellationToken.None).ConfigureAwait(false);
+            Assert.HasCount(VirtualTableQueryCoordinator.ChunkSize, page.Items);
+            Assert.AreEqual(1_000_000L - offset, page.Items[0].Values["IDrow"].IntegerValue);
+            Assert.AreEqual(1_000_001L - offset - page.Items.Count, page.Items[^1].Values["IDrow"].IntegerValue);
         }
 
         var count = await coordinator.LoadCountAsync(CancellationToken.None).ConfigureAwait(false);
         stopwatch.Stop();
+        TestContext.WriteLine($"Deep pages and count: {stopwatch.Elapsed.TotalSeconds:F3} s");
         var workingSetGrowth = Process.GetCurrentProcess().WorkingSet64 - before;
-        Assert.HasCount(VirtualTableQueryCoordinator.ChunkSize, page.Items);
         Assert.AreEqual(1_000_000L, count.Value);
         Assert.HasCount(BoundedVirtualWindow<TypedRow>.MaximumChunks, coordinator.Chunks);
         Assert.IsLessThanOrEqualTo(2_000, coordinator.ActiveRows.Count);
-        Assert.IsTrue(page.Items[0].Values["IDrow"].IntegerValue > page.Items[^1].Values["IDrow"].IntegerValue);
         Assert.IsLessThan(TimeSpan.FromSeconds(30), stopwatch.Elapsed);
         Assert.IsLessThan(512L * 1024 * 1024, workingSetGrowth);
 
@@ -72,14 +76,13 @@ public sealed class PerformancePagingTests
             coordinator.ActiveRows.Count);
     }
 
-    private static async Task<SqliteTestDatabase> CreatePerformanceFixtureAsync()
+    private static Task<SqliteTestDatabase> CreatePerformanceFixtureAsync()
     {
         var statements = Enumerable.Range(0, 99)
             .Select(index => $"CREATE TABLE INF_fixture_{index:D2}(ID INTEGER PRIMARY KEY, value TEXT)")
             .Append("CREATE TABLE DYN_large(IDrow INTEGER PRIMARY KEY, bucket INTEGER, label TEXT)")
             .ToArray();
-        var database = await SqliteTestDatabase.CreateAsync(statements).ConfigureAwait(false);
-        await database.ExecuteAsync(@"
+        return SqliteTestDatabase.CreateWithTransactionalSchemaAsync(statements, @"
 WITH RECURSIVE sequence(value) AS (
   VALUES(1)
   UNION ALL
@@ -87,8 +90,6 @@ WITH RECURSIVE sequence(value) AS (
 )
 INSERT INTO DYN_large(IDrow, bucket, label)
 SELECT value, value % 10, 'row-' || value FROM sequence;
-CREATE INDEX IX_DYN_large_bucket_label ON DYN_large(bucket, label);")
-            .ConfigureAwait(false);
-        return database;
+CREATE INDEX IX_DYN_large_bucket_label ON DYN_large(bucket, label);");
     }
 }

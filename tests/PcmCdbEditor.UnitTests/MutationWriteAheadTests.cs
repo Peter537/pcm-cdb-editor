@@ -8,20 +8,30 @@ namespace PcmCdbEditor.UnitTests;
 public sealed class MutationWriteAheadTests
 {
     [TestMethod]
-    public async Task DirtyRecoveryIsPersistedNonCancellablyBeforeMutationStarts()
+    public async Task PrepareWaitsForTheNonCancellableDirtyMarker()
     {
-        var workspace = new RecordingWorkspaceService();
+        var releasePersistence = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var workspace = new RecordingWorkspaceService { ReleasePersistence = releasePersistence.Task };
         var writeAhead = new MutationWriteAhead(workspace);
         EditorSessionState session = CreateSession();
-        var mutationStarted = false;
 
-        EditorSessionState persisted = await writeAhead.PrepareAsync(session).ConfigureAwait(false);
-        mutationStarted = true;
+        Task<EditorSessionState> preparing = writeAhead.PrepareAsync(session);
+        try
+        {
+            await workspace.PersistenceStarted.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            Assert.IsFalse(preparing.IsCompleted);
+            Assert.IsNull(workspace.LastState);
+            Assert.IsFalse(workspace.ObservedToken.CanBeCanceled);
+        }
+        finally
+        {
+            releasePersistence.TrySetResult();
+        }
 
-        Assert.IsTrue(workspace.MarkDirtyCompleted);
-        Assert.IsTrue(mutationStarted);
-        Assert.IsFalse(workspace.ObservedToken.CanBeCanceled);
+        EditorSessionState persisted = await preparing.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        Assert.AreSame(workspace.LastState, persisted);
         Assert.IsTrue(persisted.IsDirty);
+        Assert.IsTrue(persisted.MutationPending);
         Assert.AreEqual(session.SessionId, persisted.SessionId);
     }
 
@@ -30,22 +40,23 @@ public sealed class MutationWriteAheadTests
     {
         var workspace = new RecordingWorkspaceService { FailMarkDirty = true };
         var writeAhead = new MutationWriteAhead(workspace);
-        var mutationStarted = false;
 
-        await Assert.ThrowsExactlyAsync<IOException>(async () =>
-        {
-            _ = await writeAhead.PrepareAsync(CreateSession()).ConfigureAwait(false);
-            mutationStarted = true;
-        }).ConfigureAwait(false);
-
-        Assert.IsFalse(mutationStarted);
-        Assert.IsFalse(workspace.MarkDirtyCompleted);
+        await Assert.ThrowsExactlyAsync<IOException>(() => writeAhead.PrepareAsync(CreateSession()))
+            .ConfigureAwait(false);
+        Assert.IsTrue(workspace.PersistenceStarted.Task.IsCompletedSuccessfully);
+        Assert.IsNull(workspace.LastState);
     }
 
     [TestMethod]
-    public async Task MismatchedOrCleanPersistenceResultIsRejected()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MismatchedOrCleanPersistenceResultIsRejected(bool mismatched)
     {
-        var workspace = new RecordingWorkspaceService { ReturnCleanSession = true };
+        var workspace = new RecordingWorkspaceService
+        {
+            ReturnCleanSession = !mismatched,
+            OverrideSessionId = mismatched ? Guid.NewGuid() : null
+        };
         var writeAhead = new MutationWriteAhead(workspace);
 
         await Assert.ThrowsExactlyAsync<InvalidDataException>(() =>
@@ -127,25 +138,31 @@ public sealed class MutationWriteAheadTests
 
         public bool ReturnCleanSession { get; init; }
 
-        public bool MarkDirtyCompleted { get; private set; }
+        public Guid? OverrideSessionId { get; init; }
+
+        public Task ReleasePersistence { get; init; } = Task.CompletedTask;
+
+        public TaskCompletionSource PersistenceStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
 
         public CancellationToken ObservedToken { get; private set; }
 
         public EditorSessionState? LastState { get; private set; }
 
-        public Task<EditorSessionState> MarkDirtyAsync(
+        public async Task<EditorSessionState> MarkDirtyAsync(
             EditorSessionState session,
             CancellationToken cancellationToken)
         {
             ObservedToken = cancellationToken;
+            PersistenceStarted.TrySetResult();
+            await ReleasePersistence.ConfigureAwait(false);
             if (FailMarkDirty)
             {
                 throw new IOException("Synthetic write-ahead failure.");
             }
 
-            MarkDirtyCompleted = true;
-            LastState = session with { IsDirty = !ReturnCleanSession };
-            return Task.FromResult(LastState);
+            LastState = session with { IsDirty = !ReturnCleanSession, SessionId = OverrideSessionId ?? session.SessionId };
+            return LastState;
         }
 
         public Task<EditorSessionState> OpenAsync(

@@ -74,9 +74,11 @@ public sealed class TableGridAdapterSourceTests
         Assert.IsFalse(
             endingBody.Contains("AnnounceEdit(", StringComparison.Ordinal),
             "CellEditEnding runs before TableView commits and must not start a mutation or rebind.");
+        int endedClose = source.IndexOf("\n    }", endedStart, StringComparison.Ordinal);
+        Assert.IsTrue(endedClose > endedStart, "The post-commit handler must have a complete body.");
         StringAssert.Contains(
-            source[endedStart..],
-            "AnnounceEdit(",
+            source[endedStart..endedClose],
+            "AnnounceEdit(operation);",
             StringComparison.Ordinal);
     }
 

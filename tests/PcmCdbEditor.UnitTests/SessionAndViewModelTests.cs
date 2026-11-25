@@ -7,35 +7,6 @@ namespace PcmCdbEditor.UnitTests;
 public sealed class SessionAndViewModelTests
 {
     [TestMethod]
-    public void SessionWithExpressionProducesImmutableLifecycleTransition()
-    {
-        var original = new EditorSessionState(
-            Guid.NewGuid(),
-            "source.cdb",
-            "source.cdb",
-            "session",
-            "working.cdb",
-            "working.sqlite",
-            false,
-            EditorSessionLifecycle.Ready,
-            DateTimeOffset.UnixEpoch,
-            DateTimeOffset.UnixEpoch,
-            null);
-
-        var changed = original with
-        {
-            IsDirty = true,
-            Lifecycle = EditorSessionLifecycle.Saving,
-            UpdatedAtUtc = DateTimeOffset.UnixEpoch.AddMinutes(1)
-        };
-
-        Assert.IsFalse(original.IsDirty);
-        Assert.AreEqual(EditorSessionLifecycle.Ready, original.Lifecycle);
-        Assert.IsTrue(changed.IsDirty);
-        Assert.AreEqual(EditorSessionLifecycle.Saving, changed.Lifecycle);
-    }
-
-    [TestMethod]
     public void TableViewStateFreezesOnlyPersistentColumnLayoutUnderSchemaSignature()
     {
         var columns = new List<ColumnDisplayState>

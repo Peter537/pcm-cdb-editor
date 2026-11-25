@@ -23,6 +23,7 @@ internal static class BoundedProcessRunner
         IReadOnlyList<string> arguments,
         TimeSpan timeout,
         IReadOnlyCollection<string> sensitiveValues,
+        TimeProvider deadlineClock,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(executablePath);
@@ -44,7 +45,7 @@ internal static class BoundedProcessRunner
         var outputTask = ReadBoundedAndSanitizedAsync(process.StandardOutput, sensitive, readerCancellation.Token);
         var errorTask = ReadBoundedAndSanitizedAsync(process.StandardError, sensitive, readerCancellation.Token);
         var completion = Task.WhenAll(process.WaitForExitAsync(readerCancellation.Token), outputTask, errorTask);
-        using var timeoutSource = new CancellationTokenSource(timeout);
+        using var timeoutSource = new CancellationTokenSource(timeout, deadlineClock);
         using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             timeoutSource.Token);

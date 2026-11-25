@@ -36,6 +36,8 @@ Create Rider fixtures cover clean draft preparation, bounded team/type/region/pr
 
 This opt-in test requires two local CDBs that you own or have permission to test. It hashes each source before and after, copies it to a private temporary directory, and performs the copy-first round trip using only that copied input. Do not use any database without its owner's permission.
 
+The test compares each edited working copy with the reopened export and compares the displaced copy with the backup. It checks object names, reported column metadata, and the exact typed rows of tables, including duplicates. Physical row order, SQLite internal tables and shadow storage, and SQLite-only indexes and triggers are outside the comparison. Views are compared by their reported columns. The report keeps only pass counts and assertions by case number.
+
 ```powershell
 $env:PCM_CDB_AUTHORIZED_SMOKE = '1'
 $env:PCM_CDB_SMOKE_1 = 'C:\path\to\first-authorized.cdb'
@@ -59,6 +61,8 @@ pwsh -NoProfile -File eng/Verify-NativeUi.ps1
 ```
 
 The runner launches a separate editor with its own data root and two generated recovery sessions. It uses Windows UI Automation and directs native clicks and keys only to that editor. Keep its window visible while the checks run. Read-only SQLite connections verify insertion, Undo, Redo, and an inline edit committed by switching tabs. The runner also checks that Escape, unchanged input, and invalid input add no history. It compares rendered header glyphs with the corresponding body cell after horizontal scrolling, both sort directions, and a wide-to-narrow-to-wide tab switch.
+
+The runner checks that F2 followed by Enter writes one typed edit, supports Undo and Redo, and leaves grid selection usable immediately after the commit. It also checks that a failed **All rows** load preserves the finite view and saved page preference. A successful retry shows the exact count and disables both paging buttons.
 
 A synthetic view forces a refresh failure after a durable Undo, then allows a successful retry. The runner verifies that cancelling Resume while SQLite is locked keeps the active and recoverable sessions available. It also checks that a failed replacement preserves the active session and that confirmed close during a pending SQLite count cleans up only that session.
 

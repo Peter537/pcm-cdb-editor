@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
@@ -242,28 +243,31 @@ public sealed class CdbConverterTests
     }
 
     [TestMethod]
-    public async Task TimeoutTerminatesTheRunningProcessAndPreservesBoundedOutput()
+    public async Task TimeoutTerminatesTheRunningConverterAfterStartup()
     {
         using var fixture = await ConverterFixture.CreateAsync(s_fakeConverterPath, "sleep")
             .ConfigureAwait(false);
         var converter = new CdbConverter(fixture.ExecutablePath);
+        using var cancellation = new CancellationTokenSource();
         var stopwatch = Stopwatch.StartNew();
+        Task<ConversionResult> conversion = converter.ExportToSqliteAsync(
+            fixture.InputPath, TimeSpan.FromSeconds(3), cancellation.Token);
+        Process? process = null;
+        try
+        {
+            int processId = await ReadProcessIdAsync(Path.Combine(fixture.Root, "parent.pid")).ConfigureAwait(false);
+            process = OpenRunningFixtureProcess(processId, fixture.ExecutablePath);
+            var exception = await Assert.ThrowsExactlyAsync<CdbConversionException>(() =>
+                conversion.WaitAsync(TimeSpan.FromSeconds(7))).ConfigureAwait(false);
 
-        var exception = await Assert.ThrowsExactlyAsync<CdbConversionException>(() =>
-            converter.ExportToSqliteAsync(
-                fixture.InputPath,
-                TimeSpan.FromMilliseconds(400),
-                CancellationToken.None)).ConfigureAwait(false);
-
-        Assert.AreEqual(ConverterFailureCategory.TimedOut, exception.Failure.Category);
-        Assert.IsTrue(stopwatch.Elapsed < TimeSpan.FromSeconds(5), "The timeout path was not bounded.");
-        var diagnostics = exception.Failure.Diagnostics
-            ?? throw new AssertFailedException("Timeout diagnostics were missing.");
-        StringAssert.Contains(diagnostics.StandardOutput, "ready", StringComparison.Ordinal);
-        var processId = int.Parse(
-            await File.ReadAllTextAsync(Path.Combine(fixture.Root, "parent.pid")).ConfigureAwait(false),
-            CultureInfo.InvariantCulture);
-        await AssertProcessExitedAsync(processId).ConfigureAwait(false);
+            Assert.AreEqual(ConverterFailureCategory.TimedOut, exception.Failure.Category);
+            Assert.IsTrue(stopwatch.Elapsed < TimeSpan.FromSeconds(8), "The timeout path was not bounded.");
+            await AssertProcessExitedAsync(processId).ConfigureAwait(false);
+        }
+        finally
+        {
+            await StopFixtureProcessAsync(cancellation, conversion, process).ConfigureAwait(false);
+        }
     }
 
     [TestMethod]
@@ -300,30 +304,38 @@ public sealed class CdbConverterTests
     {
         using var fixture = await ConverterFixture.CreateAsync(s_fakeConverterPath, "exit-after-child")
             .ConfigureAwait(false);
-        var converter = new CdbConverter(fixture.ExecutablePath);
-        var elapsed = Stopwatch.StartNew();
+        var deadline = new ControlledDeadline();
+        var converter = new CdbConverter(fixture.ExecutablePath, deadline);
+        using var cancellation = new CancellationTokenSource();
         Task<ConversionResult> conversion = converter.ExportToSqliteAsync(
-            fixture.InputPath, TimeSpan.FromSeconds(3), CancellationToken.None);
-        int childId = await ReadProcessIdAsync(Path.Combine(fixture.Root, "child.pid")).ConfigureAwait(false);
-        using var child = Process.GetProcessById(childId);
+            fixture.InputPath, TimeSpan.FromSeconds(30), cancellation.Token);
+        Process? child = null;
         try
         {
+            int childId = await ReadProcessIdAsync(Path.Combine(fixture.Root, "child.pid"), TimeSpan.FromSeconds(10))
+                .ConfigureAwait(false);
+            child = OpenRunningFixtureProcess(childId, fixture.ExecutablePath);
+            Assert.IsNotNull(child, "The fixture descendant must remain alive until the deadline.");
             int parentId = await ReadProcessIdAsync(Path.Combine(fixture.Root, "parent.pid")).ConfigureAwait(false);
             await AssertProcessExitedAsync(parentId).ConfigureAwait(false);
             Assert.IsFalse(child.HasExited, "The descendant must still own the pipe after root exit.");
+            Assert.IsFalse(conversion.IsCompleted, "The deadline must still own the descendant-held pipe.");
+            var elapsed = Stopwatch.StartNew();
+            await deadline.ExpireAsync().ConfigureAwait(false);
             var failure = await Assert.ThrowsExactlyAsync<CdbConversionException>(() =>
                 conversion.WaitAsync(TimeSpan.FromSeconds(7))).ConfigureAwait(false);
             Assert.AreEqual(ConverterFailureCategory.TimedOut, failure.Failure.Category);
+            var diagnostics = failure.Failure.Diagnostics
+                ?? throw new AssertFailedException("Timeout diagnostics were missing.");
+            StringAssert.Contains(diagnostics.StandardOutput, "child started", StringComparison.Ordinal);
+            AssertBoundedAndSanitized(diagnostics.StandardOutput, fixture);
+            AssertBoundedAndSanitized(diagnostics.StandardError, fixture);
             await AssertProcessExitedAsync(childId).ConfigureAwait(false);
             Assert.IsTrue(elapsed.Elapsed < TimeSpan.FromSeconds(8));
         }
         finally
         {
-            if (!child.HasExited)
-            {
-                child.Kill();
-                await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-            }
+            await StopFixtureProcessAsync(cancellation, conversion, child).ConfigureAwait(false);
         }
     }
 
@@ -512,6 +524,26 @@ public sealed class CdbConverterTests
         }
     }
 
+    private static async Task StopFixtureProcessAsync(
+        CancellationTokenSource cancellation, Task conversion, Process? process)
+    {
+        using (process)
+        {
+            try
+            {
+                await CancelAndObserveAsync(cancellation, conversion).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (process is { HasExited: false })
+                {
+                    process.Kill();
+                    await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                }
+            }
+        }
+    }
+
     private static async Task AssertOutputFailureAsync(
         string scenario,
         ConverterFailureCategory expectedCategory)
@@ -540,10 +572,11 @@ public sealed class CdbConverterTests
             char.IsControl(character) && character is not ('\r' or '\n' or '\t')));
     }
 
-    private static async Task<int> ReadProcessIdAsync(string path)
+    private static async Task<int> ReadProcessIdAsync(string path, TimeSpan? timeout = null)
     {
+        TimeSpan limit = timeout ?? TimeSpan.FromSeconds(5);
         var deadline = Stopwatch.StartNew();
-        while (deadline.Elapsed < TimeSpan.FromSeconds(5))
+        while (deadline.Elapsed < limit)
         {
             try
             {
@@ -564,7 +597,41 @@ public sealed class CdbConverterTests
             await Task.Delay(25).ConfigureAwait(false);
         }
 
-        throw new AssertFailedException($"The fake converter did not create {path} within five seconds.");
+        throw new AssertFailedException($"The fake converter did not create {path} within {limit.TotalSeconds} seconds.");
+    }
+
+    private static Process? OpenRunningFixtureProcess(int processId, string expectedPath)
+    {
+        Process process;
+        try
+        {
+            process = Process.GetProcessById(processId);
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+
+        try
+        {
+            if (!process.HasExited &&
+                string.Equals(process.MainModule?.FileName, expectedPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return process;
+            }
+        }
+        catch (Exception exception) when ((exception is Win32Exception or InvalidOperationException) && process.HasExited)
+        {
+            // The real deadline can expire while the fixture handle is being opened.
+        }
+        catch
+        {
+            process.Dispose();
+            throw;
+        }
+
+        process.Dispose();
+        return null;
     }
 
     private static async Task AssertProcessExitedAsync(int processId)
@@ -609,6 +676,27 @@ public sealed class CdbConverterTests
         catch (UnauthorizedAccessException)
         {
             // A failed assertion can briefly leave a process handle open; the temp root remains ignored.
+        }
+    }
+
+    private sealed class ControlledDeadline : TimeProvider
+    {
+        private readonly TaskCompletionSource<ITimer> _timer = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            Assert.IsGreaterThan(TimeSpan.Zero, dueTime);
+            Assert.AreEqual(Timeout.InfiniteTimeSpan, period);
+            ITimer timer = TimeProvider.System.CreateTimer(
+                callback, state, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            _timer.SetResult(timer);
+            return timer;
+        }
+
+        public async Task ExpireAsync()
+        {
+            ITimer timer = await _timer.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            Assert.IsTrue(timer.Change(TimeSpan.Zero, Timeout.InfiniteTimeSpan));
         }
     }
 

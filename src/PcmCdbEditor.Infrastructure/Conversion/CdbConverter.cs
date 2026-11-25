@@ -12,11 +12,19 @@ public sealed class CdbConverter : ICdbConverter
     public static readonly TimeSpan MaximumTimeout = TimeSpan.FromMinutes(10);
 
     private readonly string _executablePath;
+    private readonly TimeProvider _deadlineClock;
 
     public CdbConverter(string executablePath)
+        : this(executablePath, TimeProvider.System)
+    {
+    }
+
+    internal CdbConverter(string executablePath, TimeProvider deadlineClock)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(executablePath);
+        ArgumentNullException.ThrowIfNull(deadlineClock);
         _executablePath = Path.GetFullPath(executablePath);
+        _deadlineClock = deadlineClock;
     }
 
     public async Task<ConversionResult> ExportToSqliteAsync(
@@ -142,6 +150,7 @@ public sealed class CdbConverter : ICdbConverter
                     arguments,
                     effectiveTimeout,
                     sensitivePaths.Append(_executablePath).ToArray(),
+                    _deadlineClock,
                     cancellationToken)
                 .ConfigureAwait(false);
             var diagnostics = new ConverterDiagnostics(

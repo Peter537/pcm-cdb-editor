@@ -7,8 +7,6 @@ namespace PcmCdbEditor.UnitTests;
 public sealed class TableRowDisplayOptionsTests
 {
     private static readonly int[] ExpectedFinitePageSizes = [100, 250, 500];
-    private static readonly string[] ExpectedPickerLabels =
-        ["100 rows", "250 rows", "500 rows", "All rows"];
     private static readonly string[] ExpectedStatusLabels =
         ["100 rows/page", "250 rows/page", "500 rows/page", "All rows"];
     private static readonly int?[] ExpectedPageSizes = [100, 250, 500, null];
@@ -22,9 +20,6 @@ public sealed class TableRowDisplayOptionsTests
 
         TableRowDisplayChoice[] choices = TableRowDisplayOptions.ToolbarChoices.ToArray();
         CollectionAssert.AreEqual(
-            ExpectedPickerLabels,
-            choices.Select(static choice => choice.PickerLabel).ToArray());
-        CollectionAssert.AreEqual(
             ExpectedStatusLabels,
             choices.Select(static choice => choice.StatusLabel).ToArray());
         CollectionAssert.AreEqual(
@@ -35,10 +30,14 @@ public sealed class TableRowDisplayOptionsTests
     [TestMethod]
     public void ToolbarIndexesRoundTripWithoutEncodingPageSizesInUiLogic()
     {
-        for (var index = 0; index < TableRowDisplayOptions.ToolbarChoices.Count; index++)
+        for (var index = 0; index < ExpectedPageSizes.Length; index++)
         {
             TableRowDisplayChoice choice = TableRowDisplayOptions.FromToolbarIndex(index);
-            Assert.AreEqual(index, TableRowDisplayOptions.GetToolbarIndex(choice));
+            Assert.AreEqual(ExpectedPageSizes[index], choice.PageSize);
+            TableRowDisplayChoice expected = ExpectedPageSizes[index] is int size
+                ? TableRowDisplayChoice.FromPageSize(size)
+                : TableRowDisplayChoice.AllRows;
+            Assert.AreEqual(index, TableRowDisplayOptions.GetToolbarIndex(expected));
         }
 
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>

@@ -62,9 +62,9 @@ internal static class FakeConverterProgram
 
         if (mode == "sleep")
         {
-            WriteProcessId(root, "parent.pid");
             Console.Out.WriteLine("ready");
             Console.Out.Flush();
+            WriteProcessId(root, "parent.pid");
             Thread.Sleep(Timeout.Infinite);
             return 0;
         }

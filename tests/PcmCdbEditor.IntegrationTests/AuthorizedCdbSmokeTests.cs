@@ -125,6 +125,36 @@ public sealed class AuthorizedCdbSmokeTests
         Assert.IsFalse(Directory.Exists(scratch));
     }
 
+    [TestMethod]
+    public async Task RoundTripSnapshotIgnoresRowOrderButDetectsTypedDataAndCatalogChanges()
+    {
+        await using var before = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE sentinel(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO sentinel VALUES(1,'edited')",
+            "CREATE TABLE unrelated(value); INSERT INTO unrelated VALUES(7),(7),(X'0001'),(NULL)",
+            "CREATE VIEW related_view AS SELECT value FROM unrelated").ConfigureAwait(false);
+        await using var after = await SqliteTestDatabase.CreateAsync(
+            "CREATE TABLE unrelated(value); INSERT INTO unrelated VALUES(NULL),(X'0001'),(7),(7)",
+            "CREATE TABLE sentinel(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO sentinel VALUES(1,'edited')",
+            "CREATE VIEW related_view AS SELECT value FROM unrelated").ConfigureAwait(false);
+        var expected = await CdbRoundTripSnapshot.ReadAsync(before.Path, CancellationToken.None).ConfigureAwait(false);
+        Assert.IsNull(expected.FindDifference(
+            await CdbRoundTripSnapshot.ReadAsync(after.Path, CancellationToken.None).ConfigureAwait(false)));
+
+        await after.ExecuteAsync("UPDATE unrelated SET value='7' WHERE rowid=3").ConfigureAwait(false);
+        Assert.AreEqual("The round trip changed the typed rows of exported object 3.", expected.FindDifference(
+            await CdbRoundTripSnapshot.ReadAsync(after.Path, CancellationToken.None).ConfigureAwait(false)));
+
+        await after.ExecuteAsync("UPDATE unrelated SET value=7 WHERE rowid=3; DELETE FROM unrelated WHERE rowid=4")
+            .ConfigureAwait(false);
+        Assert.AreEqual("The round trip changed the typed rows of exported object 3.", expected.FindDifference(
+            await CdbRoundTripSnapshot.ReadAsync(after.Path, CancellationToken.None).ConfigureAwait(false)));
+
+        await after.ExecuteAsync("INSERT INTO unrelated VALUES(7); ALTER TABLE unrelated ADD COLUMN extra TEXT")
+            .ConfigureAwait(false);
+        Assert.AreEqual("The round trip changed the column metadata or type of exported object 3.", expected.FindDifference(
+            await CdbRoundTripSnapshot.ReadAsync(after.Path, CancellationToken.None).ConfigureAwait(false)));
+    }
+
     private static async Task WithSmokeScratchAsync(Func<string, Task> run)
     {
         DirectoryInfo scratch = Directory.CreateTempSubdirectory("PcmCdbAuthorizedSmoke-");
@@ -169,6 +199,8 @@ public sealed class AuthorizedCdbSmokeTests
                 cancellationToken)
             .ConfigureAwait(false);
         SentinelTarget sentinel = await CreateSentinelAsync(first.WorkingSqlitePath, cancellationToken).ConfigureAwait(false);
+        var firstContents = await CdbRoundTripSnapshot.ReadAsync(first.WorkingSqlitePath, cancellationToken)
+            .ConfigureAwait(false);
         first = await workspace.MarkDirtyAsync(first, cancellationToken).ConfigureAwait(false);
         WorkspaceSaveResult firstSave = await workspace.SaveAsAsync(
                 first,
@@ -186,6 +218,8 @@ public sealed class AuthorizedCdbSmokeTests
             .ConfigureAwait(false);
         TypedRow secondRow = await ReadSentinelRowAsync(second.WorkingSqlitePath, sentinel, cancellationToken).ConfigureAwait(false);
         Assert.AreEqual(sentinel.FirstValue, secondRow.Values[sentinel.ColumnName]);
+        Assert.IsNull(firstContents.FindDifference(
+            await CdbRoundTripSnapshot.ReadAsync(second.WorkingSqlitePath, cancellationToken).ConfigureAwait(false)));
 
         var store = new SqliteTableDataStore();
         var secondCatalog = await new SqliteTableCatalog()
@@ -206,6 +240,8 @@ public sealed class AuthorizedCdbSmokeTests
                 secondEdit,
                 cancellationToken)
             .ConfigureAwait(false);
+        var secondContents = await CdbRoundTripSnapshot.ReadAsync(second.WorkingSqlitePath, cancellationToken)
+            .ConfigureAwait(false);
         second = await workspace.MarkDirtyAsync(second, cancellationToken).ConfigureAwait(false);
         WorkspaceSaveResult replacement = await workspace.SaveAsync(second, cancellationToken)
             .ConfigureAwait(false);
@@ -222,6 +258,8 @@ public sealed class AuthorizedCdbSmokeTests
             sentinel.SecondValue,
             (await ReadSentinelRowAsync(replaced.WorkingSqlitePath, sentinel, cancellationToken).ConfigureAwait(false))
                 .Values[sentinel.ColumnName]);
+        Assert.IsNull(secondContents.FindDifference(
+            await CdbRoundTripSnapshot.ReadAsync(replaced.WorkingSqlitePath, cancellationToken).ConfigureAwait(false)));
         await workspace.CloseAsync(replaced, discardDirtySession: false, cancellationToken)
             .ConfigureAwait(false);
 
@@ -233,6 +271,8 @@ public sealed class AuthorizedCdbSmokeTests
             sentinel.FirstValue,
             (await ReadSentinelRowAsync(backup.WorkingSqlitePath, sentinel, cancellationToken).ConfigureAwait(false))
                 .Values[sentinel.ColumnName]);
+        Assert.IsNull(firstContents.FindDifference(
+            await CdbRoundTripSnapshot.ReadAsync(backup.WorkingSqlitePath, cancellationToken).ConfigureAwait(false)));
         await workspace.CloseAsync(backup, discardDirtySession: false, cancellationToken)
             .ConfigureAwait(false);
 

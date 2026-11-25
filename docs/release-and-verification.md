@@ -99,7 +99,7 @@ Verify actual installation in Windows Sandbox on a compatible Windows x64 host w
 
 The probe disables guest networking and maps only the read-only installer input and an isolated result directory. It compares every installed payload path, size, and SHA-256 against the ZIP-verified staging directory, allowing the two Inno-generated uninstall files. It verifies HKCU registration, the Start Menu shortcut, preservation of a seeded `.cdb` default, uninstall cleanup, and survival of synthetic user data. The release verifier checks the result against the current installer checksum and adds it to `SHA256SUMS.txt`.
 
-Run `./eng/Test-ReleaseTooling.ps1` to check source capture, candidate promotion, and installer manifest rejection against synthetic fixtures. Windows Sandbox is needed for actual installation evidence. If a host or VM is forcibly terminated, close the task-owned process or Sandbox before removing only the scratch path printed for that run.
+Run `./eng/Test-ReleaseTooling.ps1` to check source capture, candidate promotion, installer manifest rejection, and ZIP-to-payload verification against synthetic fixtures. Windows Sandbox is needed for actual installation evidence. If a host or VM is forcibly terminated, close the task-owned process or Sandbox before removing only the scratch path printed for that run.
 
 ## Local candidate handling
 

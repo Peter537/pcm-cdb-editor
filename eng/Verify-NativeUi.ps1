@@ -81,6 +81,11 @@ public static class UiAcceptanceInput
     Focus(hwnd);
     Send(KeyEvent(key,0), KeyEvent(key,2));
   }
+  public static void ControlA(IntPtr hwnd)
+  {
+    Focus(hwnd);
+    Send(KeyEvent(0x11,0), KeyEvent(0x41,0), KeyEvent(0x41,2), KeyEvent(0x11,2));
+  }
 }
 '@
 
@@ -232,6 +237,12 @@ with contextlib.closing(sqlite3.connect(sys.argv[1])) as db, db:
         FROM trap_control
         """)
     db.execute("""
+        CREATE VIEW zz_all_rows_trap AS
+        SELECT id, CASE WHEN id=501 AND (SELECT fail FROM trap_control)=1
+                        THEN json_extract('invalid-fixture-json', '$') ELSE note END AS note
+        FROM sample
+        """)
+    db.execute("""
         CREATE VIEW zz_slow_count AS
         WITH RECURSIVE counter(n) AS (
             VALUES(1) UNION ALL SELECT n + 1 FROM counter WHERE n < 50000000
@@ -318,7 +329,7 @@ with contextlib.closing(sqlite3.connect(sys.argv[1], timeout=3)) as db, db:
 }
 
 function Read-GridNote {
-    param([string] $Sqlite, [int] $Id)
+    param([string] $Sqlite, [int] $Id, [switch] $IncludeType)
 
     $value = @'
 import contextlib
@@ -327,14 +338,15 @@ import sqlite3
 import sys
 
 with contextlib.closing(sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
-    print(db.execute("SELECT note FROM sample WHERE id=?", (int(sys.argv[2]),)).fetchone()[0])
-'@ | & $python.Source - $Sqlite $Id
+    note, kind = db.execute("SELECT note, typeof(note) FROM sample WHERE id=?", (int(sys.argv[2]),)).fetchone()
+    print(f"{kind}:{note}" if sys.argv[3] == "1" else note)
+'@ | & $python.Source - $Sqlite $Id ([int] $IncludeType.IsPresent)
     if ($LASTEXITCODE -ne 0) { throw 'Could not read the inline edit fixture.' }
     $value
 }
 
 function Start-InlineEdit {
-    param([string] $CellValue, [switch] $RequireExactCell)
+    param([string] $CellValue, [switch] $RequireExactCell, [switch] $F2Only)
 
     $condition = [Windows.Automation.PropertyCondition]::new(
         [Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -359,8 +371,13 @@ function Start-InlineEdit {
     }
     if (!$openedEditor) {
         Click-Element (Wait-GridValue $CellValue)
-        Start-Sleep -Milliseconds 85
-        Click-Element (Wait-GridValue $CellValue)
+        if ($F2Only) {
+            [UiAcceptanceInput]::Key($process.MainWindowHandle, 113)
+        }
+        else {
+            Start-Sleep -Milliseconds 85
+            Click-Element (Wait-GridValue $CellValue)
+        }
     }
     $textbox = Wait-Observation "the inline editor for $CellValue" $findEditor
     $value = $textbox.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
@@ -368,6 +385,120 @@ function Start-InlineEdit {
         throw 'The inline editor opened on the wrong fixture cell.'
     }
     $value
+}
+
+function Find-GridRowSelection {
+    param([string] $Value)
+
+    $walker = [Windows.Automation.TreeWalker]::RawViewWalker
+    $element = Find-GridValue $Value
+    while ($element -and $element.Current.AutomationId -ne 'GridControl') {
+        $pattern = $null
+        if ($element.TryGetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern, [ref] $pattern)) {
+            return $pattern
+        }
+        $element = $walker.GetParent($element)
+    }
+}
+
+function Test-InlineEnter {
+    param([pscustomobject] $Fixture)
+
+    Switch-TableTab 'sample' 'row-000'
+    $historyPath = Join-Path $Fixture.Directory 'edit-history.json'
+    $before = Get-Content -Raw -LiteralPath $historyPath | ConvertFrom-Json
+    $editorValue = Start-InlineEdit 'row-000' -RequireExactCell -F2Only
+    $editorValue.SetValue('committed-by-enter')
+    [UiAcceptanceInput]::Key($process.MainWindowHandle, 13)
+    $null = Wait-GridValue 'committed-by-enter'
+
+    $after = Wait-Observation 'the durable Enter edit and its history' {
+        $current = Get-Content -Raw -LiteralPath $historyPath | ConvertFrom-Json
+        if ($current.CurrentStateId -ne $before.CurrentStateId -and $null -eq $current.Pending -and
+            (Read-GridNote $Fixture.Sqlite 1 -IncludeType) -ceq 'text:committed-by-enter') {
+            $current
+        }
+    }
+    $null = Wait-Element 'UndoEditCommand' -Enabled
+    $operation = $after.Undo[0].Operation
+    $identity = $operation.Identity.Components[0]
+    if (@($after.Undo).Count -ne (@($before.Undo).Count + 1) -or @($after.Redo).Count -ne 0 -or
+        $null -ne $after.Pending -or $after.CurrentStateId -ne $after.Undo[0].AfterStateId -or
+        $after.Undo[0].BeforeStateId -ne $before.CurrentStateId -or
+        $operation.Kind -cne 'row-update' -or $operation.TableName -cne 'sample' -or
+        $identity.ColumnName -cne 'id' -or $identity.Value.IntegerValue -ne 1 -or
+        $operation.OldValues.note.TextValue -cne 'row-000' -or
+        $operation.NewValues.note.TextValue -cne 'committed-by-enter') {
+        throw 'Enter did not persist exactly one typed edit for the original cell.'
+    }
+
+    $selection = Wait-Observation 'the neighboring row selection peer' {
+        Find-GridRowSelection 'row-001'
+    }
+    if ($selection.Current.IsSelected) { throw 'The neighboring row was already selected before Ctrl+A.' }
+    [UiAcceptanceInput]::ControlA($process.MainWindowHandle)
+    $null = Wait-Observation 'Ctrl+A to select the neighboring row' {
+        $current = Find-GridRowSelection 'row-001'
+        $current -and $current.Current.IsSelected
+    }
+    Invoke-Element (Wait-Element 'UndoEditCommand' -Enabled)
+    $null = Wait-GridValue 'row-000'
+    if ((Read-GridNote $Fixture.Sqlite 1 -IncludeType) -cne 'text:row-000') {
+        throw 'Undo did not restore the original typed value after Enter.'
+    }
+    Invoke-Element (Wait-Element 'RedoEditCommand' -Enabled)
+    $null = Wait-GridValue 'committed-by-enter'
+    if ((Read-GridNote $Fixture.Sqlite 1 -IncludeType) -cne 'text:committed-by-enter') {
+        throw 'Redo did not restore the typed value committed by Enter.'
+    }
+    Write-Output 'PASS F2 and Enter committed one typed edit, kept grid selection usable, and supported Undo and Redo.'
+}
+
+function Select-RowDisplayChoice {
+    param([string] $Name)
+
+    $picker = Wait-Element 'TablePageSize' -Enabled
+    $picker.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    Select-Element (Wait-Element $Name -ByName -Enabled)
+}
+
+function Test-AllRowsDisplay {
+    param([pscustomobject] $Fixture)
+
+    Select-CatalogTable 'zz_all_rows_trap'
+    $finite = 'zz_all_rows_trap · 1–500 of 501 rows'
+    $null = Wait-Element $finite -ByName
+    $null = Wait-GridValue 'committed-by-enter'
+    $null = Wait-Element 'NextTablePageCommand' -Enabled
+    $settingsPath = Join-Path $dataRoot 'settings.json'
+
+    Set-RefreshTrap -Sqlite $Fixture.Sqlite -Enabled $true
+    try {
+        Select-RowDisplayChoice 'All rows (slower)'
+        $null = Wait-Element 'Could not update the table query' -ByName
+        $null = Wait-Element $finite -ByName
+        $null = Wait-GridValue 'committed-by-enter'
+        $null = Wait-Element 'NextTablePageCommand' -Enabled
+        $picker = Wait-Element 'TablePageSize' -Enabled
+        $selected = $picker.GetCurrentPattern([Windows.Automation.SelectionPattern]::Pattern).GetSelection()
+        if (@($selected).Count -ne 1 -or $selected[0].Current.Name -cne '500 rows' -or
+            (Get-Content -Raw -LiteralPath $settingsPath | ConvertFrom-Json).Preferences.PageSize -ne 500) {
+            throw 'The failed All Rows request changed the finite page choice or its saved preference.'
+        }
+    }
+    finally {
+        Set-RefreshTrap -Sqlite $Fixture.Sqlite -Enabled $false
+    }
+
+    Select-RowDisplayChoice 'All rows (slower)'
+    $null = Wait-Element 'zz_all_rows_trap · 1–501 of 501 rows' -ByName
+    $null = Wait-Element 'All rows loaded' -ByName
+    if ((Wait-Element 'PreviousTablePageCommand').Current.IsEnabled -or
+        (Wait-Element 'NextTablePageCommand').Current.IsEnabled -or
+        (Get-Content -Raw -LiteralPath $settingsPath | ConvertFrom-Json).Preferences.PageSize -ne 500) {
+        throw 'All Rows enabled paging or replaced the saved finite preference.'
+    }
+    Write-Output 'PASS All Rows reported the exact count and kept the finite view and preference after a failed load.'
 }
 
 function Test-InlineTabSwitch {
@@ -791,6 +922,8 @@ with sqlite3.connect(sys.argv[1]) as connection:
     }
     Write-Output 'PASS Failed recovery replacement kept the prior session and its edits.'
 
+    Test-InlineEnter $original
+    Test-AllRowsDisplay $original
     Select-CatalogTable 'zz_slow_count'
 
     $pendingCount = Wait-Observation 'the outstanding SQLite count' {

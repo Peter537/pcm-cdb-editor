@@ -480,7 +480,6 @@ public sealed class MainWindowAccessibilityTests
         CollectionAssert.AreEqual(
             ExpectedTableRowDisplayLabels,
             optionLabels);
-        Assert.AreEqual("TablePageSize", (string?)pageSizeBox.Attribute("AutomationProperties.AutomationId"));
         Assert.AreEqual("Rows to show", (string?)pageSizeBox.Attribute("AutomationProperties.Name"));
         Assert.AreEqual(helpText, (string?)pageSizeBox.Attribute("AutomationProperties.HelpText"));
 

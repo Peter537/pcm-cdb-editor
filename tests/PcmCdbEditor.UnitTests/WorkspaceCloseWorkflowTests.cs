@@ -7,6 +7,17 @@ namespace PcmCdbEditor.UnitTests;
 public sealed class WorkspaceCloseWorkflowTests
 {
     [TestMethod]
+    public async Task UnsuccessfulSaveKeepsTheWorkspaceOpen()
+    {
+        WorkspaceCloseCompletion result = await WorkspaceCloseWorkflow.CompleteAsync(
+            _ => Task.FromResult(false),
+            _ => throw new AssertFailedException("An unsuccessful save must not close the workspace."),
+            CancellationToken.None).ConfigureAwait(false);
+
+        Assert.AreEqual(WorkspaceCloseOutcome.SaveDidNotComplete, result.Outcome);
+    }
+
+    [TestMethod]
     public async Task CancelAfterSaveCommitsKeepsTheWindowOpenAndReportsTheSuccessfulSave()
     {
         using var gate = new ExclusiveOperationGate();

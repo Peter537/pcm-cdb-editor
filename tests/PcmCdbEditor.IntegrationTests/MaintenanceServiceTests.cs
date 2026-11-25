@@ -130,6 +130,10 @@ public sealed class MaintenanceServiceTests
         var operation = Assert.IsInstanceOfType<MaintenanceEditOperation>(result.HistoryOperation);
         Assert.AreEqual(SqliteValue.Integer(long.MaxValue),
             Assert.ContainsSingle(operation.Changes).BeforeValues!["value_i_injury_num_days"]);
+        await VerifyPersistedUndoAndRedoAsync(database, result,
+            "SELECT typeof(value_i_injury_num_days) || ':' || value_i_injury_num_days " +
+            "FROM DYN_cyclist_fitness WHERE IDcyclist = 1",
+            "integer:9223372036854775807", "integer:0").ConfigureAwait(false);
     }
 
     [TestMethod]
@@ -453,6 +457,12 @@ public sealed class MaintenanceServiceTests
         Assert.AreEqual(SqliteValueKind.Text, change.BeforeValues["text_value"].Kind);
         Assert.AreEqual(SqliteValueKind.Blob, change.BeforeValues["blob_value"].Kind);
         Assert.AreEqual(RowReplayExpectation.Absent, Assert.ContainsSingle(applied.UndoGuards!).Expectation);
+        await VerifyPersistedUndoAndRedoAsync(typedDatabase, applied, """
+            SELECT COALESCE((SELECT IDresult_season_stage || ':' || typeof(null_value) || ':' ||
+                   typeof(integer_value) || ':' || integer_value || ':' || typeof(real_value) || ':' ||
+                   real_value || ':' || typeof(text_value) || ':' || text_value || ':' ||
+                   typeof(blob_value) || ':' || hex(blob_value) FROM DYN_result_season_stage), 'empty')
+            """, "1:null:integer:7:real:1.5:text:neutral:blob:0102", "empty").ConfigureAwait(false);
 
         await using var emptyDatabase = await SqliteTestDatabase.CreateAsync(
             "CREATE TABLE GAM_config(gene_i_date TEXT); INSERT INTO GAM_config VALUES('20270101')",
@@ -743,6 +753,13 @@ public sealed class MaintenanceServiceTests
             .ConfigureAwait(false);
         Assert.AreEqual(0, noOp.AffectedRows);
         Assert.IsNull(noOp.HistoryOperation);
+        await VerifyPersistedUndoAndRedoAsync(database, applied, """
+            SELECT group_concat(value, '|') FROM (
+                SELECT IDcountry || ':' || quote(gene_i_num_cyclist_WC) || ':' ||
+                       quote(gene_i_num_cyclist_WC_ITT) || ':' || quote(gene_i_num_cyclist_EC) || ':' ||
+                       quote(gene_i_num_cyclist_EC_ITT) AS value FROM STA_country ORDER BY IDcountry
+            )
+            """, "1:0:0:0:0|2:8:2:8:2", "1:8:2:8:2|2:0:0:0:0").ConfigureAwait(false);
     }
 
     [TestMethod]
@@ -823,6 +840,55 @@ public sealed class MaintenanceServiceTests
             quotaService.ApplyAsync(quotaDatabase.Path, quotaPreview, cancellation.Token)).ConfigureAwait(false);
         Assert.AreEqual(0L, await quotaDatabase.ScalarAsync<long>(
             "SELECT gene_i_num_cyclist_WC FROM STA_country WHERE IDcountry=1").ConfigureAwait(false));
+    }
+
+    [TestMethod]
+    public async Task RiderRecoveryCancellationAfterTheFirstUpdateRollsBackEveryRow()
+    {
+        await using var database = await CreateRiderDatabaseAsync().ConfigureAwait(false);
+        using var cancellation = new CancellationTokenSource();
+        var updated = new List<long>();
+        var service = new RiderRecoveryService(id =>
+        {
+            updated.Add(id);
+            cancellation.Cancel();
+        });
+        RiderRecoveryPreview preview = await service.PreviewAsync(database.Path, [1, 2], CancellationToken.None)
+            .ConfigureAwait(false);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            service.ApplyAsync(database.Path, preview, cancellation.Token)).ConfigureAwait(false);
+        Assert.AreEqual(1L, Assert.ContainsSingle(updated));
+        Assert.AreEqual("10.0:5|11.0:6", await database.ScalarAsync<string>("""
+            SELECT group_concat(value, '|') FROM (
+                SELECT value_f_FIT || ':' || value_i_injury_num_days AS value
+                FROM DYN_cyclist_fitness ORDER BY IDcyclist
+            )
+            """).ConfigureAwait(false));
+    }
+
+    private static async Task VerifyPersistedUndoAndRedoAsync(
+        SqliteTestDatabase database, MaintenanceApplyResult applied, string observation, string before, string after)
+    {
+        Assert.AreEqual(after, await database.ScalarAsync<string>(observation).ConfigureAwait(false));
+        var catalog = await new SqliteTableCatalog().DiscoverAsync(database.Path, CancellationToken.None)
+            .ConfigureAwait(false);
+        var historyPath = Path.Combine(database.Directory, "replay-history.json");
+        new EditHistory(historyPath).Record(applied.HistoryOperation!, applied.UndoGuards!);
+        var history = new EditHistory(historyPath);
+        var replayer = new SqliteEditOperationReplayer();
+        EditHistoryReplay undo = history.TakeUndoReplay();
+        EditReplayResult undone = await replayer.ReplayAsync(database.Path, catalog, undo, CancellationToken.None)
+            .ConfigureAwait(false);
+        history.CompleteUndo(undo, undone.OppositeGuards);
+        Assert.AreEqual(before, await database.ScalarAsync<string>(observation).ConfigureAwait(false));
+
+        history = new EditHistory(historyPath);
+        EditHistoryReplay redo = history.TakeRedoReplay();
+        EditReplayResult redone = await replayer.ReplayAsync(database.Path, catalog, redo, CancellationToken.None)
+            .ConfigureAwait(false);
+        history.CompleteRedo(redo, redone.OppositeGuards);
+        Assert.AreEqual(after, await database.ScalarAsync<string>(observation).ConfigureAwait(false));
     }
 
     private const string RiderSchema = @"CREATE TABLE DYN_cyclist_fitness(

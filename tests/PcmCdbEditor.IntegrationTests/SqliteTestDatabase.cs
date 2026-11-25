@@ -14,7 +14,13 @@ internal sealed class SqliteTestDatabase : IAsyncDisposable
 
     public string Path { get; }
 
-    public static async Task<SqliteTestDatabase> CreateAsync(params string[] statements)
+    public static Task<SqliteTestDatabase> CreateAsync(params string[] statements) =>
+        CreateAsync([], statements);
+
+    public static Task<SqliteTestDatabase> CreateWithTransactionalSchemaAsync(
+        string[] schema, params string[] statements) => CreateAsync(schema, statements);
+
+    private static async Task<SqliteTestDatabase> CreateAsync(string[] schema, string[] statements)
     {
         var directory = System.IO.Path.Combine(
             System.IO.Path.GetTempPath(),
@@ -22,16 +28,46 @@ internal sealed class SqliteTestDatabase : IAsyncDisposable
             Guid.NewGuid().ToString("N"));
         System.IO.Directory.CreateDirectory(directory);
         var path = System.IO.Path.Combine(directory, "fixture.sqlite");
-        await using var connection = Open(path);
-        await connection.OpenAsync().ConfigureAwait(false);
+        var database = new SqliteTestDatabase(directory, path);
+        try
+        {
+            await using var connection = Open(path);
+            await connection.OpenAsync().ConfigureAwait(false);
+            if (schema.Length != 0)
+            {
+                using var transaction = connection.BeginTransaction();
+                await ExecuteStatementsAsync(connection, schema, transaction).ConfigureAwait(false);
+                transaction.Commit();
+            }
+
+            await ExecuteStatementsAsync(connection, statements, transaction: null).ConfigureAwait(false);
+            return database;
+        }
+        catch (Exception setupFailure)
+        {
+            try
+            {
+                await database.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (IOException cleanupFailure)
+            {
+                throw new AggregateException("SQLite fixture setup and cleanup both failed.", setupFailure, cleanupFailure);
+            }
+
+            throw;
+        }
+    }
+
+    private static async Task ExecuteStatementsAsync(
+        SqliteConnection connection, IEnumerable<string> statements, SqliteTransaction? transaction)
+    {
         foreach (var statement in statements)
         {
             await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText = statement;
             await command.ExecuteNonQueryAsync().ConfigureAwait(false);
         }
-
-        return new SqliteTestDatabase(directory, path);
     }
 
     public async Task ExecuteAsync(string statement)
@@ -58,16 +94,25 @@ internal sealed class SqliteTestDatabase : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         SqliteConnection.ClearAllPools();
-        try
+        for (var attempt = 0; ; attempt++)
         {
-            if (System.IO.Directory.Exists(Directory))
+            try
             {
-                System.IO.Directory.Delete(Directory, recursive: true);
+                if (System.IO.Directory.Exists(Directory))
+                {
+                    System.IO.Directory.Delete(Directory, recursive: true);
+                }
+
+                return;
             }
-        }
-        catch (IOException)
-        {
-            // A failed test still leaves only an isolated temp fixture.
+            catch (IOException) when (attempt < 2)
+            {
+                await Task.Delay(50).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                throw new IOException($"Could not remove SQLite fixture '{Directory}'.", exception);
+            }
         }
     }
 

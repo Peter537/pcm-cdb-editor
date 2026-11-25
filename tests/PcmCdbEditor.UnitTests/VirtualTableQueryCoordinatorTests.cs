@@ -7,10 +7,11 @@ namespace PcmCdbEditor.UnitTests;
 [TestClass]
 public sealed class VirtualTableQueryCoordinatorTests
 {
+    private static readonly TimeSpan RendezvousTimeout = TimeSpan.FromSeconds(5);
     [TestMethod]
     public async Task CountStartsUnknownLoadsLazilyAndRecoversAfterIndependentCancellation()
     {
-        var store = new RecordingTableDataStore { CountResult = 2_345 };
+        using var store = new RecordingTableDataStore { CountResult = 2_345 };
         using var coordinator = CreateCoordinator(store);
 
         Assert.AreEqual(TableRowCountStatus.Unknown, coordinator.CountState.Status);
@@ -19,10 +20,10 @@ public sealed class VirtualTableQueryCoordinatorTests
         store.BlockCount = true;
         using var cancelled = new CancellationTokenSource();
         Task<TableRowCountState> pending = coordinator.LoadCountAsync(cancelled.Token);
-        await store.CountStarted.Task.ConfigureAwait(false);
+        await store.CountStarted.Task.WaitAsync(RendezvousTimeout).ConfigureAwait(false);
         Assert.AreEqual(TableRowCountStatus.Loading, coordinator.CountState.Status);
         cancelled.Cancel();
-        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending.WaitAsync(RendezvousTimeout)).ConfigureAwait(false);
         Assert.AreEqual(TableRowCountStatus.Cancelled, coordinator.CountState.Status);
 
         store.BlockCount = false;
@@ -40,7 +41,7 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task ChunksAlignBoundariesUseLruEvictionAndRefetchEvictedRanges()
     {
-        var store = new RecordingTableDataStore();
+        using var store = new RecordingTableDataStore();
         using var coordinator = CreateCoordinator(store);
 
         VirtualChunk<TypedRow> first = await coordinator.LoadChunkContainingAsync(499, CancellationToken.None)
@@ -72,7 +73,7 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task ResetCancelsOldFetchClearsRowsAndPreservesDatabaseQueryShape()
     {
-        var store = new RecordingTableDataStore { BlockRows = true };
+        using var store = new RecordingTableDataStore { BlockRows = true };
         var original = new TableQuery(
             "items",
             new PageRequest(73, 12),
@@ -83,9 +84,9 @@ public sealed class VirtualTableQueryCoordinatorTests
         using var coordinator = CreateCoordinator(store, original);
 
         Task<VirtualChunk<TypedRow>> pending = coordinator.LoadChunkContainingAsync(700, CancellationToken.None);
-        await store.RowsStarted.Task.ConfigureAwait(false);
+        await store.RowsStarted.Task.WaitAsync(RendezvousTimeout).ConfigureAwait(false);
         coordinator.Reset(original);
-        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending.WaitAsync(RendezvousTimeout)).ConfigureAwait(false);
         Assert.IsEmpty(coordinator.Chunks);
         Assert.AreEqual(TableRowCountStatus.Unknown, coordinator.CountState.Status);
 
@@ -103,7 +104,7 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task InvalidateDropsCachedRowsAndCountThenRefetchesTheSameQuery()
     {
-        var store = new RecordingTableDataStore { CountResult = 731 };
+        using var store = new RecordingTableDataStore { CountResult = 731 };
         var query = new TableQuery(
             "items",
             new PageRequest(0, 100),
@@ -143,7 +144,7 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task CallerCancellationRejectsLateRowsFromANonCooperativeStore()
     {
-        var store = new RecordingTableDataStore
+        using var store = new RecordingTableDataStore
         {
             BlockRows = true,
             IgnoreRowCancellation = true,
@@ -154,18 +155,18 @@ public sealed class VirtualTableQueryCoordinatorTests
         Task<VirtualChunk<TypedRow>> pending = coordinator.LoadChunkContainingAsync(
             0,
             cancellation.Token);
-        await store.RowsStarted.Task.ConfigureAwait(false);
+        await store.RowsStarted.Task.WaitAsync(RendezvousTimeout).ConfigureAwait(false);
         cancellation.Cancel();
         store.ReleaseRows.TrySetResult();
 
-        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending.WaitAsync(RendezvousTimeout)).ConfigureAwait(false);
         Assert.IsEmpty(coordinator.Chunks);
     }
 
     [TestMethod]
     public async Task AllRowsUseThePageIndependentDefinitionWithoutGrowingTheBoundedWindow()
     {
-        var store = new RecordingTableDataStore { AllRowsResultCount = 750 };
+        using var store = new RecordingTableDataStore { AllRowsResultCount = 750 };
         var query = new TableQuery(
             "items",
             new PageRequest(73, 12),
@@ -194,7 +195,7 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task InvalidateRejectsLateAllRowsFromANonCooperativeStore()
     {
-        var store = new RecordingTableDataStore
+        using var store = new RecordingTableDataStore
         {
             BlockAllRows = true,
             IgnoreAllRowsCancellation = true,
@@ -202,11 +203,11 @@ public sealed class VirtualTableQueryCoordinatorTests
         using var coordinator = CreateCoordinator(store);
 
         Task<IReadOnlyList<TypedRow>> pending = coordinator.LoadAllRowsAsync(CancellationToken.None);
-        await store.AllRowsStarted.Task.ConfigureAwait(false);
+        await store.AllRowsStarted.Task.WaitAsync(RendezvousTimeout).ConfigureAwait(false);
         coordinator.Invalidate();
         store.ReleaseAllRows.TrySetResult();
 
-        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending.WaitAsync(RendezvousTimeout)).ConfigureAwait(false);
         Assert.IsEmpty(coordinator.Chunks);
         Assert.AreEqual(TableRowCountStatus.Unknown, coordinator.CountState.Status);
     }
@@ -214,7 +215,7 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task CallerCancellationRejectsLateAllRowsFromANonCooperativeStore()
     {
-        var store = new RecordingTableDataStore
+        using var store = new RecordingTableDataStore
         {
             BlockAllRows = true,
             IgnoreAllRowsCancellation = true,
@@ -223,11 +224,11 @@ public sealed class VirtualTableQueryCoordinatorTests
         using var cancellation = new CancellationTokenSource();
 
         Task<IReadOnlyList<TypedRow>> pending = coordinator.LoadAllRowsAsync(cancellation.Token);
-        await store.AllRowsStarted.Task.ConfigureAwait(false);
+        await store.AllRowsStarted.Task.WaitAsync(RendezvousTimeout).ConfigureAwait(false);
         cancellation.Cancel();
         store.ReleaseAllRows.TrySetResult();
 
-        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending.WaitAsync(RendezvousTimeout)).ConfigureAwait(false);
         Assert.IsEmpty(coordinator.Chunks);
         Assert.IsEmpty(coordinator.ActiveRows);
     }
@@ -235,7 +236,7 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task ResetRejectsLateAllRowsFromThePreviousQueryLifetime()
     {
-        var store = new RecordingTableDataStore
+        using var store = new RecordingTableDataStore
         {
             BlockAllRows = true,
             IgnoreAllRowsCancellation = true,
@@ -244,14 +245,14 @@ public sealed class VirtualTableQueryCoordinatorTests
         using var coordinator = CreateCoordinator(store, original);
 
         Task<IReadOnlyList<TypedRow>> pending = coordinator.LoadAllRowsAsync(CancellationToken.None);
-        await store.AllRowsStarted.Task.ConfigureAwait(false);
+        await store.AllRowsStarted.Task.WaitAsync(RendezvousTimeout).ConfigureAwait(false);
         coordinator.Reset(new TableQuery(
             "items",
             new PageRequest(0, 250),
             [new SortDescriptor("ID", SortDirection.Descending)]));
         store.ReleaseAllRows.TrySetResult();
 
-        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending.WaitAsync(RendezvousTimeout)).ConfigureAwait(false);
         Assert.IsEmpty(coordinator.Chunks);
         Assert.AreEqual(TableRowCountStatus.Unknown, coordinator.CountState.Status);
     }
@@ -259,19 +260,19 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task DisposeRejectsLateAllRowsFromANonCooperativeStore()
     {
-        var store = new RecordingTableDataStore
+        using var store = new RecordingTableDataStore
         {
             BlockAllRows = true,
             IgnoreAllRowsCancellation = true,
         };
-        VirtualTableQueryCoordinator coordinator = CreateCoordinator(store);
+        using VirtualTableQueryCoordinator coordinator = CreateCoordinator(store);
 
         Task<IReadOnlyList<TypedRow>> pending = coordinator.LoadAllRowsAsync(CancellationToken.None);
-        await store.AllRowsStarted.Task.ConfigureAwait(false);
+        await store.AllRowsStarted.Task.WaitAsync(RendezvousTimeout).ConfigureAwait(false);
         coordinator.Dispose();
         store.ReleaseAllRows.TrySetResult();
 
-        await Assert.ThrowsAsync<OperationCanceledException>(() => pending).ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending.WaitAsync(RendezvousTimeout)).ConfigureAwait(false);
         Assert.IsEmpty(coordinator.Chunks);
         Assert.IsEmpty(coordinator.ActiveRows);
     }
@@ -279,7 +280,7 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task FailedAllRowsQueryDoesNotMutateTheBoundedWindow()
     {
-        var store = new RecordingTableDataStore();
+        using var store = new RecordingTableDataStore();
         using var coordinator = CreateCoordinator(store);
         VirtualChunk<TypedRow> existing = await coordinator.LoadChunkContainingAsync(
                 0,
@@ -300,13 +301,13 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task CountsRemainIndependentAcrossTabsAndRejectLateCancellation()
     {
-        var firstStore = new RecordingTableDataStore
+        using var firstStore = new RecordingTableDataStore
         {
             BlockCount = true,
             IgnoreCountCancellation = true,
             CountResult = 111,
         };
-        var secondStore = new RecordingTableDataStore
+        using var secondStore = new RecordingTableDataStore
         {
             BlockCount = true,
             IgnoreCountCancellation = true,
@@ -318,15 +319,15 @@ public sealed class VirtualTableQueryCoordinatorTests
 
         Task<TableRowCountState> firstPending = first.LoadCountAsync(firstCancellation.Token);
         Task<TableRowCountState> secondPending = second.LoadCountAsync(CancellationToken.None);
-        await Task.WhenAll(firstStore.CountStarted.Task, secondStore.CountStarted.Task)
+        await Task.WhenAll(firstStore.CountStarted.Task, secondStore.CountStarted.Task).WaitAsync(RendezvousTimeout)
             .ConfigureAwait(false);
 
         firstCancellation.Cancel();
         firstStore.ReleaseCount.TrySetResult();
         secondStore.ReleaseCount.TrySetResult();
 
-        await Assert.ThrowsAsync<OperationCanceledException>(() => firstPending).ConfigureAwait(false);
-        TableRowCountState secondResult = await secondPending.ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => firstPending.WaitAsync(RendezvousTimeout)).ConfigureAwait(false);
+        TableRowCountState secondResult = await secondPending.WaitAsync(RendezvousTimeout).ConfigureAwait(false);
         Assert.AreEqual(TableRowCountStatus.Cancelled, first.CountState.Status);
         Assert.AreEqual(TableRowCountStatus.Available, secondResult.Status);
         Assert.AreEqual(222L, secondResult.Value);
@@ -335,25 +336,27 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task AnOlderCountCannotReplaceOrReturnAfterANewerCount()
     {
-        var store = new RecordingTableDataStore { BlockCount = true, IgnoreCountCancellation = true };
+        using var store = new RecordingTableDataStore { BlockCount = true, IgnoreCountCancellation = true };
         using var coordinator = CreateCoordinator(store);
         Task<TableRowCountState> older = coordinator.LoadCountAsync(CancellationToken.None);
-        await store.CountStarted.Task.ConfigureAwait(false);
+        await store.CountStarted.Task.WaitAsync(RendezvousTimeout).ConfigureAwait(false);
 
         store.BlockCount = false;
         store.CountResult = 222;
-        Assert.AreEqual(222L, (await coordinator.LoadCountAsync(CancellationToken.None).ConfigureAwait(false)).Value);
+        TableRowCountState newer = await coordinator.LoadCountAsync(CancellationToken.None)
+            .WaitAsync(RendezvousTimeout).ConfigureAwait(false);
+        Assert.AreEqual(222L, newer.Value);
 
         store.CountResult = 111;
         store.ReleaseCount.TrySetResult();
-        await Assert.ThrowsAsync<OperationCanceledException>(() => older).ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => older.WaitAsync(RendezvousTimeout)).ConfigureAwait(false);
         Assert.AreEqual(222L, coordinator.CountState.Value);
     }
 
     [TestMethod]
     public async Task CancelledCallCannotReadOrMutateACachedChunkOrCount()
     {
-        var store = new RecordingTableDataStore();
+        using var store = new RecordingTableDataStore();
         using var coordinator = CreateCoordinator(store);
         var chunk = await coordinator.LoadChunkContainingAsync(0, CancellationToken.None).ConfigureAwait(false);
         var count = await coordinator.LoadCountAsync(CancellationToken.None).ConfigureAwait(false);
@@ -372,7 +375,7 @@ public sealed class VirtualTableQueryCoordinatorTests
     [TestMethod]
     public async Task ExactlyFullChunkRetainsTheStoreContinuationEvidence()
     {
-        var store = new RecordingTableDataStore { ChunkHasMore = false };
+        using var store = new RecordingTableDataStore { ChunkHasMore = false };
         using var coordinator = CreateCoordinator(store);
         var finalChunk = await coordinator.LoadChunkContainingAsync(0, CancellationToken.None).ConfigureAwait(false);
 
@@ -419,7 +422,7 @@ public sealed class VirtualTableQueryCoordinatorTests
             query ?? new TableQuery("items", new PageRequest(0, 100)));
     }
 
-    private sealed class RecordingTableDataStore : ITableDataStore
+    private sealed class RecordingTableDataStore : ITableDataStore, IDisposable
     {
         public List<TableQuery> Queries { get; } = [];
 
@@ -486,14 +489,8 @@ public sealed class VirtualTableQueryCoordinatorTests
             RowsStarted.TrySetResult();
             if (BlockRows)
             {
-                if (IgnoreRowCancellation)
-                {
-                    await ReleaseRows.Task.ConfigureAwait(false);
-                }
-                else
-                {
-                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
-                }
+                await ReleaseRows.Task.WaitAsync(IgnoreRowCancellation ? CancellationToken.None : cancellationToken)
+                    .ConfigureAwait(false);
             }
 
             var rows = Enumerable.Range(0, query.Page.Limit)
@@ -513,14 +510,8 @@ public sealed class VirtualTableQueryCoordinatorTests
             AllRowsStarted.TrySetResult();
             if (BlockAllRows)
             {
-                if (IgnoreAllRowsCancellation)
-                {
-                    await ReleaseAllRows.Task.ConfigureAwait(false);
-                }
-                else
-                {
-                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
-                }
+                await ReleaseAllRows.Task.WaitAsync(IgnoreAllRowsCancellation ? CancellationToken.None : cancellationToken)
+                    .ConfigureAwait(false);
             }
 
             if (AllRowsException is not null)
@@ -550,14 +541,8 @@ public sealed class VirtualTableQueryCoordinatorTests
             CountStarted.TrySetResult();
             if (BlockCount)
             {
-                if (IgnoreCountCancellation)
-                {
-                    await ReleaseCount.Task.ConfigureAwait(false);
-                }
-                else
-                {
-                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
-                }
+                await ReleaseCount.Task.WaitAsync(IgnoreCountCancellation ? CancellationToken.None : cancellationToken)
+                    .ConfigureAwait(false);
             }
 
             return CountResult;
@@ -586,6 +571,13 @@ public sealed class VirtualTableQueryCoordinatorTests
             DatabaseSchemaCatalog catalog,
             RowDeletionOperation operation,
             CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public void Dispose()
+        {
+            ReleaseRows.TrySetResult();
+            ReleaseAllRows.TrySetResult();
+            ReleaseCount.TrySetResult();
+        }
 
         private static TypedRow CreateRow(long id) => new(
             RowIdentity.FromPrimaryKey([new RowIdentityComponent("ID", SqliteValue.Integer(id))]),

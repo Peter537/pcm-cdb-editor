@@ -956,9 +956,8 @@ public sealed class RiderCreationServiceTests
             .Replace("__EXTRA_COLUMN__", extra, StringComparison.Ordinal)
             .Replace("__CONTRACT_RIDER_FK__", contractRiderForeignKey ? " REFERENCES DYN_cyclist(IDcyclist)" : string.Empty,
                 StringComparison.Ordinal);
-        return SqliteTestDatabase.CreateAsync(
-            riderSchema,
-            SupportingSchema,
+        return SqliteTestDatabase.CreateWithTransactionalSchemaAsync(
+            [riderSchema, SupportingSchema],
             includeSeedRows ? SeedRows : string.Empty);
     }
 

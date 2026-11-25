@@ -153,6 +153,52 @@ try {
     Write-FixtureEvidence
     Assert-Rejected { Assert-FixtureEvidence } 'does not match this installer'
     Write-Host 'PASS installer evidence rejects missing, added, duplicate, changed, and wrong-installer evidence.'
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = Join-Path $run 'candidate.zip'
+    $payloadFiles = @(
+        [pscustomobject]@{ Path = 'bin/first.txt'; Sha256 = $null }
+        [pscustomobject]@{ Path = 'bin/second.txt'; Sha256 = $null }
+    )
+    foreach ($file in $payloadFiles) {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($file.Path)
+        $file.Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+    }
+    function Write-ArchiveFixture {
+        param([string[]] $EntryPaths, [string] $ChangedPath)
+
+        if ([IO.File]::Exists($archive)) { [IO.File]::Delete($archive) }
+        $zip = [IO.Compression.ZipFile]::Open($archive, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($path in $EntryPaths) {
+                $entry = $zip.CreateEntry($path)
+                if ($path.EndsWith('/')) { continue }
+                $content = if ($path -ceq $ChangedPath) { 'changed-bytes' } else { $path }
+                $bytes = [Text.Encoding]::UTF8.GetBytes($content)
+                $stream = $entry.Open()
+                try { $stream.Write($bytes, 0, $bytes.Length) }
+                finally { $stream.Dispose() }
+            }
+        }
+        finally { $zip.Dispose() }
+    }
+
+    $paths = @($payloadFiles.Path)
+    Write-ArchiveFixture -EntryPaths ($paths + 'bin/')
+    Assert-ZipMatchesPayload -PayloadFiles $payloadFiles -ArchivePath $archive
+    Write-ArchiveFixture -EntryPaths @($paths[0])
+    Assert-Rejected { Assert-ZipMatchesPayload $payloadFiles $archive } 'Missing: \[bin/second\.txt\]'
+    Write-ArchiveFixture -EntryPaths ($paths + 'extra.txt')
+    Assert-Rejected { Assert-ZipMatchesPayload $payloadFiles $archive } 'extra: \[extra\.txt\]'
+    Write-ArchiveFixture -EntryPaths ($paths + $paths[0])
+    Assert-Rejected { Assert-ZipMatchesPayload $payloadFiles $archive } 'duplicate path: bin/first\.txt'
+    Write-ArchiveFixture -EntryPaths $paths -ChangedPath $paths[1]
+    Assert-Rejected { Assert-ZipMatchesPayload $payloadFiles $archive } 'hash mismatch: \[bin/second\.txt\]'
+    Write-ArchiveFixture -EntryPaths ($paths + '../outside.txt')
+    Assert-Rejected { Assert-ZipMatchesPayload $payloadFiles $archive } 'ZIP contains an unsafe path'
+    Write-ArchiveFixture -EntryPaths ($paths + '../')
+    Assert-Rejected { Assert-ZipMatchesPayload $payloadFiles $archive } 'ZIP contains an unsafe path'
+    Write-Host 'PASS ZIP verification accepts matching payload and rejects missing, extra, duplicate, changed, and unsafe entries.'
 }
 finally {
     Remove-ReleaseScratch -Path $run -ArtifactsRoot $artifacts
